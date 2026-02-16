@@ -1,0 +1,16 @@
+name: LingCage Actionlint
+
+on:
+  pull_request:
+
+jobs:
+  actionlint:
+    name: Lint Workflow YAML
+    uses: ./.github/workflows/per-commit.yml
+    with:
+      run: |
+        if ! command -v actionlint >/dev/null 2>&1; then
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          sudo mv ./actionlint /usr/local/bin/actionlint
+        fi
+        actionlint
