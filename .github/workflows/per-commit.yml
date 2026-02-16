@@ -1,0 +1,65 @@
+name: LingCage per-commit
+
+# A bisectability gate. On push events it degrades to HEAD only.
+
+on:
+  workflow_call:
+    inputs:
+      run:
+        description: Shell command to execute at each commit.
+        type: string
+        required: true
+
+jobs:
+  run:
+    name: Execute Per-Commit Check
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout PR With Full History
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install Pinned Rust Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Restore Cargo Build Cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+
+      - name: Run Caller Check At Each Commit In Range
+        env:
+          PER_COMMIT_RUN: ${{ inputs.run }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            commits=$(git rev-list --reverse --no-merges "$BASE_SHA..$HEAD_SHA")
+          else
+            commits=$(git rev-parse HEAD)
+          fi
+
+          if [ -z "$commits" ]; then
+            echo "no commits to check"
+            exit 0
+          fi
+
+          original=$(git rev-parse HEAD)
+          trap 'git checkout --quiet --detach "$original" >/dev/null 2>&1 || true' EXIT
+
+          for c in $commits; do
+            subject=$(git log -1 --format=%s "$c")
+            echo "::group::$c $subject"
+            git checkout --quiet --detach "$c"
+            if ! bash -c "$PER_COMMIT_RUN"; then
+              echo "::error::commit $c ($subject) failed: $PER_COMMIT_RUN"
+              echo "::endgroup::"
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
