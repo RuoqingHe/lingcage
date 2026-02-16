@@ -1,0 +1,23 @@
+name: LingCage DCO
+
+# Every commit must carry a Developer Certificate of Origin sign-off
+# (the `Signed-off-by: Name <email>` trailer added by `git commit -s`).
+
+on:
+  pull_request:
+
+jobs:
+  dco:
+    name: Verify DCO Sign-off
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR With Full History
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install dco-check
+        run: pipx install dco-check
+
+      - name: Verify Sign-off On Each Commit
+        run: dco-check --verbose
