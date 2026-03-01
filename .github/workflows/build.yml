@@ -1,0 +1,11 @@
+name: LingCage Build
+
+on:
+  pull_request:
+
+jobs:
+  build:
+    name: Compile Workspace
+    uses: ./.github/workflows/per-commit.yml
+    with:
+      run: RUSTFLAGS='-D warnings' cargo build --workspace --all-targets --locked
