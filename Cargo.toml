@@ -13,3 +13,13 @@ license = "Apache-2.0"
 name = "lingcage"
 repository = "https://github.com/RuoqingHe/lingcage"
 version = "0.1.0"
+
+# Member crates opt in via `lints.workspace = true`
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
