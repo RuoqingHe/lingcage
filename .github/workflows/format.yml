@@ -1,0 +1,15 @@
+name: LingCage Format
+
+on:
+  pull_request:
+
+jobs:
+  format:
+    name: Check Rust and TOML Formatting
+    uses: ./.github/workflows/per-commit.yml
+    with:
+      run: |
+        command -v taplo >/dev/null 2>&1 || cargo install taplo-cli --locked
+        taplo fmt --check
+        rustup toolchain install nightly --profile minimal --component rustfmt
+        cargo +nightly fmt --all -- --check

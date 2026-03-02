@@ -1,0 +1,6 @@
+include = ["**/Cargo.toml"]
+
+[formatting]
+indent_string = "  " # 2 spaces
+reorder_arrays = true
+reorder_keys = true

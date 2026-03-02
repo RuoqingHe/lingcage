@@ -1,0 +1,9 @@
+edition = "2024"
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"
+comment_width = 100
+wrap_comments = true
+format_code_in_doc_comments = true
+format_strings = true
+normalize_comments = true
+normalize_doc_attributes = true
