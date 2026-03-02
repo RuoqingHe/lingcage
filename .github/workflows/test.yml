@@ -1,0 +1,11 @@
+name: LingCage Test
+
+on:
+  pull_request:
+
+jobs:
+  test:
+    name: Run Test Suite
+    uses: ./.github/workflows/per-commit.yml
+    with:
+      run: cargo test --workspace --locked
