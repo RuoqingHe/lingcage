@@ -5,6 +5,7 @@ path = [
   # "src/**" should be checked with SPDX headers.
   "**/Cargo.toml",
   "Cargo.lock",
+  "rust-toolchain.toml",
   ".rustfmt.toml",
   ".taplo.toml",
   ".mdformat.toml",
