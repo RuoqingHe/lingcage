@@ -1,0 +1,18 @@
+name: LingCage Mdformat
+
+on:
+  pull_request:
+
+jobs:
+  mdformat:
+    name: Check Markdown Formatting
+    uses: ./.github/workflows/per-commit.yml
+    with:
+      run: |
+        if ! command -v mdformat >/dev/null 2>&1; then
+          pipx install mdformat --include-deps || \
+            python3 -m pip install --user mdformat
+        fi
+        pipx inject mdformat mdformat-gfm 2>/dev/null || \
+          python3 -m pip install --user mdformat-gfm
+        mdformat --check .
