@@ -1,0 +1,21 @@
+version = 1
+
+[[annotations]]
+path = [
+  # "src/**" should be checked with SPDX headers.
+  "**/Cargo.toml",
+  "Cargo.lock",
+  ".rustfmt.toml",
+  ".taplo.toml",
+  ".mdformat.toml",
+  "REUSE.toml",
+  ".gitignore",
+  ".github/**",
+  "**/*.md",
+  "**/*.json",
+  "LICENSE",
+  "LICENSES/**",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 LingCage <opensource@lingcage.com>"
+SPDX-License-Identifier = "Apache-2.0"
