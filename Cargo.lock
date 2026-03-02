@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "lingcage"
 version = "0.1.0"
+
+[[package]]
+name = "lingcore"
+version = "0.1.0"

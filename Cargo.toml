@@ -1,4 +1,8 @@
-[package]
+[workspace]
+members = ["src/lingcage", "src/lingcore"]
+resolver = "3"
+
+[workspace.package]
 authors = [
   "LingCage <opensource@lingcage.com>",
   "Ruoqing He <ruoqing.he@lingcage.com>",
@@ -9,5 +13,3 @@ license = "Apache-2.0"
 name = "lingcage"
 repository = "https://github.com/RuoqingHe/lingcage"
 version = "0.1.0"
-
-[dependencies]
