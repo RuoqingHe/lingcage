@@ -1,0 +1,13 @@
+name: LingCage Typos
+
+on:
+  pull_request:
+
+jobs:
+  typos:
+    name: Check Spelling With Typos
+    uses: ./.github/workflows/per-commit.yml
+    with:
+      run: |
+        command -v typos >/dev/null 2>&1 || cargo install typos-cli --locked
+        typos

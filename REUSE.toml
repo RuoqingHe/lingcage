@@ -9,6 +9,7 @@ path = [
   ".rustfmt.toml",
   ".taplo.toml",
   ".mdformat.toml",
+  ".typos.toml",
   "REUSE.toml",
   ".gitignore",
   ".github/**",
