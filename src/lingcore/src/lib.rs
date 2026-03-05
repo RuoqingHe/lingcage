@@ -7,3 +7,5 @@
 //!
 //! `lingcore` is a library instead of a VMM. Each component is gated
 //! behind a Cargo feature.
+
+pub mod hv;
