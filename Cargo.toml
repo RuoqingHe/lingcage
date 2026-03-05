@@ -13,6 +13,9 @@ license = "Apache-2.0"
 repository = "https://github.com/RuoqingHe/lingcage"
 version = "0.1.0"
 
+[workspace.dependencies]
+thiserror = "2.0.18"
+
 # Member crates opt in via `lints.workspace = true`
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
