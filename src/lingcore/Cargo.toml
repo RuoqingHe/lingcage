@@ -1,5 +1,6 @@
 [package]
 authors.workspace = true
+description = "Building blocks for agentic-workload VMMs."
 edition.workspace = true
 homepage.workspace = true
 license.workspace = true
