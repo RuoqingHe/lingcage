@@ -10,7 +10,6 @@ authors = [
 edition = "2024"
 homepage = "https://lingcage.com"
 license = "Apache-2.0"
-name = "lingcage"
 repository = "https://github.com/RuoqingHe/lingcage"
 version = "0.1.0"
 
