@@ -2,17 +2,5 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+//! VMM built on top of `lingcore`. Process model, scheduling, control API
+//! and policy are to be placed in this crate. It is empty for now.
