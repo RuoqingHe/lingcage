@@ -7,6 +7,8 @@
 //! KVM is the backend implemented by lingcore. `Backend` also names the
 //! others so that a VMM built on the crate can select one.
 
+pub mod arch;
+
 use thiserror::Error;
 
 /// Errors thrown by a hypervisor backend.
