@@ -15,3 +15,6 @@ pub use crate::hv::arch::x86_64::*;
 // TODO: aarch64 register ids are scheduled to next stage.
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+
+#[cfg(target_arch = "riscv64")]
+mod riscv64;
