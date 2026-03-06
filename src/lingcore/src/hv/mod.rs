@@ -8,6 +8,7 @@
 //! others so that a VMM built on the crate can select one.
 
 pub mod arch;
+pub mod memory;
 pub mod vcpu;
 
 use thiserror::Error;
