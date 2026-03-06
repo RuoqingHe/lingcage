@@ -45,6 +45,32 @@ pub enum Backend {
     Stub,
 }
 
+/// Guest CPU architecture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    /// 64-bit x86.
+    X86_64,
+    /// 64-bit Arm.
+    Aarch64,
+    /// 64-bit RISC-V.
+    Riscv64,
+}
+
+/// State captured from a guest, a vCPU, an irqchip or the clock for
+/// example, as bytes in the layout of the backend which wrote them,
+/// tagged with that backend, the architecture and the layout version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateBlob {
+    /// Backend which captured `data`.
+    pub backend: Backend,
+    /// Architecture of the guest `data` was captured from.
+    pub arch: Arch,
+    /// Layout version of `data`, private to the backend.
+    pub version: u32,
+    /// State bytes in layout of the backend.
+    pub data: Vec<u8>,
+}
+
 /// Reason a vCPU exited, mapped by the backend from the native exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmExit {
