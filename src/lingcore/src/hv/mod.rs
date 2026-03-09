@@ -60,6 +60,20 @@ pub enum Arch {
     Riscv64,
 }
 
+/// Capability a backend may have. Device setup queries it to choose
+/// between a kernel fast path and emulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cap {
+    /// MSI injection from an eventfd through `KVM_IRQFD`.
+    IrqFd,
+    /// Ioeventfd write consumed in the kernel through `KVM_IOEVENTFD`.
+    IoeventFd,
+    /// Interrupt controller emulated in the kernel.
+    InKernelIrqChip,
+    /// Dirty page logging on guest memory.
+    DirtyLog,
+}
+
 /// State captured from a guest, a vCPU, an irqchip or the clock for
 /// example, as bytes in the layout of the backend which wrote them,
 /// tagged with that backend, the architecture and the layout version.
