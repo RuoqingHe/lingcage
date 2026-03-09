@@ -8,4 +8,4 @@ jobs:
     name: Lint With Clippy
     uses: ./.github/workflows/per-commit.yml
     with:
-      run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

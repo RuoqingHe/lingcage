@@ -8,4 +8,4 @@ jobs:
     name: Compile Workspace
     uses: ./.github/workflows/per-commit.yml
     with:
-      run: RUSTFLAGS='-D warnings' cargo build --workspace --all-targets --locked
+      run: RUSTFLAGS='-D warnings' cargo build --workspace --all-targets --all-features --locked
