@@ -8,6 +8,8 @@
 //! others so that a VMM built on the crate can select one.
 
 pub mod arch;
+#[cfg(target_os = "linux")]
+pub mod ioeventfd;
 pub mod irq;
 pub mod memory;
 pub mod vcpu;
