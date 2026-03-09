@@ -8,4 +8,5 @@
 //! `lingcore` is a library instead of a VMM. Each component is gated
 //! behind a Cargo feature.
 
+#[cfg(feature = "hv")]
 pub mod hv;

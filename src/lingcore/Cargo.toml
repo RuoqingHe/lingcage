@@ -8,6 +8,11 @@ name = "lingcore"
 repository.workspace = true
 version.workspace = true
 
+[features]
+default = ["hv"]
+# Hypervisor backends, only KVM is implemented for now.
+hv = []
+
 [lints]
 workspace = true
 
