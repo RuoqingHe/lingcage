@@ -4,6 +4,8 @@
 
 //! A single guest and the parts a backend builds for it.
 
+use std::thread::JoinHandle;
+
 use crate::hv::irq::{IrqSender, MsiSender};
 use crate::hv::memory::VmMemory;
 #[cfg(target_os = "linux")]
@@ -83,4 +85,9 @@ pub trait Vm: Send + Sync {
     fn set_clock_elapsed(&self, _state: &StateBlob) -> Result<()> {
         Err(Error::Unsupported("set_clock_elapsed"))
     }
+
+    /// Kick the vCPU numbered `cpu_index` out of `run`. `handle` is the
+    /// thread blocked in the backend running it. Interrupted run returns
+    /// `VmExit::Interrupted`.
+    fn stop_vcpu<T>(&self, cpu_index: u16, handle: &JoinHandle<T>) -> Result<()>;
 }
