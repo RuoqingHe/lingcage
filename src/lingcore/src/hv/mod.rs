@@ -26,9 +26,14 @@ pub enum Error {
     /// Register id is not defined for this architecture or backend.
     #[error("Invalid register for this arch/backend")]
     BadRegister,
-    /// Hypervisor call failed with this errno.
-    #[error("Hypervisor call failed: errno {0}")]
-    Os(i32),
+    /// Hypervisor call failed, with its errno.
+    #[error("{op} failed: errno {errno}")]
+    Os {
+        /// Operation which failed.
+        op: &'static str,
+        /// Errno of the failed call.
+        errno: i32,
+    },
     /// Other failure, described by a message.
     #[error("{0}")]
     Other(&'static str),
