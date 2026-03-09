@@ -8,6 +8,7 @@
 //! others so that a VMM built on the crate can select one.
 
 pub mod arch;
+pub mod hypervisor;
 pub mod irq;
 pub mod memory;
 pub mod os;
