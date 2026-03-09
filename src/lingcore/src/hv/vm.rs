@@ -9,7 +9,7 @@ use crate::hv::memory::VmMemory;
 #[cfg(target_os = "linux")]
 use crate::hv::os::linux::ioeventfd::IoeventFdRegistry;
 use crate::hv::vcpu::Vcpu;
-use crate::hv::{Cap, Result};
+use crate::hv::{Cap, Error, Result, StateBlob};
 
 /// One guest. Each backend names its concrete part types, so code
 /// written against `Vm` builds with one backend. It is shared by
@@ -45,4 +45,23 @@ pub trait Vm: Send + Sync {
 
     /// Returns whether the backend has `cap`.
     fn capability(&self, cap: Cap) -> bool;
+
+    /// Create the in-kernel irqchip. Kernel then handles guest idle, and
+    /// `VmExit::Halt` changes meaning accordingly, so the machine calls this
+    /// during setup. Default returns `Unsupported`.
+    fn enable_irqchip(&self) -> Result<()> {
+        Err(Error::Unsupported("enable_irqchip"))
+    }
+
+    /// Capture the in-kernel irqchip state, PIC, IOAPIC and PIT on x86_64,
+    /// GIC on aarch64, AIA on riscv64. Default returns `Unsupported`.
+    fn get_irqchip_state(&self) -> Result<StateBlob> {
+        Err(Error::Unsupported("get_irqchip_state"))
+    }
+
+    /// Restore a blob captured by `get_irqchip_state` on the same backend
+    /// and architecture. Default returns `Unsupported`.
+    fn set_irqchip_state(&self, _state: &StateBlob) -> Result<()> {
+        Err(Error::Unsupported("set_irqchip_state"))
+    }
 }
