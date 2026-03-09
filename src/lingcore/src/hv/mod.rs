@@ -12,6 +12,7 @@ pub mod irq;
 pub mod memory;
 pub mod os;
 pub mod vcpu;
+pub mod vm;
 
 use thiserror::Error;
 
