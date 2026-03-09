@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kernel-side ioeventfds, an eventfd bound to a guest address through
-//! `KVM_IOEVENTFD`.
+//! Kernel-side ioeventfds. An eventfd is bound to a guest address
+//! through `KVM_IOEVENTFD`.
 
 use crate::hv::Result;
 

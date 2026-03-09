@@ -7,6 +7,8 @@
 #[cfg(target_os = "linux")]
 use crate::hv::Error;
 use crate::hv::Result;
+#[cfg(target_os = "linux")]
+use crate::hv::os::linux::irqfd::IrqFd;
 
 /// Sender for a legacy line. Trigger mode is set on the irqchip and the
 /// routing instead of per send.
@@ -30,18 +32,4 @@ pub trait MsiSender: Send + Sync {
     fn create_irqfd(&self) -> Result<Self::IrqFd> {
         Err(Error::Unsupported("create_irqfd"))
     }
-}
-
-/// eventfd bound to an MSI through `KVM_IRQFD`. Writing it injects the
-/// interrupt in kernel without involving the VMM.
-#[cfg(target_os = "linux")]
-pub trait IrqFd: Send + Sync {
-    /// Set the MSI address.
-    fn set_addr(&self, addr: u64) -> Result<()>;
-
-    /// Set the MSI data.
-    fn set_data(&self, data: u32) -> Result<()>;
-
-    /// Mask or unmask the interrupt.
-    fn set_masked(&self, masked: bool) -> Result<()>;
 }
