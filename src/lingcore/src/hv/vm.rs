@@ -64,4 +64,23 @@ pub trait Vm: Send + Sync {
     fn set_irqchip_state(&self, _state: &StateBlob) -> Result<()> {
         Err(Error::Unsupported("set_irqchip_state"))
     }
+
+    /// Capture the guest clock together with the host instant it was read
+    /// at. Default returns `Unsupported`.
+    fn get_clock(&self) -> Result<StateBlob> {
+        Err(Error::Unsupported("get_clock"))
+    }
+
+    /// Restore the clock as captured by `get_clock`, for replaying a
+    /// recorded run. Default returns `Unsupported`.
+    fn set_clock(&self, _state: &StateBlob) -> Result<()> {
+        Err(Error::Unsupported("set_clock"))
+    }
+
+    /// Restore the captured clock advanced by the host time elapsed since
+    /// capture, for a clone which resumes on current wall clock time. Guest
+    /// sees one forward jump. Default returns `Unsupported`.
+    fn set_clock_elapsed(&self, _state: &StateBlob) -> Result<()> {
+        Err(Error::Unsupported("set_clock_elapsed"))
+    }
 }
