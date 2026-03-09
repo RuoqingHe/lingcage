@@ -47,8 +47,6 @@ pub enum Backend {
     Hvf,
     /// Windows Hypervisor Platform on Windows.
     Whp,
-    /// Placeholder backend for tests.
-    Stub,
 }
 
 /// Guest CPU architecture.
