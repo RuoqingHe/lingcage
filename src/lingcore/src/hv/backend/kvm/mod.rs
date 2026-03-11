@@ -13,7 +13,7 @@ use kvm_bindings::{
 };
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
-use kvm_ioctls::{Kvm, VmFd};
+use kvm_ioctls::{Kvm, VcpuFd, VmFd};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 use crate::hv::irq::IrqSender;
@@ -95,6 +95,16 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Create the vCPU with id `cpu_index` through `KVM_CREATE_VCPU`. A
+    /// second vCPU with the same id fails with `EEXIST`.
+    pub fn create_vcpu(&self, cpu_index: u16) -> Result<KvmVcpu> {
+        let fd = self
+            .fd
+            .create_vcpu(u64::from(cpu_index))
+            .map_err(kvm_err("KVM_CREATE_VCPU"))?;
+        Ok(KvmVcpu { fd })
+    }
+
     /// Bind a new eventfd to irqchip pin `pin` through `KVM_IRQFD` and
     /// return the sender which writes it. Pin is fixed for each sender.
     pub fn create_irq_sender(&self, pin: u8) -> Result<KvmIrqSender> {
@@ -167,6 +177,13 @@ impl VmMemory for KvmMemory {
     }
 }
 
+/// vCPU handle, the fd returned by `KVM_CREATE_VCPU`.
+pub struct KvmVcpu {
+    // TODO: drop the attribute once running the vCPU reads this fd.
+    #[cfg_attr(not(test), expect(dead_code, reason = "only the test reads the fd"))]
+    fd: VcpuFd,
+}
+
 /// Legacy interrupt line, the eventfd bound to its pin by `KVM_IRQFD`.
 /// `send` writes the fd and issues no ioctl on the VM fd. Binding is
 /// not undone on drop, it ends together with the VM fd.
@@ -234,6 +251,17 @@ mod tests {
         vm.enable_irqchip().expect("in-kernel irqchip");
         // Second `KVM_CREATE_IRQCHIP` fails with `EEXIST`.
         vm.enable_irqchip().expect_err("irqchip again");
+    }
+
+    #[test]
+    fn test_create_vcpus() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let cpu0 = vm.create_vcpu(0).expect("vcpu 0");
+        let cpu1 = vm.create_vcpu(1).expect("vcpu 1");
+        assert_ne!(cpu0.fd.as_raw_fd(), cpu1.fd.as_raw_fd());
+        // Second `KVM_CREATE_VCPU` with the same id fails with `EEXIST`.
+        assert!(vm.create_vcpu(0).is_err(), "vCPU 0 created a second time");
     }
 
     #[cfg(target_arch = "x86_64")]
