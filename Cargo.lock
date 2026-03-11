@@ -52,6 +52,7 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "thiserror",
+ "vmm-sys-util",
 ]
 
 [[package]]

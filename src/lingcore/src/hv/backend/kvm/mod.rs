@@ -14,15 +14,18 @@ use kvm_bindings::{
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
 use kvm_ioctls::{Kvm, VmFd};
+use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
+use crate::hv::irq::IrqSender;
 use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::{Error, Result};
 
-/// Map a `kvm_ioctls::Error` to `Error::Os` with operation `op`.
-fn kvm_err(op: &'static str) -> impl Fn(kvm_ioctls::Error) -> Error {
+/// Map a `kvm_ioctls::Error`, or the `io::Error` of an eventfd call, to
+/// `Error::Os` with operation `op`.
+fn kvm_err<E: Into<kvm_ioctls::Error>>(op: &'static str) -> impl Fn(E) -> Error {
     move |err| Error::Os {
         op,
-        errno: err.errno(),
+        errno: err.into().errno(),
     }
 }
 
@@ -91,6 +94,16 @@ impl KvmVm {
             .map_err(kvm_err("KVM_CREATE_PIT2"))?;
         Ok(())
     }
+
+    /// Bind a new eventfd to irqchip pin `pin` through `KVM_IRQFD` and
+    /// return the sender which writes it. Pin is fixed for each sender.
+    pub fn create_irq_sender(&self, pin: u8) -> Result<KvmIrqSender> {
+        let eventfd = EventFd::new(EFD_NONBLOCK).map_err(kvm_err("eventfd"))?;
+        self.fd
+            .register_irqfd(&eventfd, u32::from(pin))
+            .map_err(kvm_err("KVM_IRQFD"))?;
+        Ok(KvmIrqSender { eventfd })
+    }
 }
 
 /// Guest physical address space of one guest, as KVM memory slots.
@@ -154,6 +167,20 @@ impl VmMemory for KvmMemory {
     }
 }
 
+/// Legacy interrupt line, the eventfd bound to its pin by `KVM_IRQFD`.
+/// `send` writes the fd and issues no ioctl on the VM fd. Binding is
+/// not undone on drop, it ends together with the VM fd.
+pub struct KvmIrqSender {
+    eventfd: EventFd,
+}
+
+impl IrqSender for KvmIrqSender {
+    fn send(&self) -> Result<()> {
+        // Without resamplefd, KVM raises the line and lowers it for each write.
+        self.eventfd.write(1).map_err(kvm_err("irqfd write"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
@@ -207,5 +234,22 @@ mod tests {
         vm.enable_irqchip().expect("in-kernel irqchip");
         // Second `KVM_CREATE_IRQCHIP` fails with `EEXIST`.
         vm.enable_irqchip().expect_err("irqchip again");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_legacy_irq_line() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        // `KVM_IRQFD` fails with `EINVAL` before `KVM_CREATE_IRQCHIP`.
+        assert!(
+            vm.create_irq_sender(4).is_err(),
+            "pin bound with no controller behind it"
+        );
+
+        vm.enable_irqchip().expect("in-kernel irqchip");
+        let com1 = vm.create_irq_sender(4).expect("sender on IRQ 4");
+        com1.send().expect("pulse");
+        com1.send().expect("pulse again");
     }
 }

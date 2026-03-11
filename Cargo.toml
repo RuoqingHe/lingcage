@@ -17,6 +17,7 @@ version = "0.1.0"
 kvm-bindings = "0.14.0"
 kvm-ioctls = "0.24.0"
 thiserror = "2.0.18"
+vmm-sys-util = "0.15.0"
 
 # Member crates opt in via `lints.workspace = true`
 [workspace.lints.clippy]
