@@ -12,9 +12,15 @@ version.workspace = true
 default = ["hv"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
+# KVM backend.
+kvm = ["dep:kvm-bindings", "dep:kvm-ioctls", "hv"]
 
 [lints]
 workspace = true
 
 [dependencies]
 thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-bindings = { workspace = true, optional = true }
+kvm-ioctls = { workspace = true, optional = true }

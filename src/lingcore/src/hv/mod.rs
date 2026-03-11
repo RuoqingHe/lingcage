@@ -8,6 +8,7 @@
 //! others so that a VMM built on the crate can select one.
 
 pub mod arch;
+pub mod backend;
 pub mod hypervisor;
 pub mod irq;
 pub mod memory;
@@ -34,6 +35,10 @@ pub enum Error {
         /// Errno of the failed call.
         errno: i32,
     },
+    /// KVM API version reported by the kernel, when it is not
+    /// `KVM_API_VERSION`.
+    #[error("Unsupported KVM API version: {0}")]
+    ApiVersion(i32),
     /// Other failure, described by a message.
     #[error("{0}")]
     Other(&'static str),
