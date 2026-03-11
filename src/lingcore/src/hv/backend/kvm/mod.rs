@@ -9,11 +9,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
-    KVM_API_VERSION, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY, kvm_userspace_memory_region,
+    KVM_API_VERSION, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY, kvm_msi,
+    kvm_userspace_memory_region,
 };
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
-use kvm_ioctls::{Kvm, VcpuFd, VmFd};
+use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 use crate::hv::irq::IrqSender;
@@ -114,6 +115,17 @@ impl KvmVm {
             .map_err(kvm_err("KVM_IRQFD"))?;
         Ok(KvmIrqSender { eventfd })
     }
+
+    /// Create the MSI sender. Returns `Unsupported` without
+    /// `KVM_CAP_SIGNAL_MSI`.
+    pub fn create_msi_sender(&self) -> Result<KvmMsiSender> {
+        if !self.fd.check_extension(Cap::SignalMsi) {
+            return Err(Error::Unsupported("KVM_CAP_SIGNAL_MSI"));
+        }
+        Ok(KvmMsiSender {
+            vm: Arc::clone(&self.fd),
+        })
+    }
 }
 
 /// Guest physical address space of one guest, as KVM memory slots.
@@ -198,6 +210,27 @@ impl IrqSender for KvmIrqSender {
     }
 }
 
+/// Sender for message signalled interrupts. Address and data are passed
+/// with each `send`, so all devices of a guest share one sender.
+pub struct KvmMsiSender {
+    vm: Arc<VmFd>,
+}
+
+impl KvmMsiSender {
+    /// Deliver `data` to `addr` through `KVM_SIGNAL_MSI` on the calling
+    /// thread.
+    pub fn send(&self, addr: u64, data: u32) -> Result<()> {
+        let msi = kvm_msi {
+            address_lo: addr as u32,
+            address_hi: (addr >> 32) as u32,
+            data,
+            ..Default::default()
+        };
+        self.vm.signal_msi(msi).map_err(kvm_err("KVM_SIGNAL_MSI"))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
@@ -262,6 +295,26 @@ mod tests {
         assert_ne!(cpu0.fd.as_raw_fd(), cpu1.fd.as_raw_fd());
         // Second `KVM_CREATE_VCPU` with the same id fails with `EEXIST`.
         assert!(vm.create_vcpu(0).is_err(), "vCPU 0 created a second time");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_send_msi() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        vm.enable_irqchip().expect("in-kernel irqchip");
+        let msi = vm.create_msi_sender().expect("msi sender");
+
+        // Without vCPU there is no LAPIC to deliver to. `KVM_SIGNAL_MSI`
+        // returns -1, which shows as `EPERM` at the syscall boundary.
+        assert!(
+            msi.send(0xfee0_0000, 0x30).is_err(),
+            "message delivered with no LAPIC to take it"
+        );
+
+        let _cpu0 = vm.create_vcpu(0).expect("vcpu 0");
+        // Vector 0x30, fixed delivery, addressed to APIC id 0.
+        msi.send(0xfee0_0000, 0x30).expect("deliver to vcpu 0");
     }
 
     #[cfg(target_arch = "x86_64")]
