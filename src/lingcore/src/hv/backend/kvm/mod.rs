@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use kvm_bindings::{
     KVM_API_VERSION, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY, kvm_userspace_memory_region,
 };
+#[cfg(target_arch = "x86_64")]
+use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
 use kvm_ioctls::{Kvm, VmFd};
 
 use crate::hv::memory::{MemMapOption, VmMemory};
@@ -70,6 +72,24 @@ impl KvmVm {
             next_slot: AtomicU32::new(0),
             slots: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Create the in-kernel irqchip (PIC, IOAPIC and LAPICs) through
+    /// `KVM_CREATE_IRQCHIP`, and the i8254 PIT through `KVM_CREATE_PIT2`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn enable_irqchip(&self) -> Result<()> {
+        self.fd
+            .create_irq_chip()
+            .map_err(kvm_err("KVM_CREATE_IRQCHIP"))?;
+        // `KVM_PIT_SPEAKER_DUMMY` registers a speaker stub at port 0x61 in
+        // kernel, so guest write there does not exit to VMM.
+        self.fd
+            .create_pit2(kvm_pit_config {
+                flags: KVM_PIT_SPEAKER_DUMMY,
+                ..Default::default()
+            })
+            .map_err(kvm_err("KVM_CREATE_PIT2"))?;
+        Ok(())
     }
 }
 
@@ -177,5 +197,15 @@ mod tests {
         // SAFETY: `host` came from `alloc_zeroed` with `layout` and is not
         // mapped into the guest anymore.
         unsafe { dealloc(host, layout) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_irqchip_created_once() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        vm.enable_irqchip().expect("in-kernel irqchip");
+        // Second `KVM_CREATE_IRQCHIP` fails with `EEXIST`.
+        vm.enable_irqchip().expect_err("irqchip again");
     }
 }
