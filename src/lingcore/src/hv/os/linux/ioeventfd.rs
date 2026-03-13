@@ -20,8 +20,9 @@ pub trait IoeventFdRegistry: Send + Sync {
     /// Open an eventfd not bound to any address yet.
     fn create(&self) -> Result<Self::IoeventFd>;
 
-    /// Bind `fd` to a guest write of `len` bytes at `gpa`. With `data` set,
-    /// only a write of that value signals it.
+    /// Bind `fd` to a guest write at `gpa`. With `data` set, only a write
+    /// of `len` bytes carrying that value signals it, otherwise a write of
+    /// any width does.
     fn register(&self, fd: &Self::IoeventFd, gpa: u64, len: u8, data: Option<u64>) -> Result<()>;
 
     /// Unbind `fd`.
