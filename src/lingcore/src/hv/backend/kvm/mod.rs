@@ -242,11 +242,23 @@ const PIN_IRQCHIP: u32 = 0;
 const FIRST_MSI_GSI: u32 = 256;
 
 /// MSI route of one irqfd.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct MsiRoute {
     addr: u64,
     data: u32,
     masked: bool,
+}
+
+impl Default for MsiRoute {
+    /// Masked, so that the route stays out of the table until address and
+    /// data are set.
+    fn default() -> Self {
+        MsiRoute {
+            addr: 0,
+            data: 0,
+            masked: true,
+        }
+    }
 }
 
 /// Routing table of the guest. `KVM_SET_GSI_ROUTING` overwrites the
@@ -333,7 +345,7 @@ impl MsiSender for KvmMsiSender {
         let gsi = {
             let mut routing = self.routing.lock().unwrap();
             let gsi = routing.take_gsi();
-            // Zeroed route until the caller sets address and data.
+            // Masked until the caller sets address and data.
             routing.msi.insert(gsi, MsiRoute::default());
             gsi
         };
@@ -636,6 +648,18 @@ mod tests {
         let two = msi.create_irqfd().expect("second irqfd");
         assert_ne!(one.gsi, two.gsi, "two irqfds got the same GSI");
         assert!(one.gsi >= FIRST_MSI_GSI, "irqfd took a legacy pin number");
+
+        // Both routes are still masked, so neither of them is in the table.
+        let fresh = vm.routing.lock().unwrap();
+        assert!(
+            fresh.msi[&one.gsi].masked,
+            "route without message went to KVM"
+        );
+        assert!(
+            fresh.msi[&two.gsi].masked,
+            "route without message went to KVM"
+        );
+        drop(fresh);
 
         // Each call rewrites the table with the legacy pin and both MSI
         // routes. `KVM_SET_GSI_ROUTING` fails on a table it can not route.
