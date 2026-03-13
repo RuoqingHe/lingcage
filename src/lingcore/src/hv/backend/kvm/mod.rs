@@ -4,22 +4,25 @@
 
 //! KVM backend.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
-    KVM_API_VERSION, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY, kvm_msi,
-    kvm_userspace_memory_region,
+    KVM_API_VERSION, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MEM_LOG_DIRTY_PAGES,
+    KVM_MEM_READONLY, KvmIrqRouting, kvm_irq_routing_entry, kvm_irq_routing_irqchip,
+    kvm_irq_routing_msi, kvm_msi, kvm_userspace_memory_region,
 };
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
 use kvm_ioctls::{Cap, IoEventAddress, Kvm, NoDatamatch, VcpuFd, VmFd};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
-use crate::hv::irq::IrqSender;
+use crate::hv::irq::{IrqSender, MsiSender};
 use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
+use crate::hv::os::linux::irqfd::IrqFd;
 use crate::hv::{Error, Result};
 
 /// Map a `kvm_ioctls::Error`, or the `io::Error` of an eventfd call, to
@@ -59,7 +62,10 @@ impl KvmHv {
     /// Create a guest through `KVM_CREATE_VM`, without vCPU or memory.
     pub fn create_vm(&self) -> Result<KvmVm> {
         let fd = self.kvm.create_vm().map_err(kvm_err("KVM_CREATE_VM"))?;
-        Ok(KvmVm { fd: Arc::new(fd) })
+        Ok(KvmVm {
+            fd: Arc::new(fd),
+            routing: Arc::new(Mutex::new(Routing::default())),
+        })
     }
 }
 
@@ -67,6 +73,7 @@ impl KvmHv {
 /// from it share the fd.
 pub struct KvmVm {
     fd: Arc<VmFd>,
+    routing: Arc<Mutex<Routing>>,
 }
 
 impl KvmVm {
@@ -111,6 +118,11 @@ impl KvmVm {
     /// return the sender which writes it. Pin is fixed for each sender.
     pub fn create_irq_sender(&self, pin: u8) -> Result<KvmIrqSender> {
         let eventfd = EventFd::new(EFD_NONBLOCK).map_err(kvm_err("eventfd"))?;
+        {
+            let mut routing = self.routing.lock().unwrap();
+            routing.pins.insert(pin);
+            routing.apply(&self.fd)?;
+        }
         self.fd
             .register_irqfd(&eventfd, u32::from(pin))
             .map_err(kvm_err("KVM_IRQFD"))?;
@@ -125,6 +137,7 @@ impl KvmVm {
         }
         Ok(KvmMsiSender {
             vm: Arc::clone(&self.fd),
+            routing: Arc::clone(&self.routing),
         })
     }
 
@@ -218,16 +231,93 @@ impl IrqSender for KvmIrqSender {
     }
 }
 
+/// irqchip which a legacy pin routes to. IOAPIC on x86_64, irqchip 0 on
+/// other architectures.
+#[cfg(target_arch = "x86_64")]
+const PIN_IRQCHIP: u32 = kvm_bindings::KVM_IRQCHIP_IOAPIC;
+#[cfg(not(target_arch = "x86_64"))]
+const PIN_IRQCHIP: u32 = 0;
+
+/// First GSI taken by an irqfd. Legacy pins are `u8` and stay below it.
+const FIRST_MSI_GSI: u32 = 256;
+
+/// MSI route of one irqfd.
+#[derive(Clone, Copy, Default)]
+struct MsiRoute {
+    addr: u64,
+    data: u32,
+    masked: bool,
+}
+
+/// Routing table of the guest. `KVM_SET_GSI_ROUTING` overwrites the
+/// table, so legacy pins which have a sender are kept here and written
+/// together with MSI routes.
+#[derive(Default)]
+struct Routing {
+    pins: BTreeSet<u8>,
+    msi: BTreeMap<u32, MsiRoute>,
+    next_gsi: u32,
+}
+
+impl Routing {
+    /// Returns GSI of the next irqfd.
+    fn take_gsi(&mut self) -> u32 {
+        let gsi = FIRST_MSI_GSI + self.next_gsi;
+        self.next_gsi += 1;
+        gsi
+    }
+
+    /// Write the table through `KVM_SET_GSI_ROUTING`. Masked routes are
+    /// left out.
+    fn apply(&self, vm: &VmFd) -> Result<()> {
+        let mut entries = Vec::with_capacity(self.pins.len() + self.msi.len());
+        for &pin in &self.pins {
+            let mut entry = kvm_irq_routing_entry {
+                gsi: u32::from(pin),
+                type_: KVM_IRQ_ROUTING_IRQCHIP,
+                ..Default::default()
+            };
+            entry.u.irqchip = kvm_irq_routing_irqchip {
+                irqchip: PIN_IRQCHIP,
+                pin: u32::from(pin),
+            };
+            entries.push(entry);
+        }
+        for (&gsi, route) in &self.msi {
+            if route.masked {
+                continue;
+            }
+            let mut entry = kvm_irq_routing_entry {
+                gsi,
+                type_: KVM_IRQ_ROUTING_MSI,
+                ..Default::default()
+            };
+            entry.u.msi = kvm_irq_routing_msi {
+                address_lo: route.addr as u32,
+                address_hi: (route.addr >> 32) as u32,
+                data: route.data,
+                ..Default::default()
+            };
+            entries.push(entry);
+        }
+        let table = KvmIrqRouting::from_entries(&entries)
+            .map_err(|_| Error::Other("guest holds more routes than KVM accepts"))?;
+        vm.set_gsi_routing(&table)
+            .map_err(kvm_err("KVM_SET_GSI_ROUTING"))
+    }
+}
+
 /// Sender for message signalled interrupts. Address and data are passed
 /// with each `send`, so all devices of a guest share one sender.
 pub struct KvmMsiSender {
     vm: Arc<VmFd>,
+    routing: Arc<Mutex<Routing>>,
 }
 
-impl KvmMsiSender {
-    /// Deliver `data` to `addr` through `KVM_SIGNAL_MSI` on the calling
-    /// thread.
-    pub fn send(&self, addr: u64, data: u32) -> Result<()> {
+impl MsiSender for KvmMsiSender {
+    type IrqFd = KvmIrqFd;
+
+    fn send(&self, addr: u64, data: u32) -> Result<()> {
         let msi = kvm_msi {
             address_lo: addr as u32,
             address_hi: (addr >> 32) as u32,
@@ -236,6 +326,81 @@ impl KvmMsiSender {
         };
         self.vm.signal_msi(msi).map_err(kvm_err("KVM_SIGNAL_MSI"))?;
         Ok(())
+    }
+
+    fn create_irqfd(&self) -> Result<KvmIrqFd> {
+        let eventfd = EventFd::new(EFD_NONBLOCK).map_err(kvm_err("eventfd"))?;
+        let gsi = {
+            let mut routing = self.routing.lock().unwrap();
+            let gsi = routing.take_gsi();
+            // Zeroed route until the caller sets address and data.
+            routing.msi.insert(gsi, MsiRoute::default());
+            gsi
+        };
+        self.vm
+            .register_irqfd(&eventfd, gsi)
+            .map_err(kvm_err("KVM_IRQFD"))?;
+        Ok(KvmIrqFd {
+            vm: Arc::clone(&self.vm),
+            routing: Arc::clone(&self.routing),
+            eventfd,
+            gsi,
+        })
+    }
+}
+
+/// eventfd bound to a GSI through `KVM_IRQFD`, together with the MSI
+/// route of that GSI. Writing the fd injects the MSI in kernel.
+pub struct KvmIrqFd {
+    vm: Arc<VmFd>,
+    routing: Arc<Mutex<Routing>>,
+    eventfd: EventFd,
+    gsi: u32,
+}
+
+impl KvmIrqFd {
+    /// Apply `change` to the route and rewrite the table.
+    fn update(&self, change: impl FnOnce(&mut MsiRoute)) -> Result<()> {
+        let mut routing = self.routing.lock().unwrap();
+        let route = routing
+            .msi
+            .get_mut(&self.gsi)
+            .ok_or(Error::Other("irqfd has no route"))?;
+        change(route);
+        routing.apply(&self.vm)
+    }
+}
+
+impl AsFd for KvmIrqFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: `eventfd` is owned by `self`, so the fd stays open during
+        // the lifetime of the borrow.
+        unsafe { BorrowedFd::borrow_raw(self.eventfd.as_raw_fd()) }
+    }
+}
+
+impl IrqFd for KvmIrqFd {
+    fn set_addr(&self, addr: u64) -> Result<()> {
+        self.update(|route| route.addr = addr)
+    }
+
+    fn set_data(&self, data: u32) -> Result<()> {
+        self.update(|route| route.data = data)
+    }
+
+    fn set_masked(&self, masked: bool) -> Result<()> {
+        self.update(|route| route.masked = masked)
+    }
+}
+
+impl Drop for KvmIrqFd {
+    fn drop(&mut self) {
+        // KVM detaches the irqfd on eventfd hangup. The route is dropped from
+        // the table, if the rewrite fails it stays in KVM with no fd bound to
+        // its GSI.
+        let mut routing = self.routing.lock().unwrap();
+        routing.msi.remove(&self.gsi);
+        let _ = routing.apply(&self.vm);
     }
 }
 
@@ -452,6 +617,49 @@ mod tests {
         let _cpu0 = vm.create_vcpu(0).expect("vcpu 0");
         // Vector 0x30, fixed delivery, addressed to APIC id 0.
         msi.send(0xfee0_0000, 0x30).expect("deliver to vcpu 0");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_irqfd_routing() {
+        // Check GSI assignment, masking and route removal of irqfds.
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        vm.enable_irqchip().expect("in-kernel irqchip");
+
+        // Legacy line. Its pin is in each table written after this.
+        let com1 = vm.create_irq_sender(4).expect("sender on IRQ 4");
+        assert!(vm.routing.lock().unwrap().pins.contains(&4));
+
+        let msi = vm.create_msi_sender().expect("msi sender");
+        let one = msi.create_irqfd().expect("irqfd");
+        let two = msi.create_irqfd().expect("second irqfd");
+        assert_ne!(one.gsi, two.gsi, "two irqfds got the same GSI");
+        assert!(one.gsi >= FIRST_MSI_GSI, "irqfd took a legacy pin number");
+
+        // Each call rewrites the table with the legacy pin and both MSI
+        // routes. `KVM_SET_GSI_ROUTING` fails on a table it can not route.
+        one.set_addr(0xfee0_0000).expect("address");
+        one.set_data(0x31).expect("data");
+        one.set_masked(false).expect("unmask");
+        two.set_addr(0xfee0_0000).expect("address");
+        two.set_data(0x32).expect("data");
+        two.set_masked(false).expect("unmask");
+
+        let routing = vm.routing.lock().unwrap();
+        assert!(routing.pins.contains(&4), "legacy pin left the table");
+        assert_eq!(routing.msi.len(), 2);
+        drop(routing);
+
+        one.eventfd.write(1).expect("fire the irqfd");
+        com1.send().expect("pulse IRQ 4");
+
+        let gone = two.gsi;
+        drop(two);
+        assert!(
+            !vm.routing.lock().unwrap().msi.contains_key(&gone),
+            "dropped irqfd left its route behind"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

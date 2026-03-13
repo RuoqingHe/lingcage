@@ -5,11 +5,14 @@
 //! Kernel-side MSI injection with an eventfd bound to an MSI through
 //! `KVM_IRQFD`.
 
+use std::os::fd::AsFd;
+
 use crate::hv::Result;
 
 /// eventfd bound to an MSI through `KVM_IRQFD`. Writing it injects the
-/// interrupt in kernel without involving the VMM.
-pub trait IrqFd: Send + Sync {
+/// interrupt in kernel without involving the VMM. Device writes it
+/// through `AsFd`.
+pub trait IrqFd: AsFd + Send + Sync {
     /// Set the MSI address.
     fn set_addr(&self, addr: u64) -> Result<()>;
 
