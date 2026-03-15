@@ -345,13 +345,11 @@ impl MsiSender for KvmMsiSender {
         let gsi = {
             let mut routing = self.routing.lock().unwrap();
             let gsi = routing.take_gsi();
-            // Masked until the caller sets address and data.
+            // Masked, so the route is out of the table and the fd is off the
+            // GSI until the caller sets address and data and unmasks it.
             routing.msi.insert(gsi, MsiRoute::default());
             gsi
         };
-        self.vm
-            .register_irqfd(&eventfd, gsi)
-            .map_err(kvm_err("KVM_IRQFD"))?;
         Ok(KvmIrqFd {
             vm: Arc::clone(&self.vm),
             routing: Arc::clone(&self.routing),
@@ -400,19 +398,39 @@ impl IrqFd for KvmIrqFd {
         self.update(|route| route.data = data)
     }
 
+    /// Masking unregisters the irqfd before the route leaves the table,
+    /// unmasking registers it after the route is in. Note that an irqfd on
+    /// a GSI without route panicked SVM hosts before kernel commit
+    /// a80ced6ea514.
     fn set_masked(&self, masked: bool) -> Result<()> {
-        self.update(|route| route.masked = masked)
+        let mut routing = self.routing.lock().unwrap();
+        let route = routing
+            .msi
+            .get_mut(&self.gsi)
+            .ok_or(Error::Other("irqfd has no route"))?;
+        if route.masked == masked {
+            return Ok(());
+        }
+        route.masked = masked;
+        if masked {
+            self.vm
+                .unregister_irqfd(&self.eventfd, self.gsi)
+                .map_err(kvm_err("KVM_IRQFD"))?;
+            routing.apply(&self.vm)
+        } else {
+            routing.apply(&self.vm)?;
+            self.vm
+                .register_irqfd(&self.eventfd, self.gsi)
+                .map_err(kvm_err("KVM_IRQFD"))
+        }
     }
 }
 
 impl Drop for KvmIrqFd {
     fn drop(&mut self) {
-        // KVM detaches the irqfd on eventfd hangup. The route is dropped from
-        // the table, if the rewrite fails it stays in KVM with no fd bound to
-        // its GSI.
-        let mut routing = self.routing.lock().unwrap();
-        routing.msi.remove(&self.gsi);
-        let _ = routing.apply(&self.vm);
+        // KVM detaches the irqfd on eventfd hangup. The route stays in the
+        // table held by KVM until next write, with no fd on its GSI.
+        self.routing.lock().unwrap().msi.remove(&self.gsi);
     }
 }
 
@@ -631,6 +649,25 @@ mod tests {
         msi.send(0xfee0_0000, 0x30).expect("deliver to vcpu 0");
     }
 
+    /// Returns whether `fd` is registered on its GSI. A second `KVM_IRQFD`
+    /// assign of a registered eventfd fails with `EBUSY`. Probe which
+    /// succeeds is undone afterwards.
+    #[cfg(target_arch = "x86_64")]
+    fn assigned(vm: &KvmVm, fd: &KvmIrqFd) -> bool {
+        match vm.fd.register_irqfd(&fd.eventfd, fd.gsi) {
+            Ok(()) => {
+                vm.fd
+                    .unregister_irqfd(&fd.eventfd, fd.gsi)
+                    .expect("undo the probe");
+                false
+            }
+            Err(err) => {
+                assert_eq!(err.errno(), 16, "expected EBUSY");
+                true
+            }
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_irqfd_routing() {
@@ -660,6 +697,8 @@ mod tests {
             "route without message went to KVM"
         );
         drop(fresh);
+        // Masked irqfd is not registered on its GSI.
+        assert!(!assigned(&vm, &one), "unprogrammed irqfd holds its GSI");
 
         // Each call rewrites the table with the legacy pin and both MSI
         // routes. `KVM_SET_GSI_ROUTING` fails on a table it can not route.
@@ -669,6 +708,15 @@ mod tests {
         two.set_addr(0xfee0_0000).expect("address");
         two.set_data(0x32).expect("data");
         two.set_masked(false).expect("unmask");
+        assert!(assigned(&vm, &one), "unmasked irqfd is off its GSI");
+
+        // Masking unregisters the fd, repeating it is a no-op, and unmasking
+        // registers it again.
+        one.set_masked(true).expect("mask");
+        assert!(!assigned(&vm, &one), "masked irqfd holds its GSI");
+        one.set_masked(true).expect("mask twice");
+        one.set_masked(false).expect("unmask again");
+        assert!(assigned(&vm, &one), "unmasked irqfd is off its GSI");
 
         let routing = vm.routing.lock().unwrap();
         assert!(routing.pins.contains(&4), "legacy pin left the table");
