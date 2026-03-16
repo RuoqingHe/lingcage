@@ -9,6 +9,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_arch = "x86_64")]
+use kvm_bindings::KVM_EXIT_IO_IN;
 use kvm_bindings::{
     KVM_API_VERSION, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MEM_LOG_DIRTY_PAGES,
     KVM_MEM_READONLY, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, KvmIrqRouting,
@@ -212,15 +214,27 @@ impl VmMemory for KvmMemory {
     }
 }
 
-/// Read exit waiting for its value. KVM completes the read on the next
-/// `KVM_RUN` from the `kvm_run` page, so the value is written there
-/// before entering.
-enum PendingRead {
-    /// Port IN, bytes go to `io.data_offset` in the `kvm_run` page.
+/// Exit still being reported or waiting for its value. KVM completes it
+/// on the next `KVM_RUN` from the `kvm_run` page.
+enum Pending {
+    /// Port instruction in progress. Access `next` is reported on the next
+    /// `run`, access `next - 1` is the read waiting for its value.
     #[cfg(target_arch = "x86_64")]
-    Io { len: usize },
-    /// MMIO read, bytes go to `mmio.data`.
+    Port { next: u32 },
+    /// MMIO read of `len` bytes, value goes to `mmio.data`.
     Mmio { len: usize },
+}
+
+/// `KVM_EXIT_IO` as decoded from the `kvm_run` page, `count` accesses of
+/// `size` bytes, packed from `offset`. String instruction has `count`
+/// above one.
+#[cfg(target_arch = "x86_64")]
+struct PortAccess {
+    port: u16,
+    size: u8,
+    count: u32,
+    offset: usize,
+    is_in: bool,
 }
 
 /// Decode `data`, little endian and at most eight bytes.
@@ -235,21 +249,36 @@ fn le(data: &[u8]) -> u64 {
 /// waiting for its value.
 pub struct KvmVcpu {
     fd: VcpuFd,
-    pending: Option<PendingRead>,
+    pending: Option<Pending>,
 }
 
 impl KvmVcpu {
     /// Run the vCPU until next exit. Pending read is completed from `entry`
     /// before entering the guest.
     pub fn run(&mut self, entry: VmEntry) -> Result<VmExit> {
-        if let Some(pending) = self.pending.take() {
-            let value = match entry {
-                #[cfg(target_arch = "x86_64")]
-                VmEntry::Io { data } => u64::from(data),
-                VmEntry::Mmio { data } => data,
-                _ => 0,
-            };
-            self.complete_read(pending, value);
+        match self.pending.take() {
+            #[cfg(target_arch = "x86_64")]
+            Some(Pending::Port { next }) => {
+                let access = self.port_access();
+                if access.is_in
+                    && let VmEntry::Io { data } = entry
+                {
+                    self.write_slot(&access, next - 1, u64::from(data));
+                }
+                // String instruction is one exit of `count` accesses, the rest
+                // are reported without entering the guest.
+                if next < access.count {
+                    return Ok(self.report_port(&access, next));
+                }
+            }
+            Some(Pending::Mmio { len }) => {
+                let value = match entry {
+                    VmEntry::Mmio { data } => data,
+                    _ => 0,
+                };
+                self.complete_mmio(len, value);
+            }
+            None => {}
         }
 
         // Stop still enters `KVM_RUN`, with `immediate_exit` set. KVM
@@ -263,25 +292,14 @@ impl KvmVcpu {
             self.fd.set_kvm_immediate_exit(1);
         }
 
-        let mut pending = None;
+        #[cfg(target_arch = "x86_64")]
+        let mut port = false;
+        let mut mmio = None;
         let exit = match self.fd.run() {
             #[cfg(target_arch = "x86_64")]
-            Ok(VcpuExit::IoOut(port, data)) => Some(VmExit::Io {
-                port,
-                write: Some(le(data) as u32),
-                size: data.len() as u8,
-            }),
-            #[cfg(target_arch = "x86_64")]
-            Ok(VcpuExit::IoIn(port, data)) => {
-                let size = data.len() as u8;
-                pending = Some(PendingRead::Io {
-                    len: data.len().min(8),
-                });
-                Some(VmExit::Io {
-                    port,
-                    write: None,
-                    size,
-                })
+            Ok(VcpuExit::IoOut(..) | VcpuExit::IoIn(..)) => {
+                port = true;
+                None
             }
             Ok(VcpuExit::MmioWrite(addr, data)) => Some(VmExit::Mmio {
                 addr,
@@ -290,7 +308,7 @@ impl KvmVcpu {
             }),
             Ok(VcpuExit::MmioRead(addr, data)) => {
                 let size = data.len() as u8;
-                pending = Some(PendingRead::Mmio {
+                mmio = Some(Pending::Mmio {
                     len: data.len().min(8),
                 });
                 Some(VmExit::Mmio {
@@ -328,9 +346,14 @@ impl KvmVcpu {
                 };
             }
         };
-        self.pending = pending;
+        self.pending = mmio;
         if stop.is_some() {
             self.fd.set_kvm_immediate_exit(0);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if port {
+            let access = self.port_access();
+            return Ok(self.report_port(&access, 0));
         }
         match exit {
             Some(exit) => Ok(exit),
@@ -341,30 +364,79 @@ impl KvmVcpu {
         }
     }
 
-    /// Write `value` into the `kvm_run` slot which KVM completes the pending
-    /// read from.
-    fn complete_read(&mut self, pending: PendingRead, value: u64) {
+    /// Decode the `KVM_EXIT_IO` in the `kvm_run` page.
+    #[cfg(target_arch = "x86_64")]
+    fn port_access(&mut self) -> PortAccess {
+        let run = self.fd.get_kvm_run();
+        // SAFETY: the exit was `KVM_EXIT_IO`, so `io` is the union arm filled
+        // in by KVM.
+        let io = unsafe { run.__bindgen_anon_1.io };
+        PortAccess {
+            port: io.port,
+            size: io.size,
+            count: io.count,
+            offset: io.data_offset as usize,
+            is_in: io.direction == KVM_EXIT_IO_IN as u8,
+        }
+    }
+
+    /// Report access `index` of `access` and record `index + 1` as the next
+    /// one to report.
+    #[cfg(target_arch = "x86_64")]
+    fn report_port(&mut self, access: &PortAccess, index: u32) -> VmExit {
+        let write = if access.is_in {
+            None
+        } else {
+            Some(self.read_slot(access, index) as u32)
+        };
+        self.pending = Some(Pending::Port { next: index + 1 });
+        VmExit::Io {
+            port: access.port,
+            write,
+            size: access.size,
+        }
+    }
+
+    /// Returns address of access `index` in the `kvm_run` page.
+    #[cfg(target_arch = "x86_64")]
+    fn slot(&mut self, access: &PortAccess, index: u32) -> *mut u8 {
+        let run = self.fd.get_kvm_run();
+        let page = std::ptr::from_mut(run).cast::<u8>();
+        let at = access.offset + index as usize * access.size as usize;
+        // SAFETY: KVM packs `count * size` bytes at `data_offset` inside the
+        // page, and `index` is below `count`.
+        unsafe { page.add(at) }
+    }
+
+    /// Read the value of OUT access `index`.
+    #[cfg(target_arch = "x86_64")]
+    fn read_slot(&mut self, access: &PortAccess, index: u32) -> u64 {
+        let len = (access.size as usize).min(8);
+        let mut bytes = [0u8; 8];
+        let slot = self.slot(access, index);
+        // SAFETY: `slot` points at `size` bytes written by KVM.
+        unsafe { std::ptr::copy_nonoverlapping(slot, bytes.as_mut_ptr(), len) };
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Write `value` into the slot of IN access `index`.
+    #[cfg(target_arch = "x86_64")]
+    fn write_slot(&mut self, access: &PortAccess, index: u32, value: u64) {
+        let len = (access.size as usize).min(8);
+        let bytes = value.to_le_bytes();
+        let slot = self.slot(access, index);
+        // SAFETY: `slot` points at `size` bytes KVM reads on the next entry.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, len) };
+    }
+
+    /// Write `value` into `mmio.data` for the pending MMIO read.
+    fn complete_mmio(&mut self, len: usize, value: u64) {
         let bytes = value.to_le_bytes();
         let run = self.fd.get_kvm_run();
-        match pending {
-            #[cfg(target_arch = "x86_64")]
-            PendingRead::Io { len } => {
-                // SAFETY: the pending exit was `KVM_EXIT_IO`, so `io` is the
-                // union arm filled in by KVM.
-                let offset = unsafe { run.__bindgen_anon_1.io.data_offset } as usize;
-                let page = std::ptr::from_mut(run).cast::<u8>();
-                // SAFETY: `data_offset` is relative to the start of the
-                // `kvm_run` page and `len` is the width of the same exit, so
-                // the write stays inside the page.
-                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), page.add(offset), len) };
-            }
-            PendingRead::Mmio { len } => {
-                // SAFETY: the pending exit was `KVM_EXIT_MMIO`, so `mmio` is
-                // the union arm filled in by KVM.
-                let mmio = unsafe { &mut run.__bindgen_anon_1.mmio };
-                mmio.data[..len].copy_from_slice(&bytes[..len]);
-            }
-        }
+        // SAFETY: the pending exit was `KVM_EXIT_MMIO`, so `mmio` is the
+        // union arm filled in by KVM.
+        let mmio = unsafe { &mut run.__bindgen_anon_1.mmio };
+        mmio.data[..len].copy_from_slice(&bytes[..len]);
     }
 }
 
@@ -841,6 +913,71 @@ mod tests {
         // SAFETY: `host` came from `alloc_zeroed` with `layout` and is not
         // mapped into the guest anymore.
         unsafe { dealloc(host, layout) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_string_read_reported_per_access() {
+        // rep insb is one KVM exit, each access should be reported alone.
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mem = vm.create_vm_memory().expect("address space");
+
+        let layout = Layout::from_size_align(PAGE, PAGE).expect("page-aligned layout");
+        // SAFETY: `layout` has non-zero size.
+        let low = unsafe { alloc_zeroed(layout) };
+        // SAFETY: same as above.
+        let reset = unsafe { alloc_zeroed(layout) };
+        assert!(!low.is_null() && !reset.is_null());
+
+        // rep insb: three reads of port 0xf9 stored at ES:DI, which is guest
+        // address zero out of reset.
+        let code = [
+            0xba, 0xf9, 0x00, // mov dx, 0x00f9
+            0xbf, 0x00, 0x00, // mov di, 0x0000
+            0xb9, 0x03, 0x00, // mov cx, 3
+            0xf3, 0x6c, // rep insb
+            0xf4, // hlt
+        ];
+        // SAFETY: the allocation is one page and `code` fits at 0xff0.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), reset.add(0xff0), code.len()) };
+        mem.mem_map(0, PAGE as u64, low as usize, MemMapOption::default())
+            .expect("map the page guest writes to");
+        mem.mem_map(
+            0xffff_f000,
+            PAGE as u64,
+            reset as usize,
+            MemMapOption::default(),
+        )
+        .expect("map the reset vector");
+
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        let read = VmExit::Io {
+            port: 0xf9,
+            write: None,
+            size: 1,
+        };
+        // KVM reports the three reads as one exit with `count` 3, each one
+        // is reported to the caller as a one-byte access.
+        assert_eq!(cpu.run(VmEntry::Run).expect("run"), read);
+        assert_eq!(cpu.run(VmEntry::Io { data: 0x11 }).expect("run"), read);
+        assert_eq!(cpu.run(VmEntry::Io { data: 0x22 }).expect("run"), read);
+        // Third value completes the instruction and the guest runs on.
+        assert_eq!(
+            cpu.run(VmEntry::Io { data: 0x33 }).expect("run"),
+            VmExit::Halt
+        );
+
+        // SAFETY: `low` is one page, and the guest wrote its first three bytes.
+        let written = unsafe { std::slice::from_raw_parts(low, 3) };
+        assert_eq!(written, [0x11, 0x22, 0x33], "reads landed out of order");
+
+        // SAFETY: both came from `alloc_zeroed` with `layout` and are not
+        // mapped into the guest anymore.
+        unsafe {
+            dealloc(low, layout);
+            dealloc(reset, layout);
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
