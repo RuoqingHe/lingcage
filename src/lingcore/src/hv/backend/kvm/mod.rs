@@ -11,18 +11,20 @@ use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{
     KVM_API_VERSION, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MEM_LOG_DIRTY_PAGES,
-    KVM_MEM_READONLY, KvmIrqRouting, kvm_irq_routing_entry, kvm_irq_routing_irqchip,
-    kvm_irq_routing_msi, kvm_msi, kvm_userspace_memory_region,
+    KVM_MEM_READONLY, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, KvmIrqRouting,
+    kvm_irq_routing_entry, kvm_irq_routing_irqchip, kvm_irq_routing_msi, kvm_msi,
+    kvm_userspace_memory_region,
 };
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
-use kvm_ioctls::{Cap, IoEventAddress, Kvm, NoDatamatch, VcpuFd, VmFd};
+use kvm_ioctls::{Cap, IoEventAddress, Kvm, NoDatamatch, VcpuExit, VcpuFd, VmFd};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 use crate::hv::irq::{IrqSender, MsiSender};
 use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
 use crate::hv::os::linux::irqfd::IrqFd;
+use crate::hv::vcpu::{VmEntry, VmExit};
 use crate::hv::{Error, Result};
 
 /// Map a `kvm_ioctls::Error`, or the `io::Error` of an eventfd call, to
@@ -111,7 +113,7 @@ impl KvmVm {
             .fd
             .create_vcpu(u64::from(cpu_index))
             .map_err(kvm_err("KVM_CREATE_VCPU"))?;
-        Ok(KvmVcpu { fd })
+        Ok(KvmVcpu { fd, pending: None })
     }
 
     /// Bind a new eventfd to irqchip pin `pin` through `KVM_IRQFD` and
@@ -210,11 +212,160 @@ impl VmMemory for KvmMemory {
     }
 }
 
-/// vCPU handle, the fd returned by `KVM_CREATE_VCPU`.
+/// Read exit waiting for its value. KVM completes the read on the next
+/// `KVM_RUN` from the `kvm_run` page, so the value is written there
+/// before entering.
+enum PendingRead {
+    /// Port IN, bytes go to `io.data_offset` in the `kvm_run` page.
+    #[cfg(target_arch = "x86_64")]
+    Io { len: usize },
+    /// MMIO read, bytes go to `mmio.data`.
+    Mmio { len: usize },
+}
+
+/// Decode `data`, little endian and at most eight bytes.
+fn le(data: &[u8]) -> u64 {
+    let mut bytes = [0u8; 8];
+    let len = data.len().min(bytes.len());
+    bytes[..len].copy_from_slice(&data[..len]);
+    u64::from_le_bytes(bytes)
+}
+
+/// vCPU handle, the fd returned by `KVM_CREATE_VCPU`, plus the read exit
+/// waiting for its value.
 pub struct KvmVcpu {
-    // TODO: drop the attribute once running the vCPU reads this fd.
-    #[cfg_attr(not(test), expect(dead_code, reason = "only the test reads the fd"))]
     fd: VcpuFd,
+    pending: Option<PendingRead>,
+}
+
+impl KvmVcpu {
+    /// Run the vCPU until next exit. Pending read is completed from `entry`
+    /// before entering the guest.
+    pub fn run(&mut self, entry: VmEntry) -> Result<VmExit> {
+        if let Some(pending) = self.pending.take() {
+            let value = match entry {
+                #[cfg(target_arch = "x86_64")]
+                VmEntry::Io { data } => u64::from(data),
+                VmEntry::Mmio { data } => data,
+                _ => 0,
+            };
+            self.complete_read(pending, value);
+        }
+
+        // Stop still enters `KVM_RUN`, with `immediate_exit` set. KVM
+        // completes the pending operation and returns `EINTR`.
+        let stop = match entry {
+            VmEntry::Shutdown => Some(VmExit::Shutdown),
+            VmEntry::Reboot => Some(VmExit::Reboot),
+            _ => None,
+        };
+        if stop.is_some() {
+            self.fd.set_kvm_immediate_exit(1);
+        }
+
+        let mut pending = None;
+        let exit = match self.fd.run() {
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuExit::IoOut(port, data)) => Some(VmExit::Io {
+                port,
+                write: Some(le(data) as u32),
+                size: data.len() as u8,
+            }),
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuExit::IoIn(port, data)) => {
+                let size = data.len() as u8;
+                pending = Some(PendingRead::Io {
+                    len: data.len().min(8),
+                });
+                Some(VmExit::Io {
+                    port,
+                    write: None,
+                    size,
+                })
+            }
+            Ok(VcpuExit::MmioWrite(addr, data)) => Some(VmExit::Mmio {
+                addr,
+                write: Some(le(data)),
+                size: data.len() as u8,
+            }),
+            Ok(VcpuExit::MmioRead(addr, data)) => {
+                let size = data.len() as u8;
+                pending = Some(PendingRead::Mmio {
+                    len: data.len().min(8),
+                });
+                Some(VmExit::Mmio {
+                    addr,
+                    write: None,
+                    size,
+                })
+            }
+            Ok(VcpuExit::Hlt) => Some(VmExit::Halt),
+            Ok(VcpuExit::Shutdown) => Some(VmExit::Shutdown),
+            Ok(VcpuExit::Intr) => Some(VmExit::Interrupted),
+            Ok(VcpuExit::Debug(_)) => Some(VmExit::Debug),
+            Ok(VcpuExit::Hypercall(call)) => Some(VmExit::Hypercall {
+                nr: call.nr,
+                args: call.args,
+            }),
+            Ok(VcpuExit::SystemEvent(kind, _)) => Some(match kind {
+                KVM_SYSTEM_EVENT_SHUTDOWN => VmExit::Shutdown,
+                KVM_SYSTEM_EVENT_RESET => VmExit::Reboot,
+                other => VmExit::Unknown(u64::from(other)),
+            }),
+            Ok(_) => None,
+            Err(err) => {
+                self.fd.set_kvm_immediate_exit(0);
+                // `EINTR` and `EAGAIN` are not failures, vCPU state is intact
+                // and caller re-enters.
+                let cut_short = matches!(
+                    std::io::Error::from_raw_os_error(err.errno()).kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                );
+                return match (cut_short, stop) {
+                    (true, Some(exit)) => Ok(exit),
+                    (true, None) => Ok(VmExit::Interrupted),
+                    (false, _) => Err(kvm_err("KVM_RUN")(err)),
+                };
+            }
+        };
+        self.pending = pending;
+        if stop.is_some() {
+            self.fd.set_kvm_immediate_exit(0);
+        }
+        match exit {
+            Some(exit) => Ok(exit),
+            // Exit reason not mapped above, caller logs the raw value.
+            None => Ok(VmExit::Unknown(u64::from(
+                self.fd.get_kvm_run().exit_reason,
+            ))),
+        }
+    }
+
+    /// Write `value` into the `kvm_run` slot which KVM completes the pending
+    /// read from.
+    fn complete_read(&mut self, pending: PendingRead, value: u64) {
+        let bytes = value.to_le_bytes();
+        let run = self.fd.get_kvm_run();
+        match pending {
+            #[cfg(target_arch = "x86_64")]
+            PendingRead::Io { len } => {
+                // SAFETY: the pending exit was `KVM_EXIT_IO`, so `io` is the
+                // union arm filled in by KVM.
+                let offset = unsafe { run.__bindgen_anon_1.io.data_offset } as usize;
+                let page = std::ptr::from_mut(run).cast::<u8>();
+                // SAFETY: `data_offset` is relative to the start of the
+                // `kvm_run` page and `len` is the width of the same exit, so
+                // the write stays inside the page.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), page.add(offset), len) };
+            }
+            PendingRead::Mmio { len } => {
+                // SAFETY: the pending exit was `KVM_EXIT_MMIO`, so `mmio` is
+                // the union arm filled in by KVM.
+                let mmio = unsafe { &mut run.__bindgen_anon_1.mmio };
+                mmio.data[..len].copy_from_slice(&bytes[..len]);
+            }
+        }
+    }
 }
 
 /// Legacy interrupt line, the eventfd bound to its pin by `KVM_IRQFD`.
@@ -627,6 +778,69 @@ mod tests {
             registry.register(&eventfd, 0x3000, 3, Some(1)).is_err(),
             "three-byte datamatch accepted"
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_run_and_complete_port_read() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mem = vm.create_vm_memory().expect("address space");
+
+        // Page of the reset vector. x86 vCPU starts fetching at
+        // 0xffff_fff0, so the guest runs without setting any register.
+        const GPA: u64 = 0xffff_f000;
+        let layout = Layout::from_size_align(PAGE, PAGE).expect("page-aligned layout");
+        // SAFETY: `layout` has non-zero size.
+        let host = unsafe { alloc_zeroed(layout) };
+        assert!(!host.is_null());
+        let code = [
+            0xb0, 0x42, // mov al, 0x42
+            0xe6, 0xf8, // out 0xf8, al
+            0xe4, 0xf9, // in al, 0xf9
+            0xe6, 0xfa, // out 0xfa, al
+            0xf4, // hlt
+        ];
+        // SAFETY: the allocation is one page and `code` fits at 0xff0.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), host.add(0xff0), code.len()) };
+        mem.mem_map(GPA, PAGE as u64, host as usize, MemMapOption::default())
+            .expect("map the reset vector");
+
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Io {
+                port: 0xf8,
+                write: Some(0x42),
+                size: 1
+            }
+        );
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Io {
+                port: 0xf9,
+                write: None,
+                size: 1
+            }
+        );
+        // Guest writes the value of the IN to port 0xfa next, which shows
+        // the read was completed.
+        assert_eq!(
+            cpu.run(VmEntry::Io { data: 0x99 })
+                .expect("answer the read"),
+            VmExit::Io {
+                port: 0xfa,
+                write: Some(0x99),
+                size: 1
+            }
+        );
+        // Without in-kernel irqchip, `HLT` exits to userspace.
+        assert_eq!(cpu.run(VmEntry::Run).expect("run"), VmExit::Halt);
+        assert_eq!(cpu.run(VmEntry::Shutdown).expect("stop"), VmExit::Shutdown);
+
+        // SAFETY: `host` came from `alloc_zeroed` with `layout` and is not
+        // mapped into the guest anymore.
+        unsafe { dealloc(host, layout) };
     }
 
     #[cfg(target_arch = "x86_64")]
