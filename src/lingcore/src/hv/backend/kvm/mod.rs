@@ -917,6 +917,76 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn test_ioeventfd_avoids_mmio_exit() {
+        // Guest write should signal the eventfd instead of exiting as MMIO.
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let layout = Layout::from_size_align(PAGE, PAGE).expect("page-aligned layout");
+        // No memory is mapped at `NOTIFY`. Write to it exits as MMIO unless an
+        // ioeventfd is bound there.
+        const NOTIFY: u64 = 0x8000;
+        let code = [
+            0xbb, 0x00, 0x80, // mov bx, 0x8000
+            0xb0, 0x42, // mov al, 0x42
+            0x88, 0x07, // mov [bx], al
+            0xf4, // hlt
+        ];
+
+        // Build a guest with only the reset vector page mapped. Caller frees
+        // `reset` once the guest is not run anymore.
+        let guest = |hv: &KvmHv| {
+            let vm = hv.create_vm().expect("guest");
+            let mem = vm.create_vm_memory().expect("address space");
+            // SAFETY: `layout` has non-zero size.
+            let reset = unsafe { alloc_zeroed(layout) };
+            assert!(!reset.is_null());
+            // SAFETY: the allocation is one page and `code` fits at 0xff0.
+            unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), reset.add(0xff0), code.len()) };
+            mem.mem_map(
+                0xffff_f000,
+                PAGE as u64,
+                reset as usize,
+                MemMapOption::default(),
+            )
+            .expect("map the reset vector");
+            (vm, mem, reset)
+        };
+
+        // Without ioeventfd, the write exits as MMIO.
+        let (vm, _mem, reset) = guest(&hv);
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Mmio {
+                addr: NOTIFY,
+                write: Some(0x42),
+                size: 1
+            }
+        );
+        // SAFETY: `reset` came from `alloc_zeroed` with `layout`, and the
+        // guest is not run anymore.
+        unsafe { dealloc(reset, layout) };
+
+        // With an ioeventfd bound at `NOTIFY`, KVM signals it instead of
+        // exiting, guest runs on to `hlt`.
+        let (vm, _mem, reset) = guest(&hv);
+        let registry = vm.create_ioeventfd_registry();
+        let eventfd = registry.create().expect("ioeventfd");
+        registry
+            .register(&eventfd, NOTIFY, 1, None)
+            .expect("bind the ioeventfd");
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Halt,
+            "write exited as MMIO"
+        );
+        assert_eq!(eventfd.eventfd.read().expect("ioeventfd signalled"), 1);
+        // SAFETY: same as above.
+        unsafe { dealloc(reset, layout) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_string_read_reported_per_access() {
         // rep insb is one KVM exit, each access should be reported alone.
         let hv = KvmHv::new().expect("open /dev/kvm");
