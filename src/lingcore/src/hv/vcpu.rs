@@ -4,6 +4,8 @@
 
 //! The `Vcpu` trait, exit reasons and the entry action for next `run`.
 
+#[cfg(target_arch = "x86_64")]
+use crate::hv::arch::{DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
 use crate::hv::{Error, Result, StateBlob};
 
 /// Reason a vCPU exited, mapped by the backend from the native exit.
@@ -76,19 +78,34 @@ pub trait Vcpu: Send {
 
     /// Read one general register.
     #[cfg(target_arch = "x86_64")]
-    fn get_reg(&self, reg: crate::hv::arch::Reg) -> Result<u64>;
+    fn get_reg(&self, reg: Reg) -> Result<u64>;
 
     /// Set general registers in one batch.
     #[cfg(target_arch = "x86_64")]
-    fn set_regs(&mut self, vals: &[(crate::hv::arch::Reg, u64)]) -> Result<()>;
+    fn set_regs(&mut self, vals: &[(Reg, u64)]) -> Result<()>;
 
     /// Read a segment register, decoded into `SegRegVal`.
     #[cfg(target_arch = "x86_64")]
-    fn get_seg_reg(&self, reg: crate::hv::arch::SegReg) -> Result<crate::hv::arch::SegRegVal>;
+    fn get_seg_reg(&self, reg: SegReg) -> Result<SegRegVal>;
 
-    /// Set control and model specific registers in one batch.
+    /// Read a descriptor table register, decoded into `DtRegVal`.
     #[cfg(target_arch = "x86_64")]
-    fn set_sregs(&mut self, sregs: &[(crate::hv::arch::SReg, u64)]) -> Result<()>;
+    fn get_dt_reg(&self, reg: DtReg) -> Result<DtRegVal>;
+
+    /// Read one control or special register.
+    #[cfg(target_arch = "x86_64")]
+    fn get_sreg(&self, reg: SReg) -> Result<u64>;
+
+    /// Set control, segment and descriptor table registers in one batch.
+    /// `CR0`, `EFER`, the code segment and the tables indexed by its
+    /// selectors describe one mode together, so they are written together.
+    #[cfg(target_arch = "x86_64")]
+    fn set_sregs(
+        &mut self,
+        sregs: &[(SReg, u64)],
+        seg_regs: &[(SegReg, SegRegVal)],
+        dt_regs: &[(DtReg, DtRegVal)],
+    ) -> Result<()>;
 
     /// Capture the vCPU state as a `StateBlob`. Default returns
     /// `Unsupported`.
