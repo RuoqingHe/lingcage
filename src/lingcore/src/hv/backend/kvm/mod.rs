@@ -22,11 +22,13 @@ use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
 use kvm_ioctls::{Cap, IoEventAddress, Kvm, NoDatamatch, VcpuExit, VcpuFd, VmFd};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
+#[cfg(target_arch = "x86_64")]
+use crate::hv::arch::{DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
 use crate::hv::irq::{IrqSender, MsiSender};
 use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
 use crate::hv::os::linux::irqfd::IrqFd;
-use crate::hv::vcpu::{VmEntry, VmExit};
+use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
 use crate::hv::{Error, Result};
 
 /// Map a `kvm_ioctls::Error`, or the `io::Error` of an eventfd call, to
@@ -252,10 +254,8 @@ pub struct KvmVcpu {
     pending: Option<Pending>,
 }
 
-impl KvmVcpu {
-    /// Run the vCPU until next exit. Pending read is completed from `entry`
-    /// before entering the guest.
-    pub fn run(&mut self, entry: VmEntry) -> Result<VmExit> {
+impl Vcpu for KvmVcpu {
+    fn run(&mut self, entry: VmEntry) -> Result<VmExit> {
         match self.pending.take() {
             #[cfg(target_arch = "x86_64")]
             Some(Pending::Port { next }) => {
@@ -364,6 +364,195 @@ impl KvmVcpu {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn get_reg(&self, reg: Reg) -> Result<u64> {
+        let regs = self.fd.get_regs().map_err(kvm_err("KVM_GET_REGS"))?;
+        Ok(match reg {
+            Reg::Rax => regs.rax,
+            Reg::Rbx => regs.rbx,
+            Reg::Rcx => regs.rcx,
+            Reg::Rdx => regs.rdx,
+            Reg::Rsi => regs.rsi,
+            Reg::Rdi => regs.rdi,
+            Reg::Rsp => regs.rsp,
+            Reg::Rbp => regs.rbp,
+            Reg::R8 => regs.r8,
+            Reg::R9 => regs.r9,
+            Reg::R10 => regs.r10,
+            Reg::R11 => regs.r11,
+            Reg::R12 => regs.r12,
+            Reg::R13 => regs.r13,
+            Reg::R14 => regs.r14,
+            Reg::R15 => regs.r15,
+            Reg::Rip => regs.rip,
+            Reg::Rflags => regs.rflags,
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_regs(&mut self, vals: &[(Reg, u64)]) -> Result<()> {
+        // `KVM_SET_REGS` takes the full `kvm_regs`, registers not in `vals`
+        // are read and written back unchanged.
+        let mut regs = self.fd.get_regs().map_err(kvm_err("KVM_GET_REGS"))?;
+        for &(reg, val) in vals {
+            match reg {
+                Reg::Rax => regs.rax = val,
+                Reg::Rbx => regs.rbx = val,
+                Reg::Rcx => regs.rcx = val,
+                Reg::Rdx => regs.rdx = val,
+                Reg::Rsi => regs.rsi = val,
+                Reg::Rdi => regs.rdi = val,
+                Reg::Rsp => regs.rsp = val,
+                Reg::Rbp => regs.rbp = val,
+                Reg::R8 => regs.r8 = val,
+                Reg::R9 => regs.r9 = val,
+                Reg::R10 => regs.r10 = val,
+                Reg::R11 => regs.r11 = val,
+                Reg::R12 => regs.r12 = val,
+                Reg::R13 => regs.r13 = val,
+                Reg::R14 => regs.r14 = val,
+                Reg::R15 => regs.r15 = val,
+                Reg::Rip => regs.rip = val,
+                Reg::Rflags => regs.rflags = val,
+            }
+        }
+        self.fd.set_regs(&regs).map_err(kvm_err("KVM_SET_REGS"))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_seg_reg(&self, reg: SegReg) -> Result<SegRegVal> {
+        let sregs = self.fd.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?;
+        let seg = match reg {
+            SegReg::Cs => sregs.cs,
+            SegReg::Ds => sregs.ds,
+            SegReg::Es => sregs.es,
+            SegReg::Fs => sregs.fs,
+            SegReg::Gs => sregs.gs,
+            SegReg::Ss => sregs.ss,
+            SegReg::Tr => sregs.tr,
+            SegReg::Ldtr => sregs.ldt,
+        };
+        Ok(SegRegVal {
+            base: seg.base,
+            limit: seg.limit,
+            selector: seg.selector,
+            attr: pack_attr(&seg),
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_dt_reg(&self, reg: DtReg) -> Result<DtRegVal> {
+        let sregs = self.fd.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?;
+        let table = match reg {
+            DtReg::Gdt => sregs.gdt,
+            DtReg::Idt => sregs.idt,
+        };
+        Ok(DtRegVal {
+            base: table.base,
+            limit: table.limit,
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_sreg(&self, reg: SReg) -> Result<u64> {
+        let sregs = self.fd.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?;
+        Ok(match reg {
+            SReg::Cr0 => sregs.cr0,
+            SReg::Cr2 => sregs.cr2,
+            SReg::Cr3 => sregs.cr3,
+            SReg::Cr4 => sregs.cr4,
+            SReg::Cr8 => sregs.cr8,
+            SReg::Efer => sregs.efer,
+            SReg::ApicBase => sregs.apic_base,
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_sregs(
+        &mut self,
+        sregs: &[(SReg, u64)],
+        seg_regs: &[(SegReg, SegRegVal)],
+        dt_regs: &[(DtReg, DtRegVal)],
+    ) -> Result<()> {
+        // `KVM_SET_SREGS` takes the full `kvm_sregs`, so the three groups go
+        // in one write and the rest is read and written back unchanged.
+        let mut all = self.fd.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?;
+        for &(reg, val) in sregs {
+            match reg {
+                SReg::Cr0 => all.cr0 = val,
+                SReg::Cr2 => all.cr2 = val,
+                SReg::Cr3 => all.cr3 = val,
+                SReg::Cr4 => all.cr4 = val,
+                SReg::Cr8 => all.cr8 = val,
+                SReg::Efer => all.efer = val,
+                SReg::ApicBase => all.apic_base = val,
+            }
+        }
+        for &(reg, val) in seg_regs {
+            let seg = kvm_seg(&val);
+            match reg {
+                SegReg::Cs => all.cs = seg,
+                SegReg::Ds => all.ds = seg,
+                SegReg::Es => all.es = seg,
+                SegReg::Fs => all.fs = seg,
+                SegReg::Gs => all.gs = seg,
+                SegReg::Ss => all.ss = seg,
+                SegReg::Tr => all.tr = seg,
+                SegReg::Ldtr => all.ldt = seg,
+            }
+        }
+        for &(reg, val) in dt_regs {
+            let table = kvm_bindings::kvm_dtable {
+                base: val.base,
+                limit: val.limit,
+                ..Default::default()
+            };
+            match reg {
+                DtReg::Gdt => all.gdt = table,
+                DtReg::Idt => all.idt = table,
+            }
+        }
+        self.fd.set_sregs(&all).map_err(kvm_err("KVM_SET_SREGS"))
+    }
+}
+
+/// Convert `val` to a `kvm_segment`, `attr` is unpacked into the access
+/// rights fields, one per byte.
+#[cfg(target_arch = "x86_64")]
+fn kvm_seg(val: &SegRegVal) -> kvm_bindings::kvm_segment {
+    kvm_bindings::kvm_segment {
+        base: val.base,
+        limit: val.limit,
+        selector: val.selector,
+        type_: (val.attr & 0xf) as u8,
+        s: (val.attr >> 4) as u8 & 1,
+        dpl: (val.attr >> 5) as u8 & 3,
+        present: (val.attr >> 7) as u8 & 1,
+        avl: (val.attr >> 12) as u8 & 1,
+        l: (val.attr >> 13) as u8 & 1,
+        db: (val.attr >> 14) as u8 & 1,
+        g: (val.attr >> 15) as u8 & 1,
+        unusable: 0,
+        padding: 0,
+    }
+}
+
+/// Pack access rights of `seg` into one word in descriptor layout, type
+/// in bits 0-3, S, DPL and P through bit 7, AVL, L, D/B and G from bit
+/// 12.
+#[cfg(target_arch = "x86_64")]
+fn pack_attr(seg: &kvm_bindings::kvm_segment) -> u16 {
+    u16::from(seg.type_)
+        | u16::from(seg.s) << 4
+        | u16::from(seg.dpl) << 5
+        | u16::from(seg.present) << 7
+        | u16::from(seg.avl) << 12
+        | u16::from(seg.l) << 13
+        | u16::from(seg.db) << 14
+        | u16::from(seg.g) << 15
+}
+
+impl KvmVcpu {
     /// Decode the `KVM_EXIT_IO` in the `kvm_run` page.
     #[cfg(target_arch = "x86_64")]
     fn port_access(&mut self) -> PortAccess {
@@ -912,6 +1101,139 @@ mod tests {
 
         // SAFETY: `host` came from `alloc_zeroed` with `layout` and is not
         // mapped into the guest anymore.
+        unsafe { dealloc(host, layout) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_run_from_written_rip() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mem = vm.create_vm_memory().expect("address space");
+
+        let layout = Layout::from_size_align(PAGE, PAGE).expect("page-aligned layout");
+        // SAFETY: `layout` has non-zero size.
+        let reset = unsafe { alloc_zeroed(layout) };
+        assert!(!reset.is_null());
+        // Two instruction streams in one page. Reset vector reaches the
+        // first at 0xff0, only a written `rip` reaches the second at 0.
+        let at_reset = [0xb0, 0x11, 0xe6, 0xf8, 0xf4]; // mov al,0x11; out 0xf8,al; hlt
+        let elsewhere = [0xb0, 0x22, 0xe6, 0xf8, 0xf4]; // mov al,0x22; out 0xf8,al; hlt
+        // SAFETY: the allocation is one page and both fit, at 0xff0 and at 0.
+        unsafe {
+            std::ptr::copy_nonoverlapping(at_reset.as_ptr(), reset.add(0xff0), at_reset.len());
+            std::ptr::copy_nonoverlapping(elsewhere.as_ptr(), reset, elsewhere.len());
+        }
+        mem.mem_map(
+            0xffff_f000,
+            PAGE as u64,
+            reset as usize,
+            MemMapOption::default(),
+        )
+        .expect("map the reset vector");
+
+        // Out of reset `CS` has selector 0xf000 and base 0xffff_0000, so the
+        // reset vector is in this page.
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        let cs = cpu.get_seg_reg(SegReg::Cs).expect("cs");
+        assert_eq!(cs.selector, 0xf000);
+        assert_eq!(cs.base, 0xffff_0000);
+
+        // With `rip` written the second stream runs, byte on port 0xf8
+        // shows which one did.
+        cpu.set_regs(&[(Reg::Rip, 0xf000)]).expect("set rip");
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Io {
+                port: 0xf8,
+                write: Some(0x22),
+                size: 1
+            }
+        );
+        assert_eq!(cpu.get_reg(Reg::Rax).expect("rax") & 0xff, 0x22);
+
+        // `CR2` round trips through `set_sregs` and `get_sreg`.
+        cpu.set_sregs(&[(SReg::Cr2, 0xdead_beef)], &[], &[])
+            .expect("set cr2");
+        assert_eq!(cpu.get_sreg(SReg::Cr2).expect("cr2"), 0xdead_beef);
+
+        // SAFETY: `reset` came from `alloc_zeroed` with `layout`, and the
+        // guest is not run anymore.
+        unsafe { dealloc(reset, layout) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_enter_protected_mode() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mem = vm.create_vm_memory().expect("address space");
+
+        let layout = Layout::from_size_align(PAGE, PAGE).expect("page-aligned layout");
+        // SAFETY: `layout` has non-zero size.
+        let host = unsafe { alloc_zeroed(layout) };
+        assert!(!host.is_null());
+        // Code at guest address 0x1000. Out of reset `CS` has base
+        // 0xffff_0000, so only a flat code segment reaches it.
+        let code = [0xb0, 0x55, 0xe6, 0xf8, 0xf4]; // mov al,0x55; out 0xf8,al; hlt
+        // SAFETY: the allocation is one page and `code` fits at its start.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), host, code.len()) };
+        mem.mem_map(0x1000, PAGE as u64, host as usize, MemMapOption::default())
+            .expect("map the code");
+
+        // Flat 4 GiB descriptors in GDT entry attribute layout, 0xc09b is a
+        // 32-bit code segment, 0xc093 is the matching data segment. `limit`
+        // is in bytes. Note that on SVM `KVM_GET_SREGS` reports granularity
+        // bit as `limit > 0xfffff`, so a limit given in pages reads back
+        // with G clear.
+        let code_seg = SegRegVal {
+            base: 0,
+            limit: 0xffff_ffff,
+            selector: 0x08,
+            attr: 0xc09b,
+        };
+        let data_seg = SegRegVal {
+            selector: 0x10,
+            attr: 0xc093,
+            ..code_seg
+        };
+        let gdt = DtRegVal {
+            base: 0x500,
+            limit: 0x17,
+        };
+
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        let cr0 = cpu.get_sreg(SReg::Cr0).expect("cr0");
+        cpu.set_sregs(
+            // `CR0.PE`, bit 0, selects protected mode.
+            &[(SReg::Cr0, cr0 | 1)],
+            &[
+                (SegReg::Cs, code_seg),
+                (SegReg::Ds, data_seg),
+                (SegReg::Es, data_seg),
+                (SegReg::Ss, data_seg),
+            ],
+            &[(DtReg::Gdt, gdt)],
+        )
+        .expect("enter protected mode");
+        cpu.set_regs(&[(Reg::Rip, 0x1000)]).expect("entry point");
+
+        // The code sits at an address only a flat code segment can reach,
+        // so the exit on port 0xf8 shows the mode took effect.
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Io {
+                port: 0xf8,
+                write: Some(0x55),
+                size: 1
+            }
+        );
+        assert_eq!(cpu.get_seg_reg(SegReg::Cs).expect("cs"), code_seg);
+        assert_eq!(cpu.get_dt_reg(DtReg::Gdt).expect("gdt"), gdt);
+        assert_eq!(cpu.get_sreg(SReg::Cr0).expect("cr0") & 1, 1);
+
+        // SAFETY: `host` came from `alloc_zeroed` with `layout`, and the
+        // guest is not run again.
         unsafe { dealloc(host, layout) };
     }
 
