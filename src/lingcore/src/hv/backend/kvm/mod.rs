@@ -29,6 +29,8 @@ use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
 use crate::hv::os::linux::irqfd::IrqFd;
 use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
+#[cfg(target_arch = "x86_64")]
+use crate::hv::{Arch, Backend, StateBlob};
 use crate::hv::{Error, Result};
 
 /// Map a `kvm_ioctls::Error`, or the `io::Error` of an eventfd call, to
@@ -117,7 +119,24 @@ impl KvmVm {
             .fd
             .create_vcpu(u64::from(cpu_index))
             .map_err(kvm_err("KVM_CREATE_VCPU"))?;
-        Ok(KvmVcpu { fd, pending: None })
+        Ok(KvmVcpu {
+            fd,
+            pending: None,
+            #[cfg(target_arch = "x86_64")]
+            xsave_size: self.xsave_size(),
+        })
+    }
+
+    /// Returns XSAVE area size in bytes, as reported by `KVM_CAP_XSAVE2`,
+    /// or `size_of::<kvm_xsave>()` on a kernel without the cap.
+    #[cfg(target_arch = "x86_64")]
+    fn xsave_size(&self) -> usize {
+        let reported = self.fd.check_extension_int(Cap::Xsave2);
+        if reported <= 0 {
+            size_of::<kvm_bindings::kvm_xsave>()
+        } else {
+            reported as usize
+        }
     }
 
     /// Bind a new eventfd to irqchip pin `pin` through `KVM_IRQFD` and
@@ -227,6 +246,169 @@ enum Pending {
     Mmio { len: usize },
 }
 
+/// Layout version of `StateBlob::data`, `set_state` refuses others.
+#[cfg(target_arch = "x86_64")]
+const STATE_VERSION: u32 = 1;
+
+/// Segment register as serialized in a blob.
+#[cfg(target_arch = "x86_64")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct SegmentState {
+    base: u64,
+    limit: u32,
+    selector: u16,
+    attr: u16,
+}
+
+/// Descriptor table register as serialized in a blob.
+#[cfg(target_arch = "x86_64")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct TableState {
+    base: u64,
+    limit: u16,
+}
+
+/// Pending exception, interrupt, NMI and SMI state, as reported by
+/// `KVM_GET_VCPU_EVENTS`.
+#[cfg(target_arch = "x86_64")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct EventState {
+    exception_injected: u8,
+    exception_nr: u8,
+    exception_has_error_code: u8,
+    exception_pending: u8,
+    exception_error_code: u32,
+    exception_has_payload: u8,
+    exception_payload: u64,
+    interrupt_injected: u8,
+    interrupt_nr: u8,
+    interrupt_soft: u8,
+    interrupt_shadow: u8,
+    nmi_injected: u8,
+    nmi_pending: u8,
+    nmi_masked: u8,
+    smi_smm: u8,
+    smi_pending: u8,
+    smi_inside_nmi: u8,
+    smi_latched_init: u8,
+    triple_fault_pending: u8,
+    sipi_vector: u32,
+    flags: u32,
+}
+
+/// vCPU state as captured in a blob, with general, control, segment and
+/// descriptor table registers, interrupt bitmap, debug registers, XCRs,
+/// XSAVE area, `mp_state`, pending events and the LAPIC. Fields are
+/// named, and a field missing from a blob takes its default.
+#[cfg(target_arch = "x86_64")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct VcpuState {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rsp: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    rflags: u64,
+    cr0: u64,
+    cr2: u64,
+    cr3: u64,
+    cr4: u64,
+    cr8: u64,
+    efer: u64,
+    apic_base: u64,
+    cs: SegmentState,
+    ds: SegmentState,
+    es: SegmentState,
+    fs: SegmentState,
+    gs: SegmentState,
+    ss: SegmentState,
+    tr: SegmentState,
+    ldt: SegmentState,
+    gdt: TableState,
+    idt: TableState,
+    /// Pending interrupt vectors, the four words of `interrupt_bitmap`.
+    interrupt_bitmap: Vec<u64>,
+    /// Breakpoint address registers `DR0` to `DR3`.
+    dr: Vec<u64>,
+    dr6: u64,
+    dr7: u64,
+    /// Extended control registers, keyed by number.
+    xcrs: BTreeMap<u32, u64>,
+    /// XSAVE area, 4096 bytes as `u32` words.
+    xsave: Vec<u32>,
+    mp_state: u32,
+    events: EventState,
+    /// LAPIC registers, `None` without in-kernel irqchip.
+    lapic: Option<Vec<u8>>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SegmentState {
+    fn from_kvm(seg: &kvm_bindings::kvm_segment) -> Self {
+        SegmentState {
+            base: seg.base,
+            limit: seg.limit,
+            selector: seg.selector,
+            attr: pack_attr(seg),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl TableState {
+    fn from_kvm(table: &kvm_bindings::kvm_dtable) -> Self {
+        TableState {
+            base: table.base,
+            limit: table.limit,
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl EventState {
+    fn from_kvm(events: &kvm_bindings::kvm_vcpu_events) -> Self {
+        EventState {
+            exception_injected: events.exception.injected,
+            exception_nr: events.exception.nr,
+            exception_has_error_code: events.exception.has_error_code,
+            exception_pending: events.exception.pending,
+            exception_error_code: events.exception.error_code,
+            exception_has_payload: events.exception_has_payload,
+            exception_payload: events.exception_payload,
+            interrupt_injected: events.interrupt.injected,
+            interrupt_nr: events.interrupt.nr,
+            interrupt_soft: events.interrupt.soft,
+            interrupt_shadow: events.interrupt.shadow,
+            nmi_injected: events.nmi.injected,
+            nmi_pending: events.nmi.pending,
+            nmi_masked: events.nmi.masked,
+            smi_smm: events.smi.smm,
+            smi_pending: events.smi.pending,
+            smi_inside_nmi: events.smi.smm_inside_nmi,
+            smi_latched_init: events.smi.latched_init,
+            triple_fault_pending: events.triple_fault.pending,
+            sipi_vector: events.sipi_vector,
+            flags: events.flags,
+        }
+    }
+}
+
 /// `KVM_EXIT_IO` as decoded from the `kvm_run` page, `count` accesses of
 /// `size` bytes, packed from `offset`. String instruction has `count`
 /// above one.
@@ -252,6 +434,9 @@ fn le(data: &[u8]) -> u64 {
 pub struct KvmVcpu {
     fd: VcpuFd,
     pending: Option<Pending>,
+    /// Bytes copied by `KVM_GET_XSAVE` and `KVM_SET_XSAVE` on this host.
+    #[cfg(target_arch = "x86_64")]
+    xsave_size: usize,
 }
 
 impl Vcpu for KvmVcpu {
@@ -437,6 +622,99 @@ impl Vcpu for KvmVcpu {
             limit: seg.limit,
             selector: seg.selector,
             attr: pack_attr(&seg),
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_state(&self) -> Result<StateBlob> {
+        // XSAVE area larger than `kvm_xsave` is not captured.
+        if self.xsave_size > size_of::<kvm_bindings::kvm_xsave>() {
+            return Err(Error::Unsupported("XSAVE areas past 4096 bytes"));
+        }
+        // Without in-kernel irqchip there is no LAPIC, `KVM_GET_LAPIC` fails
+        // with `EINVAL` and the blob carries `None`.
+        let lapic = match self.fd.get_lapic() {
+            Ok(lapic) => Some(lapic.regs.iter().map(|&b| b as u8).collect()),
+            Err(err)
+                if std::io::Error::from_raw_os_error(err.errno()).kind()
+                    == std::io::ErrorKind::InvalidInput =>
+            {
+                None
+            }
+            Err(err) => return Err(kvm_err("KVM_GET_LAPIC")(err)),
+        };
+        let regs = self.fd.get_regs().map_err(kvm_err("KVM_GET_REGS"))?;
+        let sregs = self.fd.get_sregs().map_err(kvm_err("KVM_GET_SREGS"))?;
+        let xcrs = self.fd.get_xcrs().map_err(kvm_err("KVM_GET_XCRS"))?;
+        let debug = self
+            .fd
+            .get_debug_regs()
+            .map_err(kvm_err("KVM_GET_DEBUGREGS"))?;
+        let xsave = self.fd.get_xsave().map_err(kvm_err("KVM_GET_XSAVE"))?;
+        let mp_state = self
+            .fd
+            .get_mp_state()
+            .map_err(kvm_err("KVM_GET_MP_STATE"))?;
+        let events = self
+            .fd
+            .get_vcpu_events()
+            .map_err(kvm_err("KVM_GET_VCPU_EVENTS"))?;
+        let state = VcpuState {
+            rax: regs.rax,
+            rbx: regs.rbx,
+            rcx: regs.rcx,
+            rdx: regs.rdx,
+            rsi: regs.rsi,
+            rdi: regs.rdi,
+            rsp: regs.rsp,
+            rbp: regs.rbp,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+            r11: regs.r11,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rip: regs.rip,
+            rflags: regs.rflags,
+            cr0: sregs.cr0,
+            cr2: sregs.cr2,
+            cr3: sregs.cr3,
+            cr4: sregs.cr4,
+            cr8: sregs.cr8,
+            efer: sregs.efer,
+            apic_base: sregs.apic_base,
+            cs: SegmentState::from_kvm(&sregs.cs),
+            ds: SegmentState::from_kvm(&sregs.ds),
+            es: SegmentState::from_kvm(&sregs.es),
+            fs: SegmentState::from_kvm(&sregs.fs),
+            gs: SegmentState::from_kvm(&sregs.gs),
+            ss: SegmentState::from_kvm(&sregs.ss),
+            tr: SegmentState::from_kvm(&sregs.tr),
+            ldt: SegmentState::from_kvm(&sregs.ldt),
+            gdt: TableState::from_kvm(&sregs.gdt),
+            idt: TableState::from_kvm(&sregs.idt),
+            interrupt_bitmap: sregs.interrupt_bitmap.to_vec(),
+            dr: debug.db.to_vec(),
+            dr6: debug.dr6,
+            dr7: debug.dr7,
+            xcrs: xcrs.xcrs[..xcrs.nr_xcrs as usize]
+                .iter()
+                .map(|xcr| (xcr.xcr, xcr.value))
+                .collect(),
+            xsave: xsave.region.to_vec(),
+            mp_state: mp_state.mp_state,
+            events: EventState::from_kvm(&events),
+            lapic,
+        };
+        let data =
+            serde_json::to_vec(&state).map_err(|_| Error::Other("failed to encode vCPU state"))?;
+        Ok(StateBlob {
+            backend: Backend::Kvm,
+            arch: Arch::X86_64,
+            version: STATE_VERSION,
+            data,
         })
     }
 

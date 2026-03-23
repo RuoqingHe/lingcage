@@ -13,12 +13,21 @@ default = ["hv"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
 # KVM backend.
-kvm = ["dep:kvm-bindings", "dep:kvm-ioctls", "dep:vmm-sys-util", "hv"]
+kvm = [
+  "dep:kvm-bindings",
+  "dep:kvm-ioctls",
+  "dep:serde",
+  "dep:serde_json",
+  "dep:vmm-sys-util",
+  "hv",
+]
 
 [lints]
 workspace = true
 
 [dependencies]
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
