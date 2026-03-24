@@ -368,6 +368,15 @@ impl SegmentState {
             attr: pack_attr(seg),
         }
     }
+
+    fn to_kvm(&self) -> kvm_bindings::kvm_segment {
+        kvm_seg(&SegRegVal {
+            base: self.base,
+            limit: self.limit,
+            selector: self.selector,
+            attr: self.attr,
+        })
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -376,6 +385,14 @@ impl TableState {
         TableState {
             base: table.base,
             limit: table.limit,
+        }
+    }
+
+    fn to_kvm(&self) -> kvm_bindings::kvm_dtable {
+        kvm_bindings::kvm_dtable {
+            base: self.base,
+            limit: self.limit,
+            ..Default::default()
         }
     }
 }
@@ -406,6 +423,34 @@ impl EventState {
             sipi_vector: events.sipi_vector,
             flags: events.flags,
         }
+    }
+
+    fn to_kvm(&self) -> kvm_bindings::kvm_vcpu_events {
+        let mut events = kvm_bindings::kvm_vcpu_events {
+            sipi_vector: self.sipi_vector,
+            flags: self.flags,
+            exception_has_payload: self.exception_has_payload,
+            exception_payload: self.exception_payload,
+            ..Default::default()
+        };
+        events.exception.injected = self.exception_injected;
+        events.exception.nr = self.exception_nr;
+        events.exception.has_error_code = self.exception_has_error_code;
+        events.exception.pending = self.exception_pending;
+        events.exception.error_code = self.exception_error_code;
+        events.interrupt.injected = self.interrupt_injected;
+        events.interrupt.nr = self.interrupt_nr;
+        events.interrupt.soft = self.interrupt_soft;
+        events.interrupt.shadow = self.interrupt_shadow;
+        events.nmi.injected = self.nmi_injected;
+        events.nmi.pending = self.nmi_pending;
+        events.nmi.masked = self.nmi_masked;
+        events.smi.smm = self.smi_smm;
+        events.smi.pending = self.smi_pending;
+        events.smi.smm_inside_nmi = self.smi_inside_nmi;
+        events.smi.latched_init = self.smi_latched_init;
+        events.triple_fault.pending = self.triple_fault_pending;
+        events
     }
 }
 
@@ -716,6 +761,125 @@ impl Vcpu for KvmVcpu {
             version: STATE_VERSION,
             data,
         })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_state(&mut self, blob: &StateBlob) -> Result<()> {
+        if blob.backend != Backend::Kvm || blob.arch != Arch::X86_64 {
+            return Err(Error::Other("state blob from another backend or arch"));
+        }
+        if blob.version != STATE_VERSION {
+            return Err(Error::Other("state blob version not supported"));
+        }
+        if self.xsave_size > size_of::<kvm_bindings::kvm_xsave>() {
+            return Err(Error::Unsupported("XSAVE areas past 4096 bytes"));
+        }
+        let state: VcpuState = serde_json::from_slice(&blob.data)
+            .map_err(|_| Error::Other("failed to decode vCPU state"))?;
+
+        let regs = kvm_bindings::kvm_regs {
+            rax: state.rax,
+            rbx: state.rbx,
+            rcx: state.rcx,
+            rdx: state.rdx,
+            rsi: state.rsi,
+            rdi: state.rdi,
+            rsp: state.rsp,
+            rbp: state.rbp,
+            r8: state.r8,
+            r9: state.r9,
+            r10: state.r10,
+            r11: state.r11,
+            r12: state.r12,
+            r13: state.r13,
+            r14: state.r14,
+            r15: state.r15,
+            rip: state.rip,
+            rflags: state.rflags,
+        };
+        self.fd.set_regs(&regs).map_err(kvm_err("KVM_SET_REGS"))?;
+
+        let mut sregs = kvm_bindings::kvm_sregs {
+            cr0: state.cr0,
+            cr2: state.cr2,
+            cr3: state.cr3,
+            cr4: state.cr4,
+            cr8: state.cr8,
+            efer: state.efer,
+            apic_base: state.apic_base,
+            cs: state.cs.to_kvm(),
+            ds: state.ds.to_kvm(),
+            es: state.es.to_kvm(),
+            fs: state.fs.to_kvm(),
+            gs: state.gs.to_kvm(),
+            ss: state.ss.to_kvm(),
+            tr: state.tr.to_kvm(),
+            ldt: state.ldt.to_kvm(),
+            gdt: state.gdt.to_kvm(),
+            idt: state.idt.to_kvm(),
+            ..Default::default()
+        };
+        for (slot, word) in sregs
+            .interrupt_bitmap
+            .iter_mut()
+            .zip(&state.interrupt_bitmap)
+        {
+            *slot = *word;
+        }
+        self.fd
+            .set_sregs(&sregs)
+            .map_err(kvm_err("KVM_SET_SREGS"))?;
+
+        let mut xcrs = kvm_bindings::kvm_xcrs::default();
+        for (slot, (&nr, &value)) in xcrs.xcrs.iter_mut().zip(&state.xcrs) {
+            *slot = kvm_bindings::kvm_xcr {
+                xcr: nr,
+                value,
+                ..Default::default()
+            };
+        }
+        xcrs.nr_xcrs = state.xcrs.len().min(xcrs.xcrs.len()) as u32;
+        self.fd.set_xcrs(&xcrs).map_err(kvm_err("KVM_SET_XCRS"))?;
+
+        let mut debug = kvm_bindings::kvm_debugregs {
+            dr6: state.dr6,
+            dr7: state.dr7,
+            ..Default::default()
+        };
+        for (slot, word) in debug.db.iter_mut().zip(&state.dr) {
+            *slot = *word;
+        }
+        self.fd
+            .set_debug_regs(&debug)
+            .map_err(kvm_err("KVM_SET_DEBUGREGS"))?;
+
+        let mut xsave = kvm_bindings::kvm_xsave::default();
+        for (slot, word) in xsave.region.iter_mut().zip(&state.xsave) {
+            *slot = *word;
+        }
+        // SAFETY: `KVM_SET_XSAVE` copies `xsave_size` bytes, and the check
+        // above bounds that by the size of `kvm_xsave`.
+        unsafe { self.fd.set_xsave(&xsave) }.map_err(kvm_err("KVM_SET_XSAVE"))?;
+
+        self.fd
+            .set_mp_state(kvm_bindings::kvm_mp_state {
+                mp_state: state.mp_state,
+            })
+            .map_err(kvm_err("KVM_SET_MP_STATE"))?;
+        self.fd
+            .set_vcpu_events(&state.events.to_kvm())
+            .map_err(kvm_err("KVM_SET_VCPU_EVENTS"))?;
+
+        if let Some(bytes) = &state.lapic {
+            let mut lapic = kvm_bindings::kvm_lapic_state::default();
+            for (slot, byte) in lapic.regs.iter_mut().zip(bytes) {
+                *slot = *byte as i8;
+            }
+            self.fd
+                .set_lapic(&lapic)
+                .map_err(kvm_err("KVM_SET_LAPIC"))?;
+        }
+        Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1438,6 +1602,66 @@ mod tests {
         // SAFETY: `reset` came from `alloc_zeroed` with `layout`, and the
         // guest is not run anymore.
         unsafe { dealloc(reset, layout) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vcpu_capture_restore() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        // With in-kernel irqchip the capture carries the LAPIC.
+        vm.enable_irqchip().expect("in-kernel irqchip");
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+
+        cpu.set_regs(&[(Reg::Rip, 0x1_2345), (Reg::Rax, 0xdead_beef)])
+            .expect("seed the registers");
+        cpu.set_sregs(&[(SReg::Cr2, 0x5555)], &[], &[])
+            .expect("seed cr2");
+        let blob = cpu.get_state().expect("capture");
+        assert_eq!(blob.backend, Backend::Kvm);
+        assert_eq!(blob.arch, Arch::X86_64);
+
+        // Overwrite the seeded registers, then restore the blob.
+        cpu.set_regs(&[(Reg::Rip, 0), (Reg::Rax, 0)])
+            .expect("clobber");
+        cpu.set_sregs(&[(SReg::Cr2, 0)], &[], &[]).expect("clobber");
+        assert_eq!(cpu.get_reg(Reg::Rax).expect("rax"), 0);
+
+        cpu.set_state(&blob).expect("restore");
+        assert_eq!(cpu.get_reg(Reg::Rip).expect("rip"), 0x1_2345);
+        assert_eq!(cpu.get_reg(Reg::Rax).expect("rax"), 0xdead_beef);
+        assert_eq!(cpu.get_sreg(SReg::Cr2).expect("cr2"), 0x5555);
+
+        // Blob of another backend, or a later layout, is refused before
+        // decoding.
+        let mut alien = blob.clone();
+        alien.backend = Backend::Mshv;
+        assert!(
+            cpu.set_state(&alien).is_err(),
+            "state of another backend accepted"
+        );
+        let mut newer = blob.clone();
+        newer.version += 1;
+        assert!(cpu.set_state(&newer).is_err(), "unknown layout accepted");
+
+        // Fields are read by name, dropped field takes default and unknown
+        // field is ignored.
+        let mut text: serde_json::Value =
+            serde_json::from_slice(&blob.data).expect("decode the blob as JSON");
+        let object = text.as_object_mut().expect("a JSON object");
+        object.remove("rbx").expect("field to drop");
+        object.insert("something_later".into(), serde_json::Value::from(7));
+        let mut edited = blob.clone();
+        edited.data = serde_json::to_vec(&text).expect("re-encode");
+        cpu.set_state(&edited).expect("restore with other fields");
+        assert_eq!(cpu.get_reg(Reg::Rip).expect("rip"), 0x1_2345);
+        assert_eq!(cpu.get_reg(Reg::Rbx).expect("rbx"), 0, "dropped field");
+
+        // Without in-kernel irqchip the capture has no LAPIC but still
+        // succeeds.
+        let bare = hv.create_vm().expect("guest");
+        let bare_cpu = bare.create_vcpu(0).expect("vcpu 0");
+        bare_cpu.get_state().expect("capture without LAPIC");
     }
 
     #[cfg(target_arch = "x86_64")]
