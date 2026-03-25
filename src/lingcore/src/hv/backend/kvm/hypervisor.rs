@@ -9,6 +9,7 @@ use kvm_ioctls::Kvm;
 
 use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::vm::KvmVm;
+use crate::hv::hypervisor::Hypervisor;
 use crate::hv::{Error, Result};
 
 /// Opened `/dev/kvm` handle.
@@ -35,9 +36,12 @@ impl KvmHv {
         }
         Ok(KvmHv { kvm })
     }
+}
 
-    /// Create a guest through `KVM_CREATE_VM`, without vCPU or memory.
-    pub fn create_vm(&self) -> Result<KvmVm> {
+impl Hypervisor for KvmHv {
+    type Vm = KvmVm;
+
+    fn create_vm(&self) -> Result<KvmVm> {
         let fd = self.kvm.create_vm().map_err(kvm_err("KVM_CREATE_VM"))?;
         Ok(KvmVm::new(fd))
     }

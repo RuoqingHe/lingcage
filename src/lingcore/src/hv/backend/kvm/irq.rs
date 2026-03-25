@@ -259,6 +259,8 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use crate::hv::backend::kvm::vm::KvmVm;
     #[cfg(target_arch = "x86_64")]
+    use crate::hv::hypervisor::Hypervisor;
+    #[cfg(target_arch = "x86_64")]
     use crate::hv::vm::Vm;
 
     /// Returns whether `fd` is registered on its GSI. A second `KVM_IRQFD`

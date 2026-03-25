@@ -113,6 +113,7 @@ mod tests {
 
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     use crate::hv::backend::kvm::ioeventfd::*;
+    use crate::hv::hypervisor::Hypervisor;
     #[cfg(target_arch = "x86_64")]
     use crate::hv::memory::{MemMapOption, VmMemory};
     #[cfg(target_arch = "x86_64")]
