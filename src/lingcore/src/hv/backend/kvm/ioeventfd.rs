@@ -117,6 +117,7 @@ mod tests {
     use crate::hv::memory::{MemMapOption, VmMemory};
     #[cfg(target_arch = "x86_64")]
     use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
+    use crate::hv::vm::Vm;
 
     #[cfg(target_arch = "x86_64")]
     const PAGE: usize = 4096;
@@ -125,7 +126,7 @@ mod tests {
     fn test_ioeventfd_registry() {
         let hv = KvmHv::new().expect("open /dev/kvm");
         let vm = hv.create_vm().expect("guest");
-        let registry = vm.create_ioeventfd_registry();
+        let registry = vm.create_ioeventfd_registry().expect("registry");
 
         let eventfd = registry.create().expect("ioeventfd");
         registry
@@ -219,7 +220,7 @@ mod tests {
         // With an ioeventfd bound at `NOTIFY`, KVM signals it instead of
         // exiting, guest runs on to `hlt`.
         let (vm, _mem, reset) = guest(&hv);
-        let registry = vm.create_ioeventfd_registry();
+        let registry = vm.create_ioeventfd_registry().expect("registry");
         let eventfd = registry.create().expect("ioeventfd");
         registry
             .register(&eventfd, NOTIFY, 1, None)

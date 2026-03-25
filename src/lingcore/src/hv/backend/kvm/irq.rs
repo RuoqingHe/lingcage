@@ -258,6 +258,8 @@ mod tests {
     use crate::hv::backend::kvm::irq::*;
     #[cfg(target_arch = "x86_64")]
     use crate::hv::backend::kvm::vm::KvmVm;
+    #[cfg(target_arch = "x86_64")]
+    use crate::hv::vm::Vm;
 
     /// Returns whether `fd` is registered on its GSI. A second `KVM_IRQFD`
     /// assign of a registered eventfd fails with `EBUSY`. Probe which

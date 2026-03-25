@@ -437,6 +437,7 @@ mod tests {
     use crate::hv::arch::{Reg, SReg};
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     use crate::hv::vcpu::Vcpu;
+    use crate::hv::vm::Vm;
     use crate::hv::{Arch, Backend};
 
     #[cfg(target_arch = "x86_64")]

@@ -93,6 +93,7 @@ mod tests {
 
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     use crate::hv::backend::kvm::memory::*;
+    use crate::hv::vm::Vm;
 
     const PAGE: usize = 4096;
 

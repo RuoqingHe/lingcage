@@ -4,12 +4,13 @@
 
 //! `KvmVm`, the guest handle, and the parts created from it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
-use kvm_ioctls::{Cap, VmFd};
+use kvm_ioctls::{Cap as KvmCap, VmFd};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 
@@ -18,7 +19,8 @@ use crate::hv::backend::kvm::irq::{KvmIrqSender, KvmMsiSender, Routing};
 use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::memory::KvmMemory;
 use crate::hv::backend::kvm::vcpu::KvmVcpu;
-use crate::hv::{Error, Result};
+use crate::hv::vm::Vm;
+use crate::hv::{Cap, Error, Result};
 
 /// Signal handler of the kick. A signal with handler makes `KVM_RUN`
 /// return `EINTR`, an ignored one leaves the run going and a defaulted
@@ -48,6 +50,8 @@ fn register_kick() -> Result<()> {
 pub struct KvmVm {
     pub(in crate::hv::backend::kvm) fd: Arc<VmFd>,
     pub(in crate::hv::backend::kvm) routing: Arc<Mutex<Routing>>,
+    /// Set once `enable_irqchip` has created the in-kernel irqchip.
+    irqchip: AtomicBool,
 }
 
 impl KvmVm {
@@ -56,35 +60,31 @@ impl KvmVm {
         KvmVm {
             fd: Arc::new(fd),
             routing: Arc::new(Mutex::new(Routing::default())),
+            irqchip: AtomicBool::new(false),
         }
     }
 
-    /// Create the guest physical address space, no region mapped yet.
-    pub fn create_vm_memory(&self) -> Result<KvmMemory> {
-        Ok(KvmMemory::new(Arc::clone(&self.fd)))
-    }
-
-    /// Create the in-kernel irqchip (PIC, IOAPIC and LAPICs) through
-    /// `KVM_CREATE_IRQCHIP`, and the i8254 PIT through `KVM_CREATE_PIT2`.
+    /// Returns XSAVE area size in bytes, as reported by `KVM_CAP_XSAVE2`, or
+    /// `size_of::<kvm_xsave>()` on a kernel without the cap.
     #[cfg(target_arch = "x86_64")]
-    pub fn enable_irqchip(&self) -> Result<()> {
-        self.fd
-            .create_irq_chip()
-            .map_err(kvm_err("KVM_CREATE_IRQCHIP"))?;
-        // `KVM_PIT_SPEAKER_DUMMY` registers a speaker stub at port 0x61 in
-        // kernel, so guest write there does not exit to VMM.
-        self.fd
-            .create_pit2(kvm_pit_config {
-                flags: KVM_PIT_SPEAKER_DUMMY,
-                ..Default::default()
-            })
-            .map_err(kvm_err("KVM_CREATE_PIT2"))?;
-        Ok(())
+    fn xsave_size(&self) -> usize {
+        let reported = self.fd.check_extension_int(KvmCap::Xsave2);
+        if reported <= 0 {
+            size_of::<kvm_bindings::kvm_xsave>()
+        } else {
+            reported as usize
+        }
     }
+}
 
-    /// Create the vCPU with id `cpu_index` through `KVM_CREATE_VCPU`. A
-    /// second vCPU with the same id fails with `EEXIST`.
-    pub fn create_vcpu(&self, cpu_index: u16) -> Result<KvmVcpu> {
+impl Vm for KvmVm {
+    type Vcpu = KvmVcpu;
+    type Memory = KvmMemory;
+    type IrqSender = KvmIrqSender;
+    type MsiSender = KvmMsiSender;
+    type IoeventFdRegistry = KvmIoeventFdRegistry;
+
+    fn create_vcpu(&self, cpu_index: u16) -> Result<KvmVcpu> {
         let fd = self
             .fd
             .create_vcpu(u64::from(cpu_index))
@@ -96,21 +96,11 @@ impl KvmVm {
         ))
     }
 
-    /// Returns XSAVE area size in bytes, as reported by `KVM_CAP_XSAVE2`, or
-    /// `size_of::<kvm_xsave>()` on a kernel without the cap.
-    #[cfg(target_arch = "x86_64")]
-    fn xsave_size(&self) -> usize {
-        let reported = self.fd.check_extension_int(Cap::Xsave2);
-        if reported <= 0 {
-            size_of::<kvm_bindings::kvm_xsave>()
-        } else {
-            reported as usize
-        }
+    fn create_vm_memory(&self) -> Result<KvmMemory> {
+        Ok(KvmMemory::new(Arc::clone(&self.fd)))
     }
 
-    /// Bind a new eventfd to irqchip pin `pin` through `KVM_IRQFD` and
-    /// return the sender which writes it. Pin is fixed for each sender.
-    pub fn create_irq_sender(&self, pin: u8) -> Result<KvmIrqSender> {
+    fn create_irq_sender(&self, pin: u8) -> Result<KvmIrqSender> {
         let eventfd = EventFd::new(EFD_NONBLOCK).map_err(kvm_err("eventfd"))?;
         {
             let mut routing = self.routing.lock().unwrap();
@@ -123,10 +113,8 @@ impl KvmVm {
         Ok(KvmIrqSender::new(eventfd))
     }
 
-    /// Create the MSI sender. Returns `Unsupported` without
-    /// `KVM_CAP_SIGNAL_MSI`.
-    pub fn create_msi_sender(&self) -> Result<KvmMsiSender> {
-        if !self.fd.check_extension(Cap::SignalMsi) {
+    fn create_msi_sender(&self) -> Result<KvmMsiSender> {
+        if !self.fd.check_extension(KvmCap::SignalMsi) {
             return Err(Error::Unsupported("KVM_CAP_SIGNAL_MSI"));
         }
         Ok(KvmMsiSender::new(
@@ -135,17 +123,45 @@ impl KvmVm {
         ))
     }
 
-    /// Kick the vCPU thread driven by `handle` with `SIGRTMIN`. A run inside
-    /// `KVM_RUN` returns `VmExit::Interrupted`, a kick landing outside the
-    /// ioctl has no effect, so caller repeats it until the run reports it.
-    pub fn stop_vcpu<T>(&self, _cpu_index: u16, handle: &JoinHandle<T>) -> Result<()> {
-        register_kick()?;
-        handle.kill(SIGRTMIN()).map_err(kvm_err("pthread_kill"))
+    fn create_ioeventfd_registry(&self) -> Result<KvmIoeventFdRegistry> {
+        Ok(KvmIoeventFdRegistry::new(Arc::clone(&self.fd)))
     }
 
-    /// Create the ioeventfd registry.
-    pub fn create_ioeventfd_registry(&self) -> KvmIoeventFdRegistry {
-        KvmIoeventFdRegistry::new(Arc::clone(&self.fd))
+    /// Returns whether the guest has `cap`. `IrqFd` and `InKernelIrqChip`
+    /// are false until `enable_irqchip` has run.
+    fn capability(&self, cap: Cap) -> bool {
+        let irqchip = self.irqchip.load(Ordering::Acquire);
+        match cap {
+            Cap::IoeventFd => self.fd.check_extension(KvmCap::Ioeventfd),
+            // irqfd needs a GSI route, and `KVM_SET_GSI_ROUTING` fails with
+            // `EINVAL` without in-kernel irqchip.
+            Cap::IrqFd => irqchip && self.fd.check_extension(KvmCap::Irqfd),
+            Cap::InKernelIrqChip => irqchip,
+            // `KVM_MEM_LOG_DIRTY_PAGES` is a slot flag, not an extension.
+            Cap::DirtyLog => true,
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn enable_irqchip(&self) -> Result<()> {
+        self.fd
+            .create_irq_chip()
+            .map_err(kvm_err("KVM_CREATE_IRQCHIP"))?;
+        // `KVM_PIT_SPEAKER_DUMMY` registers a speaker stub at port 0x61 in
+        // kernel, so guest write there does not exit to VMM.
+        self.fd
+            .create_pit2(kvm_pit_config {
+                flags: KVM_PIT_SPEAKER_DUMMY,
+                ..Default::default()
+            })
+            .map_err(kvm_err("KVM_CREATE_PIT2"))?;
+        self.irqchip.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn stop_vcpu<T>(&self, _cpu_index: u16, handle: &JoinHandle<T>) -> Result<()> {
+        register_kick()?;
+        handle.kill(SIGRTMIN()).map_err(kvm_err("pthread_kill"))
     }
 }
 
@@ -161,11 +177,15 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use std::time::Duration;
 
+    #[cfg(target_arch = "x86_64")]
+    use crate::hv::Cap;
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     #[cfg(target_arch = "x86_64")]
     use crate::hv::memory::{MemMapOption, VmMemory};
     #[cfg(target_arch = "x86_64")]
     use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
+    #[cfg(target_arch = "x86_64")]
+    use crate::hv::vm::Vm;
 
     #[test]
     fn test_create_guests() {
@@ -241,5 +261,23 @@ mod tests {
         // SAFETY: `reset` came from `alloc_zeroed` with `layout`, and the
         // guest is not run anymore.
         unsafe { dealloc(reset, layout) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_capabilities() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+
+        // Ioeventfds and dirty logging do not depend on the irqchip.
+        assert!(vm.capability(Cap::IoeventFd));
+        assert!(vm.capability(Cap::DirtyLog));
+
+        // Interrupt caps are reported once the irqchip is in the kernel.
+        assert!(!vm.capability(Cap::InKernelIrqChip));
+        assert!(!vm.capability(Cap::IrqFd));
+        vm.enable_irqchip().expect("in-kernel irqchip");
+        assert!(vm.capability(Cap::InKernelIrqChip));
+        assert!(vm.capability(Cap::IrqFd));
     }
 }

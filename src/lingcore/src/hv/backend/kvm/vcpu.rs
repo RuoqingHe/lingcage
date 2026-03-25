@@ -471,6 +471,7 @@ mod tests {
     use crate::hv::backend::kvm::vcpu::*;
     #[cfg(target_arch = "x86_64")]
     use crate::hv::memory::{MemMapOption, VmMemory};
+    use crate::hv::vm::Vm;
 
     #[cfg(target_arch = "x86_64")]
     const PAGE: usize = 4096;
