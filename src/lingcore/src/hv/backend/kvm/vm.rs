@@ -4,12 +4,14 @@
 
 //! `KvmVm`, the guest handle, and the parts created from it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
 use kvm_ioctls::{Cap, VmFd};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 
 use crate::hv::backend::kvm::ioeventfd::KvmIoeventFdRegistry;
 use crate::hv::backend::kvm::irq::{KvmIrqSender, KvmMsiSender, Routing};
@@ -17,6 +19,29 @@ use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::memory::KvmMemory;
 use crate::hv::backend::kvm::vcpu::KvmVcpu;
 use crate::hv::{Error, Result};
+
+/// Signal handler of the kick. A signal with handler makes `KVM_RUN`
+/// return `EINTR`, an ignored one leaves the run going and a defaulted
+/// one ends the process.
+extern "C" fn take_kick(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {}
+
+/// Result of installing `take_kick`, done once per process.
+static KICK_HANDLER: OnceLock<std::result::Result<(), i32>> = OnceLock::new();
+
+/// Install `take_kick` on `SIGRTMIN` once per process. `sigaction` is
+/// issued without `SA_RESTART`, so that an interrupted `KVM_RUN` returns
+/// instead of resuming.
+fn register_kick() -> Result<()> {
+    let outcome = KICK_HANDLER
+        .get_or_init(|| register_signal_handler(SIGRTMIN(), take_kick).map_err(|err| err.errno()));
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(errno) => Err(Error::Os {
+            op: "sigaction",
+            errno: *errno,
+        }),
+    }
+}
 
 /// Guest handle, the VM fd returned by `KVM_CREATE_VM`. Parts created
 /// from it share the fd.
@@ -110,6 +135,14 @@ impl KvmVm {
         ))
     }
 
+    /// Kick the vCPU thread driven by `handle` with `SIGRTMIN`. A run inside
+    /// `KVM_RUN` returns `VmExit::Interrupted`, a kick landing outside the
+    /// ioctl has no effect, so caller repeats it until the run reports it.
+    pub fn stop_vcpu<T>(&self, _cpu_index: u16, handle: &JoinHandle<T>) -> Result<()> {
+        register_kick()?;
+        handle.kill(SIGRTMIN()).map_err(kvm_err("pthread_kill"))
+    }
+
     /// Create the ioeventfd registry.
     pub fn create_ioeventfd_registry(&self) -> KvmIoeventFdRegistry {
         KvmIoeventFdRegistry::new(Arc::clone(&self.fd))
@@ -118,9 +151,21 @@ impl KvmVm {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "x86_64")]
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
     use std::os::fd::AsRawFd;
+    #[cfg(target_arch = "x86_64")]
+    use std::sync::mpsc;
+    #[cfg(target_arch = "x86_64")]
+    use std::thread;
+    #[cfg(target_arch = "x86_64")]
+    use std::time::Duration;
 
     use crate::hv::backend::kvm::hypervisor::KvmHv;
+    #[cfg(target_arch = "x86_64")]
+    use crate::hv::memory::{MemMapOption, VmMemory};
+    #[cfg(target_arch = "x86_64")]
+    use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
 
     #[test]
     fn test_create_guests() {
@@ -138,5 +183,63 @@ mod tests {
         vm.enable_irqchip().expect("in-kernel irqchip");
         // Second `KVM_CREATE_IRQCHIP` fails with `EEXIST`.
         vm.enable_irqchip().expect_err("irqchip again");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_kick_blocked_vcpu() {
+        // vCPU other than 0 is created stopped and blocks inside `KVM_RUN`
+        // until the guest starts it, so a kick is needed to bring it out.
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        // With in-kernel irqchip, `hlt` blocks inside `KVM_RUN` instead of
+        // exiting as `Halt`.
+        vm.enable_irqchip().expect("in-kernel irqchip");
+        let mem = vm.create_vm_memory().expect("address space");
+
+        let layout = Layout::from_size_align(0x1000, 0x1000).expect("page-aligned layout");
+        // SAFETY: `layout` has non-zero size.
+        let reset = unsafe { alloc_zeroed(layout) };
+        assert!(!reset.is_null());
+        let code = [0xf4, 0xeb, 0xfd]; // hlt; jmp back to the hlt
+        // SAFETY: the allocation is one page and `code` fits at 0xff0.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), reset.add(0xff0), code.len()) };
+        mem.mem_map(0xffff_f000, 0x1000, reset as usize, MemMapOption::default())
+            .expect("map the reset vector");
+
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        let (tell, exits) = mpsc::channel();
+        let running = thread::spawn(move || {
+            let exit = cpu.run(VmEntry::Run);
+            tell.send(exit).expect("report the exit");
+        });
+
+        // Kick before the thread is inside the ioctl has no effect, so
+        // repeat it until the run reports one.
+        let mut exit = None;
+        for _ in 0..50 {
+            vm.stop_vcpu(0, &running).expect("kick");
+            match exits.recv_timeout(Duration::from_millis(100)) {
+                Ok(reported) => {
+                    exit = Some(reported.expect("run"));
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(err) => panic!("vCPU thread went away: {err}"),
+            }
+        }
+        // Checked before the join, so that a thread still inside `KVM_RUN`
+        // fails the test instead of hanging it.
+        let exit = exit.expect("run did not return");
+        running.join().expect("vCPU thread");
+        assert_eq!(
+            exit,
+            VmExit::Interrupted,
+            "guest came out for another reason"
+        );
+
+        // SAFETY: `reset` came from `alloc_zeroed` with `layout`, and the
+        // guest is not run anymore.
+        unsafe { dealloc(reset, layout) };
     }
 }
