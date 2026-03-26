@@ -4,7 +4,7 @@
 
 //! Guest physical address space.
 
-use crate::hv::Result;
+use crate::hv::{Error, Result};
 
 /// Permission and dirty tracking flags of one guest mapping.
 #[derive(Debug, Clone, Copy)]
@@ -41,4 +41,13 @@ pub trait VmMemory: Send + Sync {
 
     /// Unmap the region mapped at `gpa`.
     fn unmap(&self, gpa: u64, size: u64) -> Result<()>;
+
+    // TODO: Capturing guest RAM through the dirty log is scheduled to next stage.
+    /// Returns the dirty bitmap of the region at `gpa`, one bit per page
+    /// starting from bit 0 of the first word. Backend clears the bits it
+    /// returns, so a read covers the writes since previous one. Only region
+    /// mapped with `log_dirty` has a log. Default returns `Unsupported`.
+    fn get_dirty_log(&self, _gpa: u64) -> Result<Vec<u64>> {
+        Err(Error::Unsupported("get_dirty_log"))
+    }
 }
