@@ -40,6 +40,21 @@ struct TableState {
     limit: u16,
 }
 
+/// CPUID leaf as serialized in a blob, `flags` marks whether `index`
+/// selects a sub-leaf.
+#[cfg(target_arch = "x86_64")]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct CpuidState {
+    function: u32,
+    index: u32,
+    flags: u32,
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+}
+
 /// Pending exception, interrupt, NMI and SMI state, as reported by
 /// `KVM_GET_VCPU_EVENTS`.
 #[cfg(target_arch = "x86_64")]
@@ -129,6 +144,37 @@ pub(in crate::hv::backend::kvm) struct VcpuState {
     /// MSRs keyed by index, so that a blob decodes on a kernel with another
     /// list.
     msrs: BTreeMap<u32, u64>,
+    /// CPUID leaves. Empty list, which is the default for a blob without the
+    /// field, keeps the current table of the vCPU on restore.
+    cpuid: Vec<CpuidState>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl CpuidState {
+    fn from_kvm(entry: &kvm_bindings::kvm_cpuid_entry2) -> Self {
+        CpuidState {
+            function: entry.function,
+            index: entry.index,
+            flags: entry.flags,
+            eax: entry.eax,
+            ebx: entry.ebx,
+            ecx: entry.ecx,
+            edx: entry.edx,
+        }
+    }
+
+    fn to_kvm(&self) -> kvm_bindings::kvm_cpuid_entry2 {
+        kvm_bindings::kvm_cpuid_entry2 {
+            function: self.function,
+            index: self.index,
+            flags: self.flags,
+            eax: self.eax,
+            ebx: self.ebx,
+            ecx: self.ecx,
+            edx: self.edx,
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -328,6 +374,11 @@ impl VcpuState {
             .get_vcpu_events()
             .map_err(kvm_err("KVM_GET_VCPU_EVENTS"))?;
         let msrs = capture_msrs(fd, msr_indices)?;
+        // `KVM_GET_CPUID2` writes the count of valid leaves into `nent`, and
+        // `as_slice` reads its length from there.
+        let cpuid = fd
+            .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map_err(kvm_err("KVM_GET_CPUID2"))?;
         let state = VcpuState {
             rax: regs.rax,
             rbx: regs.rbx,
@@ -377,6 +428,7 @@ impl VcpuState {
             events: EventState::from_kvm(&events),
             lapic,
             msrs,
+            cpuid: cpuid.as_slice().iter().map(CpuidState::from_kvm).collect(),
         };
         let data =
             serde_json::to_vec(&state).map_err(|_| Error::Other("failed to encode vCPU state"))?;
@@ -406,6 +458,19 @@ impl VcpuState {
         }
         let state: VcpuState = serde_json::from_slice(&blob.data)
             .map_err(|_| Error::Other("failed to decode vCPU state"))?;
+
+        // Leaves go in before the registers, since leaf 0xD bounds the XCR0
+        // accepted by `KVM_SET_XCRS`. Empty list leaves the current table.
+        if !state.cpuid.is_empty() {
+            let entries = state
+                .cpuid
+                .iter()
+                .map(CpuidState::to_kvm)
+                .collect::<Vec<_>>();
+            let cpuid = kvm_bindings::CpuId::from_entries(&entries)
+                .map_err(|_| Error::Other("CPUID does not fit"))?;
+            fd.set_cpuid2(&cpuid).map_err(kvm_err("KVM_SET_CPUID2"))?;
+        }
 
         let regs = kvm_bindings::kvm_regs {
             rax: state.rax,
@@ -643,5 +708,69 @@ mod tests {
             ),
             "refused non-zero MSR not reported"
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cpuid_capture_restore() {
+        let kvm = kvm_ioctls::Kvm::new().expect("open /dev/kvm");
+        let supported = kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .expect("supported CPUID");
+        let vendor = supported
+            .as_slice()
+            .iter()
+            .find(|leaf| leaf.function == 0)
+            .expect("leaf 0");
+
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+
+        // New vCPU reports no leaves, restoring an empty list is accepted.
+        let blob = cpu.get_state().expect("capture");
+        let mut text: serde_json::Value =
+            serde_json::from_slice(&blob.data).expect("decode the blob as JSON");
+        assert!(
+            text["cpuid"].as_array().expect("leaves").is_empty(),
+            "new vCPU has CPUID leaves"
+        );
+        cpu.set_state(&blob).expect("restore");
+
+        text["cpuid"] = supported
+            .as_slice()
+            .iter()
+            .map(|leaf| {
+                serde_json::json!({
+                    "function": leaf.function,
+                    "index": leaf.index,
+                    "flags": leaf.flags,
+                    "eax": leaf.eax,
+                    "ebx": leaf.ebx,
+                    "ecx": leaf.ecx,
+                    "edx": leaf.edx,
+                })
+            })
+            .collect();
+        let mut edited = blob.clone();
+        edited.data = serde_json::to_vec(&text).expect("re-encode");
+        cpu.set_state(&edited).expect("restore");
+
+        let after = cpu.get_state().expect("capture");
+        let text: serde_json::Value =
+            serde_json::from_slice(&after.data).expect("decode the blob as JSON");
+        let leaves = text["cpuid"].as_array().expect("leaves");
+        assert_eq!(
+            leaves.len(),
+            supported.as_slice().len(),
+            "leaf count did not survive the round trip"
+        );
+        let leaf0 = leaves
+            .iter()
+            .find(|leaf| leaf["function"] == 0)
+            .expect("leaf 0");
+        assert_eq!(leaf0["eax"], vendor.eax, "highest leaf");
+        assert_eq!(leaf0["ebx"], vendor.ebx, "vendor string");
+        assert_eq!(leaf0["edx"], vendor.edx, "vendor string");
     }
 }
