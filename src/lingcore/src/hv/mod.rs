@@ -35,6 +35,14 @@ pub enum Error {
         /// Errno of the failed call.
         errno: i32,
     },
+    /// Batch call stopped by the backend at entry `index`.
+    #[error("{op} stopped at entry {index:#x}")]
+    Partial {
+        /// Operation which stopped.
+        op: &'static str,
+        /// Index of the entry refused by the backend.
+        index: u32,
+    },
     /// KVM API version reported by the kernel, when it is not
     /// `KVM_API_VERSION`.
     #[error("Unsupported KVM API version: {0}")]

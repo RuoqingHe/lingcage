@@ -126,6 +126,9 @@ pub(in crate::hv::backend::kvm) struct VcpuState {
     events: EventState,
     /// LAPIC registers, `None` without in-kernel irqchip.
     lapic: Option<Vec<u8>>,
+    /// MSRs keyed by index, so that a blob decodes on a kernel with another
+    /// list.
+    msrs: BTreeMap<u32, u64>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -224,12 +227,81 @@ impl EventState {
     }
 }
 
+/// Largest batch accepted by `KVM_GET_MSRS` and `KVM_SET_MSRS`, the
+/// kernel refuses `nmsrs` of `MAX_IO_MSRS` (256) or more.
+#[cfg(target_arch = "x86_64")]
+const MSR_BATCH: usize = 255;
+
+/// Read the MSRs in `indices` which this vCPU has. KVM stops a batch at
+/// the first register it can not read and returns the count read, so the
+/// walk steps over that register and goes on.
+#[cfg(target_arch = "x86_64")]
+fn capture_msrs(fd: &VcpuFd, indices: &[u32]) -> Result<BTreeMap<u32, u64>> {
+    let mut captured = BTreeMap::new();
+    let mut rest = indices;
+    while !rest.is_empty() {
+        let batch = rest.len().min(MSR_BATCH);
+        let entries = rest[..batch]
+            .iter()
+            .map(|&index| kvm_bindings::kvm_msr_entry {
+                index,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut msrs = kvm_bindings::Msrs::from_entries(&entries)
+            .map_err(|_| Error::Other("MSR batch does not fit"))?;
+        let read = fd.get_msrs(&mut msrs).map_err(kvm_err("KVM_GET_MSRS"))?;
+        captured.extend(
+            msrs.as_slice()[..read]
+                .iter()
+                .map(|entry| (entry.index, entry.data)),
+        );
+        rest = &rest[batch.min(read + 1)..];
+    }
+    Ok(captured)
+}
+
+/// Write captured MSRs in ascending index order, which puts `IA32_TSC`
+/// (0x10) before `IA32_TSC_DEADLINE` (0x6e0), since KVM reads the TSC
+/// while setting the deadline. KVM stops a batch at the first register
+/// it refuses. Refused zero is stepped over, since `MSR_KVM_ASYNC_PF_INT`
+/// can be read without in-kernel LAPIC but not written, and a new vCPU
+/// reads zero there. Refused non-zero value is reported as
+/// `Error::Partial`.
+#[cfg(target_arch = "x86_64")]
+fn restore_msrs(fd: &VcpuFd, msrs: &BTreeMap<u32, u64>) -> Result<()> {
+    let entries = msrs
+        .iter()
+        .map(|(&index, &data)| kvm_bindings::kvm_msr_entry {
+            index,
+            data,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let mut rest = &entries[..];
+    while !rest.is_empty() {
+        let batch = rest.len().min(MSR_BATCH);
+        let msrs = kvm_bindings::Msrs::from_entries(&rest[..batch])
+            .map_err(|_| Error::Other("MSR batch does not fit"))?;
+        let written = fd.set_msrs(&msrs).map_err(kvm_err("KVM_SET_MSRS"))?;
+        if written < batch && rest[written].data != 0 {
+            return Err(Error::Partial {
+                op: "KVM_SET_MSRS",
+                index: rest[written].index,
+            });
+        }
+        rest = &rest[batch.min(written + 1)..];
+    }
+    Ok(())
+}
+
 #[cfg(target_arch = "x86_64")]
 impl VcpuState {
     /// Capture state of the vCPU behind `fd` as a `StateBlob`.
     pub(in crate::hv::backend::kvm) fn capture(
         fd: &VcpuFd,
         xsave_size: usize,
+        msr_indices: &[u32],
     ) -> Result<StateBlob> {
         if xsave_size > size_of::<kvm_bindings::kvm_xsave>() {
             return Err(Error::Unsupported("XSAVE areas past 4096 bytes"));
@@ -255,6 +327,7 @@ impl VcpuState {
         let events = fd
             .get_vcpu_events()
             .map_err(kvm_err("KVM_GET_VCPU_EVENTS"))?;
+        let msrs = capture_msrs(fd, msr_indices)?;
         let state = VcpuState {
             rax: regs.rax,
             rbx: regs.rbx,
@@ -303,6 +376,7 @@ impl VcpuState {
             mp_state: mp_state.mp_state,
             events: EventState::from_kvm(&events),
             lapic,
+            msrs,
         };
         let data =
             serde_json::to_vec(&state).map_err(|_| Error::Other("failed to encode vCPU state"))?;
@@ -428,12 +502,15 @@ impl VcpuState {
             }
             fd.set_lapic(&lapic).map_err(kvm_err("KVM_SET_LAPIC"))?;
         }
+        restore_msrs(fd, &state.msrs)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "x86_64")]
+    use crate::hv::Error;
     use crate::hv::arch::{Reg, SReg};
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     use crate::hv::hypervisor::Hypervisor;
@@ -499,5 +576,72 @@ mod tests {
         let bare = hv.create_vm().expect("guest");
         let bare_cpu = bare.create_vcpu(0).expect("vcpu 0");
         bare_cpu.get_state().expect("capture without LAPIC");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_msr_capture_restore() {
+        /// `MSR_KERNEL_GS_BASE`, KVM takes any canonical address.
+        const KERNEL_GS_BASE: u32 = 0xc000_0102;
+        /// A canonical address.
+        const SEEDED: u64 = 0x1234_5678_9000;
+
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+
+        let blob = cpu.get_state().expect("capture");
+        let mut text: serde_json::Value =
+            serde_json::from_slice(&blob.data).expect("decode the blob as JSON");
+        let msrs = text["msrs"].as_object_mut().expect("MSRs by index");
+        let seat = msrs
+            .get_mut(&KERNEL_GS_BASE.to_string())
+            .expect("KERNEL_GS_BASE in the list");
+        *seat = serde_json::Value::from(SEEDED);
+
+        let mut edited = blob.clone();
+        edited.data = serde_json::to_vec(&text).expect("re-encode");
+        cpu.set_state(&edited).expect("restore");
+
+        let after = cpu.get_state().expect("capture");
+        let text: serde_json::Value =
+            serde_json::from_slice(&after.data).expect("decode the blob as JSON");
+        assert_eq!(
+            text["msrs"][KERNEL_GS_BASE.to_string()],
+            serde_json::Value::from(SEEDED),
+            "MSR did not survive the round trip"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_refused_msr_reported() {
+        const KERNEL_GS_BASE: u32 = 0xc000_0102;
+        /// Bit 47 set and bits above it clear, which is not canonical, so KVM
+        /// refuses the write.
+        const CROOKED: u64 = 0xdead_beef_0000;
+
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+
+        let blob = cpu.get_state().expect("capture");
+        let mut text: serde_json::Value =
+            serde_json::from_slice(&blob.data).expect("decode the blob as JSON");
+        let msrs = text["msrs"].as_object_mut().expect("MSRs by index");
+        msrs.insert(KERNEL_GS_BASE.to_string(), serde_json::Value::from(CROOKED));
+
+        let mut edited = blob.clone();
+        edited.data = serde_json::to_vec(&text).expect("re-encode");
+        assert!(
+            matches!(
+                cpu.set_state(&edited),
+                Err(Error::Partial {
+                    op: "KVM_SET_MSRS",
+                    index: KERNEL_GS_BASE
+                })
+            ),
+            "refused non-zero MSR not reported"
+        );
     }
 }

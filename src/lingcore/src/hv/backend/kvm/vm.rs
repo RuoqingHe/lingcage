@@ -52,15 +52,23 @@ pub struct KvmVm {
     pub(in crate::hv::backend::kvm) routing: Arc<Mutex<Routing>>,
     /// Set once `enable_irqchip` has created the in-kernel irqchip.
     irqchip: AtomicBool,
+    /// MSR indices from `KVM_GET_MSR_INDEX_LIST`, passed to each vCPU.
+    #[cfg(target_arch = "x86_64")]
+    msrs: Arc<[u32]>,
 }
 
 impl KvmVm {
     /// Wrap `fd`. Routing table starts empty.
-    pub(in crate::hv::backend::kvm) fn new(fd: VmFd) -> Self {
+    pub(in crate::hv::backend::kvm) fn new(
+        fd: VmFd,
+        #[cfg(target_arch = "x86_64")] msrs: Arc<[u32]>,
+    ) -> Self {
         KvmVm {
             fd: Arc::new(fd),
             routing: Arc::new(Mutex::new(Routing::default())),
             irqchip: AtomicBool::new(false),
+            #[cfg(target_arch = "x86_64")]
+            msrs,
         }
     }
 
@@ -93,6 +101,8 @@ impl Vm for KvmVm {
             fd,
             #[cfg(target_arch = "x86_64")]
             self.xsave_size(),
+            #[cfg(target_arch = "x86_64")]
+            Arc::clone(&self.msrs),
         ))
     }
 

@@ -5,6 +5,9 @@
 //! `KvmVcpu`, the `KVM_RUN` loop and register access.
 
 #[cfg(target_arch = "x86_64")]
+use std::sync::Arc;
+
+#[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_EXIT_IO_IN;
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
@@ -58,19 +61,26 @@ pub struct KvmVcpu {
     /// Bytes copied by `KVM_GET_XSAVE` and `KVM_SET_XSAVE` on this host.
     #[cfg(target_arch = "x86_64")]
     xsave_size: usize,
+    /// MSR indices read by a capture, from `KVM_GET_MSR_INDEX_LIST`.
+    #[cfg(target_arch = "x86_64")]
+    msrs: Arc<[u32]>,
 }
 
 impl KvmVcpu {
-    /// Wrap `fd` with no exit pending.
+    /// Wrap `fd` with no exit pending. `msrs` is the index list read by a
+    /// capture.
     pub(in crate::hv::backend::kvm) fn new(
         fd: VcpuFd,
         #[cfg(target_arch = "x86_64")] xsave_size: usize,
+        #[cfg(target_arch = "x86_64")] msrs: Arc<[u32]>,
     ) -> Self {
         KvmVcpu {
             fd,
             pending: None,
             #[cfg(target_arch = "x86_64")]
             xsave_size,
+            #[cfg(target_arch = "x86_64")]
+            msrs,
         }
     }
 }
@@ -263,7 +273,7 @@ impl Vcpu for KvmVcpu {
 
     #[cfg(target_arch = "x86_64")]
     fn get_state(&self) -> Result<StateBlob> {
-        VcpuState::capture(&self.fd, self.xsave_size)
+        VcpuState::capture(&self.fd, self.xsave_size, &self.msrs)
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -4,6 +4,9 @@
 
 //! The `KvmHv` handle, which opens `/dev/kvm` and creates guests.
 
+#[cfg(target_arch = "x86_64")]
+use std::sync::Arc;
+
 use kvm_bindings::KVM_API_VERSION;
 use kvm_ioctls::Kvm;
 
@@ -15,6 +18,9 @@ use crate::hv::{Error, Result};
 /// Opened `/dev/kvm` handle.
 pub struct KvmHv {
     kvm: Kvm,
+    /// MSR indices from `KVM_GET_MSR_INDEX_LIST`, only read once per open.
+    #[cfg(target_arch = "x86_64")]
+    msrs: Arc<[u32]>,
 }
 
 impl KvmHv {
@@ -34,7 +40,17 @@ impl KvmHv {
         if version != KVM_API_VERSION as i32 {
             return Err(Error::ApiVersion(version));
         }
-        Ok(KvmHv { kvm })
+        #[cfg(target_arch = "x86_64")]
+        let msrs = kvm
+            .get_msr_index_list()
+            .map_err(kvm_err("KVM_GET_MSR_INDEX_LIST"))?
+            .as_slice()
+            .into();
+        Ok(KvmHv {
+            kvm,
+            #[cfg(target_arch = "x86_64")]
+            msrs,
+        })
     }
 }
 
@@ -43,7 +59,11 @@ impl Hypervisor for KvmHv {
 
     fn create_vm(&self) -> Result<KvmVm> {
         let fd = self.kvm.create_vm().map_err(kvm_err("KVM_CREATE_VM"))?;
-        Ok(KvmVm::new(fd))
+        Ok(KvmVm::new(
+            fd,
+            #[cfg(target_arch = "x86_64")]
+            Arc::clone(&self.msrs),
+        ))
     }
 }
 
