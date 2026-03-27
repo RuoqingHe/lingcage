@@ -14,8 +14,12 @@ use kvm_ioctls::{Cap as KvmCap, VmFd};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 
+#[cfg(target_arch = "x86_64")]
+use crate::hv::StateBlob;
 use crate::hv::backend::kvm::ioeventfd::KvmIoeventFdRegistry;
 use crate::hv::backend::kvm::irq::{KvmIrqSender, KvmMsiSender, Routing};
+#[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::irqchip::IrqChipState;
 use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::memory::KvmMemory;
 use crate::hv::backend::kvm::vcpu::KvmVcpu;
@@ -167,6 +171,22 @@ impl Vm for KvmVm {
             .map_err(kvm_err("KVM_CREATE_PIT2"))?;
         self.irqchip.store(true, Ordering::Release);
         Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_irqchip_state(&self) -> Result<StateBlob> {
+        if !self.irqchip.load(Ordering::Acquire) {
+            return Err(Error::Unsupported("get_irqchip_state"));
+        }
+        IrqChipState::capture(&self.fd)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_irqchip_state(&self, state: &StateBlob) -> Result<()> {
+        if !self.irqchip.load(Ordering::Acquire) {
+            return Err(Error::Unsupported("set_irqchip_state"));
+        }
+        IrqChipState::restore(&self.fd, state)
     }
 
     fn stop_vcpu<T>(&self, _cpu_index: u16, handle: &JoinHandle<T>) -> Result<()> {

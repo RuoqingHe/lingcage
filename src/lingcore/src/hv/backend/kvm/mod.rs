@@ -11,6 +11,8 @@ pub mod memory;
 pub mod vcpu;
 pub mod vm;
 
+/// Serialized interrupt controller state, private to this backend.
+mod irqchip;
 /// Serialized vCPU state, private to this backend.
 mod state;
 
