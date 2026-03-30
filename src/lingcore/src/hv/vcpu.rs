@@ -5,7 +5,7 @@
 //! The `Vcpu` trait, exit reasons and the entry action for next `run`.
 
 #[cfg(target_arch = "x86_64")]
-use crate::hv::arch::{DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
+use crate::hv::arch::{CpuidEntry, DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
 use crate::hv::{Error, Result, StateBlob};
 
 /// Reason a vCPU exited, mapped by the backend from the native exit.
@@ -106,6 +106,12 @@ pub trait Vcpu: Send {
         seg_regs: &[(SegReg, SegRegVal)],
         dt_regs: &[(DtReg, DtRegVal)],
     ) -> Result<()>;
+
+    /// Set the CPUID leaves read by the guest. A new vCPU returns zero for
+    /// any leaf until they are set. KVM bounds the XCR0 it accepts by leaf
+    /// 0xD.
+    #[cfg(target_arch = "x86_64")]
+    fn set_cpuid(&mut self, entries: &[CpuidEntry]) -> Result<()>;
 
     /// Capture the vCPU state as a `StateBlob`. Default returns
     /// `Unsupported`.

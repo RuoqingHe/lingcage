@@ -8,8 +8,14 @@
 use std::sync::Arc;
 
 use kvm_bindings::KVM_API_VERSION;
+#[cfg(target_arch = "x86_64")]
+use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use kvm_ioctls::Kvm;
 
+#[cfg(target_arch = "x86_64")]
+use crate::hv::arch::CpuidEntry;
+#[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::cpuid::from_kvm;
 use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::vm::KvmVm;
 use crate::hv::hypervisor::Hypervisor;
@@ -56,6 +62,15 @@ impl KvmHv {
 
 impl Hypervisor for KvmHv {
     type Vm = KvmVm;
+
+    #[cfg(target_arch = "x86_64")]
+    fn supported_cpuid(&self) -> Result<Vec<CpuidEntry>> {
+        let cpuid = self
+            .kvm
+            .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
+            .map_err(kvm_err("KVM_GET_SUPPORTED_CPUID"))?;
+        Ok(cpuid.as_slice().iter().map(from_kvm).collect())
+    }
 
     fn create_vm(&self) -> Result<KvmVm> {
         let fd = self.kvm.create_vm().map_err(kvm_err("KVM_CREATE_VM"))?;

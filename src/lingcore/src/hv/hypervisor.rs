@@ -4,6 +4,8 @@
 
 //! Opened hypervisor handle.
 
+#[cfg(target_arch = "x86_64")]
+use crate::hv::arch::CpuidEntry;
 #[cfg(all(feature = "kvm", target_os = "linux"))]
 use crate::hv::backend::kvm::hypervisor::KvmHv;
 use crate::hv::vm::Vm;
@@ -16,6 +18,11 @@ pub trait Hypervisor {
 
     /// Create a VM without vCPU, memory or device yet.
     fn create_vm(&self) -> Result<Self::Vm>;
+
+    /// Returns CPUID leaves the hypervisor supports for a guest. The list
+    /// a vCPU takes through `Vcpu::set_cpuid` is drawn from it.
+    #[cfg(target_arch = "x86_64")]
+    fn supported_cpuid(&self) -> Result<Vec<CpuidEntry>>;
 }
 
 /// Opened hypervisor of a backend. Variants carried by a build depend on

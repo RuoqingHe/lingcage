@@ -1,2 +1,6 @@
 [files]
 extend-exclude = ["target/"]
+
+[default.extend-identifiers]
+# Spelled like this in the kernel headers.
+KVM_CPUID_FLAG_SIGNIFCANT_INDEX = "KVM_CPUID_FLAG_SIGNIFCANT_INDEX"

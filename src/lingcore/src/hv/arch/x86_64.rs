@@ -110,3 +110,21 @@ pub struct DtRegVal {
     /// Table length in bytes, minus one.
     pub limit: u16,
 }
+
+/// One CPUID leaf, with the function, the sub-leaf and four registers
+/// returned. `index` is `None` for a function which does not read ECX.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CpuidEntry {
+    /// Function, the EAX input.
+    pub function: u32,
+    /// Sub-leaf, the ECX input, for a function which reads one.
+    pub index: Option<u32>,
+    /// EAX output.
+    pub eax: u32,
+    /// EBX output.
+    pub ebx: u32,
+    /// ECX output.
+    pub ecx: u32,
+    /// EDX output.
+    pub edx: u32,
+}

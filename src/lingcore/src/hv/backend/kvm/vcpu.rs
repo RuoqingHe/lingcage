@@ -12,11 +12,15 @@ use kvm_bindings::KVM_EXIT_IO_IN;
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 
+#[cfg(target_arch = "x86_64")]
+use crate::hv::Error;
 use crate::hv::Result;
 #[cfg(target_arch = "x86_64")]
 use crate::hv::StateBlob;
 #[cfg(target_arch = "x86_64")]
-use crate::hv::arch::{DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
+use crate::hv::arch::{CpuidEntry, DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
+#[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::cpuid::to_kvm;
 use crate::hv::backend::kvm::kvm_err;
 #[cfg(target_arch = "x86_64")]
 use crate::hv::backend::kvm::state::VcpuState;
@@ -269,6 +273,16 @@ impl Vcpu for KvmVcpu {
             selector: seg.selector,
             attr: pack_attr(&seg),
         })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_cpuid(&mut self, entries: &[CpuidEntry]) -> Result<()> {
+        let entries = entries.iter().map(to_kvm).collect::<Vec<_>>();
+        let cpuid = kvm_bindings::CpuId::from_entries(&entries)
+            .map_err(|_| Error::Other("too many CPUID entries"))?;
+        self.fd
+            .set_cpuid2(&cpuid)
+            .map_err(kvm_err("KVM_SET_CPUID2"))
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -756,5 +770,70 @@ mod tests {
             dealloc(low, layout);
             dealloc(reset, layout);
         }
+    }
+
+    /// Boot a guest which runs CPUID leaf 0 and writes the low byte of EBX
+    /// to port 0xf8. `cpuid` is set on the vCPU first if given.
+    #[cfg(target_arch = "x86_64")]
+    fn vendor_letter_the_guest_reads(hv: &KvmHv, cpuid: Option<&[CpuidEntry]>) -> u32 {
+        const GPA: u64 = 0xffff_f000;
+        let vm = hv.create_vm().expect("guest");
+        let mem = vm.create_vm_memory().expect("address space");
+        let layout = Layout::from_size_align(PAGE, PAGE).expect("page-aligned layout");
+        // SAFETY: `layout` has non-zero size.
+        let host = unsafe { alloc_zeroed(layout) };
+        assert!(!host.is_null());
+        let code = [
+            0x66, 0xb8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+            0x0f, 0xa2, // cpuid
+            0x88, 0xd8, // mov al, bl
+            0xe6, 0xf8, // out 0xf8, al
+            0xf4, // hlt
+        ];
+        // SAFETY: the allocation is one page and `code` fits at 0xff0.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), host.add(0xff0), code.len()) };
+        mem.mem_map(GPA, PAGE as u64, host as usize, MemMapOption::default())
+            .expect("map the reset vector");
+
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        if let Some(entries) = cpuid {
+            cpu.set_cpuid(entries).expect("set cpuid");
+        }
+        let letter = match cpu.run(VmEntry::Run).expect("run") {
+            VmExit::Io {
+                port: 0xf8,
+                write: Some(value),
+                ..
+            } => value,
+            other => panic!("unexpected exit {other:?}"),
+        };
+        // SAFETY: `host` came from `alloc_zeroed` with `layout`, and the VM
+        // which maps it is dropped at the end of the scope.
+        unsafe { dealloc(host, layout) };
+        letter
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_set_cpuid_vendor() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let supported = hv.supported_cpuid().expect("supported cpuid");
+        let leaf0 = supported
+            .iter()
+            .find(|leaf| leaf.function == 0)
+            .expect("leaf 0");
+        let vendor = leaf0.ebx & 0xff;
+        assert_ne!(vendor, 0, "leaf 0 reports no vendor");
+
+        assert_eq!(
+            vendor_letter_the_guest_reads(&hv, None),
+            0,
+            "vCPU without CPUID set reports a vendor"
+        );
+        assert_eq!(
+            vendor_letter_the_guest_reads(&hv, Some(&supported)),
+            vendor,
+            "guest reads a vendor other than the one set"
+        );
     }
 }

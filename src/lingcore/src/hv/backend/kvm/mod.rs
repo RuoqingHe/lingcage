@@ -13,6 +13,8 @@ pub mod vm;
 
 /// Serialized guest clock state, private to this backend.
 mod clock;
+/// `CpuidEntry` to and from `kvm_cpuid_entry2`, private to this backend.
+mod cpuid;
 /// Serialized interrupt controller state, private to this backend.
 mod irqchip;
 /// Serialized vCPU state, private to this backend.
