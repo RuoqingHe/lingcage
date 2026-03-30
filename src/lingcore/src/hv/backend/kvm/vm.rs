@@ -16,6 +16,8 @@ use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 
 #[cfg(target_arch = "x86_64")]
 use crate::hv::StateBlob;
+#[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::clock::ClockState;
 use crate::hv::backend::kvm::ioeventfd::KvmIoeventFdRegistry;
 use crate::hv::backend::kvm::irq::{KvmIrqSender, KvmMsiSender, Routing};
 #[cfg(target_arch = "x86_64")]
@@ -187,6 +189,21 @@ impl Vm for KvmVm {
             return Err(Error::Unsupported("set_irqchip_state"));
         }
         IrqChipState::restore(&self.fd, state)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn get_clock(&self) -> Result<StateBlob> {
+        ClockState::capture(&self.fd)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_clock(&self, state: &StateBlob) -> Result<()> {
+        ClockState::restore(&self.fd, state)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_clock_elapsed(&self, state: &StateBlob) -> Result<()> {
+        ClockState::restore_elapsed(&self.fd, state)
     }
 
     fn stop_vcpu<T>(&self, _cpu_index: u16, handle: &JoinHandle<T>) -> Result<()> {
