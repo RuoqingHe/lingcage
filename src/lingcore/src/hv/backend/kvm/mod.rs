@@ -22,6 +22,11 @@ mod state;
 
 use crate::hv::Error;
 
+/// Largest batch accepted by `KVM_GET_MSRS` and `KVM_SET_MSRS`, the
+/// kernel refuses `nmsrs` of `MAX_IO_MSRS` (256) or more.
+#[cfg(target_arch = "x86_64")]
+pub(in crate::hv::backend::kvm) const MSR_BATCH: usize = 255;
+
 /// Map a `kvm_ioctls::Error`, or the `io::Error` of an eventfd call, to
 /// `Error::Os` with operation `op`.
 fn kvm_err<E: Into<kvm_ioctls::Error>>(op: &'static str) -> impl Fn(E) -> Error {

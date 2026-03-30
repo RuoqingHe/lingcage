@@ -113,6 +113,13 @@ pub trait Vcpu: Send {
     #[cfg(target_arch = "x86_64")]
     fn set_cpuid(&mut self, entries: &[CpuidEntry]) -> Result<()>;
 
+    /// Write model specific registers by index in the given order, for a
+    /// guest entered without firmware. Register refused by the vCPU is
+    /// reported as `Error::Partial` with its index, the ones before it in
+    /// the batch are written.
+    #[cfg(target_arch = "x86_64")]
+    fn set_msrs(&mut self, msrs: &[(u32, u64)]) -> Result<()>;
+
     /// Capture the vCPU state as a `StateBlob`. Default returns
     /// `Unsupported`.
     fn get_state(&self) -> Result<StateBlob> {

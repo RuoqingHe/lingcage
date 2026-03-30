@@ -20,6 +20,8 @@ use crate::hv::StateBlob;
 #[cfg(target_arch = "x86_64")]
 use crate::hv::arch::{CpuidEntry, DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
 #[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::MSR_BATCH;
+#[cfg(target_arch = "x86_64")]
 use crate::hv::backend::kvm::cpuid::to_kvm;
 use crate::hv::backend::kvm::kvm_err;
 #[cfg(target_arch = "x86_64")]
@@ -283,6 +285,32 @@ impl Vcpu for KvmVcpu {
         self.fd
             .set_cpuid2(&cpuid)
             .map_err(kvm_err("KVM_SET_CPUID2"))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_msrs(&mut self, msrs: &[(u32, u64)]) -> Result<()> {
+        let entries = msrs
+            .iter()
+            .map(|&(index, data)| kvm_bindings::kvm_msr_entry {
+                index,
+                data,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        for batch in entries.chunks(MSR_BATCH) {
+            let msrs = kvm_bindings::Msrs::from_entries(batch)
+                .map_err(|_| Error::Other("MSR batch does not fit"))?;
+            let written = self.fd.set_msrs(&msrs).map_err(kvm_err("KVM_SET_MSRS"))?;
+            // Refused register is reported with its index. Only a capture
+            // steps over one.
+            if written != batch.len() {
+                return Err(Error::Partial {
+                    op: "KVM_SET_MSRS",
+                    index: batch[written].index,
+                });
+            }
+        }
+        Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -835,5 +863,61 @@ mod tests {
             vendor,
             "guest reads a vendor other than the one set"
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_set_msrs() {
+        /// `IA32_SYSENTER_ESP`, which KVM stores as given for a canonical value.
+        const SYSENTER_ESP: u32 = 0x175;
+        const SEEDED: u64 = 0x1234_5642;
+        const GPA: u64 = 0xffff_f000;
+
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mem = vm.create_vm_memory().expect("address space");
+        let layout = Layout::from_size_align(PAGE, PAGE).expect("page-aligned layout");
+        // SAFETY: `layout` has non-zero size.
+        let host = unsafe { alloc_zeroed(layout) };
+        assert!(!host.is_null());
+        let code = [
+            0x66, 0xb9, 0x75, 0x01, 0x00, 0x00, // mov ecx, 0x175
+            0x0f, 0x32, // rdmsr
+            0xe6, 0xf8, // out 0xf8, al
+            0xf4, // hlt
+        ];
+        // SAFETY: the allocation is one page and `code` fits at 0xff0.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), host.add(0xff0), code.len()) };
+        mem.mem_map(GPA, PAGE as u64, host as usize, MemMapOption::default())
+            .expect("map the reset vector");
+
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        cpu.set_msrs(&[(SYSENTER_ESP, SEEDED)]).expect("set msrs");
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Io {
+                port: 0xf8,
+                write: Some(SEEDED as u32 & 0xff),
+                size: 1
+            },
+            "guest did not read back what was written"
+        );
+
+        // MSR the vCPU does not have is reported by index. The one before
+        // it in the batch is written.
+        assert!(
+            matches!(
+                cpu.set_msrs(&[(SYSENTER_ESP, SEEDED), (u32::MAX, 0)]),
+                Err(Error::Partial {
+                    op: "KVM_SET_MSRS",
+                    index: u32::MAX
+                })
+            ),
+            "refused register not reported"
+        );
+
+        // SAFETY: `host` came from `alloc_zeroed` with `layout`, and the VM
+        // which maps it is dropped at the end of the scope.
+        unsafe { dealloc(host, layout) };
     }
 }

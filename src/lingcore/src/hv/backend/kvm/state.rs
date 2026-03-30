@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use kvm_ioctls::VcpuFd;
 
 use crate::hv::arch::SegRegVal;
-use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::vcpu::{kvm_seg, pack_attr};
+use crate::hv::backend::kvm::{MSR_BATCH, kvm_err};
 use crate::hv::{Arch, Backend, Error, Result, StateBlob};
 
 /// Layout version of `StateBlob::data`, `restore` refuses others.
@@ -272,11 +272,6 @@ impl EventState {
         events
     }
 }
-
-/// Largest batch accepted by `KVM_GET_MSRS` and `KVM_SET_MSRS`, the
-/// kernel refuses `nmsrs` of `MAX_IO_MSRS` (256) or more.
-#[cfg(target_arch = "x86_64")]
-const MSR_BATCH: usize = 255;
 
 /// Read the MSRs in `indices` which this vCPU has. KVM stops a batch at
 /// the first register it can not read and returns the count read, so the
