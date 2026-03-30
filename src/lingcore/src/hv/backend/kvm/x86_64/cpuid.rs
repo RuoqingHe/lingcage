@@ -4,8 +4,6 @@
 
 //! Converting `CpuidEntry` to and from `kvm_cpuid_entry2`.
 
-#![cfg(target_arch = "x86_64")]
-
 use kvm_bindings::{KVM_CPUID_FLAG_SIGNIFCANT_INDEX, kvm_cpuid_entry2};
 
 use crate::hv::arch::CpuidEntry;

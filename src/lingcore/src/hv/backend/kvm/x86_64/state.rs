@@ -2,18 +2,17 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! vCPU state as a `StateBlob`, named fields through `serde_json`
-//! instead of raw bytes of KVM structs.
-
-#![cfg(target_arch = "x86_64")]
+//! vCPU state as a `StateBlob`. Fields are named and encoded through
+//! `serde_json`, not the raw bytes of KVM structs.
 
 use std::collections::BTreeMap;
 
 use kvm_ioctls::VcpuFd;
 
 use crate::hv::arch::SegRegVal;
+use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::vcpu::{kvm_seg, pack_attr};
-use crate::hv::backend::kvm::{MSR_BATCH, kvm_err};
+use crate::hv::backend::kvm::x86_64::MSR_BATCH;
 use crate::hv::{Arch, Backend, Error, Result, StateBlob};
 
 /// Layout version of `StateBlob::data`, `restore` refuses others.
@@ -455,7 +454,7 @@ impl VcpuState {
             .map_err(|_| Error::Other("failed to decode vCPU state"))?;
 
         // Leaves go in before the registers, since leaf 0xD bounds the XCR0
-        // accepted by `KVM_SET_XCRS`. Empty list leaves the current table.
+        // accepted by `KVM_SET_XCRS`. Empty list keeps the current table.
         if !state.cpuid.is_empty() {
             let entries = state
                 .cpuid
@@ -569,14 +568,12 @@ impl VcpuState {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_arch = "x86_64")]
-    use crate::hv::Error;
     use crate::hv::arch::{Reg, SReg};
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     use crate::hv::hypervisor::Hypervisor;
     use crate::hv::vcpu::Vcpu;
     use crate::hv::vm::Vm;
-    use crate::hv::{Arch, Backend};
+    use crate::hv::{Arch, Backend, Error};
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -618,7 +615,7 @@ mod tests {
         newer.version += 1;
         assert!(cpu.set_state(&newer).is_err(), "unknown layout accepted");
 
-        // Fields are read by name, dropped field takes default and unknown
+        // Fields are read by name. Dropped field takes default and unknown
         // field is ignored.
         let mut text: serde_json::Value =
             serde_json::from_slice(&blob.data).expect("decode the blob as JSON");

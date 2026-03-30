@@ -19,13 +19,13 @@ use crate::hv::Result;
 use crate::hv::StateBlob;
 #[cfg(target_arch = "x86_64")]
 use crate::hv::arch::{CpuidEntry, DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
-#[cfg(target_arch = "x86_64")]
-use crate::hv::backend::kvm::MSR_BATCH;
-#[cfg(target_arch = "x86_64")]
-use crate::hv::backend::kvm::cpuid::to_kvm;
 use crate::hv::backend::kvm::kvm_err;
 #[cfg(target_arch = "x86_64")]
-use crate::hv::backend::kvm::state::VcpuState;
+use crate::hv::backend::kvm::x86_64::MSR_BATCH;
+#[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::x86_64::cpuid::to_kvm;
+#[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::x86_64::state::VcpuState;
 use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
 
 /// Exit still being reported or waiting for its value. KVM completes it

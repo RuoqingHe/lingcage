@@ -16,15 +16,15 @@ use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 
 #[cfg(target_arch = "x86_64")]
 use crate::hv::StateBlob;
-#[cfg(target_arch = "x86_64")]
-use crate::hv::backend::kvm::clock::ClockState;
 use crate::hv::backend::kvm::ioeventfd::KvmIoeventFdRegistry;
 use crate::hv::backend::kvm::irq::{KvmIrqSender, KvmMsiSender, Routing};
-#[cfg(target_arch = "x86_64")]
-use crate::hv::backend::kvm::irqchip::IrqChipState;
 use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::memory::KvmMemory;
 use crate::hv::backend::kvm::vcpu::KvmVcpu;
+#[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::x86_64::clock::ClockState;
+#[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::x86_64::irqchip::IrqChipState;
 use crate::hv::vm::Vm;
 use crate::hv::{Cap, Error, Result};
 

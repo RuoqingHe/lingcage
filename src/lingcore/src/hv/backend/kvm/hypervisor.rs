@@ -14,10 +14,10 @@ use kvm_ioctls::Kvm;
 
 #[cfg(target_arch = "x86_64")]
 use crate::hv::arch::CpuidEntry;
-#[cfg(target_arch = "x86_64")]
-use crate::hv::backend::kvm::cpuid::from_kvm;
 use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::vm::KvmVm;
+#[cfg(target_arch = "x86_64")]
+use crate::hv::backend::kvm::x86_64::cpuid::from_kvm;
 use crate::hv::hypervisor::Hypervisor;
 use crate::hv::{Error, Result};
 

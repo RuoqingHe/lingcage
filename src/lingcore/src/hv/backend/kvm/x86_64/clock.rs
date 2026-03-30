@@ -5,8 +5,6 @@
 //! Guest clock as a `StateBlob`, `kvm_clock_data` from `KVM_GET_CLOCK`
 //! plus the host instant it was read at.
 
-#![cfg(target_arch = "x86_64")]
-
 use kvm_bindings::{KVM_CLOCK_REALTIME, kvm_clock_data};
 use kvm_ioctls::VmFd;
 

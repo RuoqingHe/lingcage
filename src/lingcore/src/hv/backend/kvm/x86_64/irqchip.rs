@@ -5,8 +5,6 @@
 //! Interrupt controller state as a `StateBlob`. It covers the two 8259
 //! PICs, the I/O APIC and the 8254 PIT.
 
-#![cfg(target_arch = "x86_64")]
-
 use kvm_bindings::{
     KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, kvm_irqchip,
 };
@@ -302,7 +300,7 @@ impl IrqChipState {
 #[cfg(test)]
 mod tests {
     use crate::hv::backend::kvm::hypervisor::KvmHv;
-    use crate::hv::backend::kvm::irqchip::*;
+    use crate::hv::backend::kvm::x86_64::irqchip::*;
     use crate::hv::hypervisor::Hypervisor;
     use crate::hv::vm::Vm;
     use crate::hv::{Arch, Backend, Error};

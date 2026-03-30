@@ -11,21 +11,11 @@ pub mod memory;
 pub mod vcpu;
 pub mod vm;
 
-/// Serialized guest clock state, private to this backend.
-mod clock;
-/// `CpuidEntry` to and from `kvm_cpuid_entry2`, private to this backend.
-mod cpuid;
-/// Serialized interrupt controller state, private to this backend.
-mod irqchip;
-/// Serialized vCPU state, private to this backend.
-mod state;
+/// CPUID conversion, MSR batch and x86_64 state blobs.
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
 
 use crate::hv::Error;
-
-/// Largest batch accepted by `KVM_GET_MSRS` and `KVM_SET_MSRS`, the
-/// kernel refuses `nmsrs` of `MAX_IO_MSRS` (256) or more.
-#[cfg(target_arch = "x86_64")]
-pub(in crate::hv::backend::kvm) const MSR_BATCH: usize = 255;
 
 /// Map a `kvm_ioctls::Error`, or the `io::Error` of an eventfd call, to
 /// `Error::Os` with operation `op`.
