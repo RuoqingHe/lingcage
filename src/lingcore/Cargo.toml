@@ -12,6 +12,8 @@ version.workspace = true
 default = ["hv"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
+# Guest RAM, held as vm-memory regions.
+mem = ["dep:vm-memory"]
 # KVM backend.
 kvm = [
   "dep:kvm-bindings",
@@ -30,6 +32,7 @@ workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
+vm-memory = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 kvm-bindings = { workspace = true, optional = true }

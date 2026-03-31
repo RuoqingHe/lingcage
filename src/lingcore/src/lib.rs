@@ -10,3 +10,5 @@
 
 #[cfg(feature = "hv")]
 pub mod hv;
+#[cfg(feature = "mem")]
+pub mod mem;
