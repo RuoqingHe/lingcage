@@ -12,3 +12,5 @@
 pub mod hv;
 #[cfg(feature = "mem")]
 pub mod mem;
+#[cfg(feature = "vcpu")]
+pub mod vcpu;
