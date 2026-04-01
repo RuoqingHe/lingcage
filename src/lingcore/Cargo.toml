@@ -10,6 +10,8 @@ version.workspace = true
 
 [features]
 default = ["hv"]
+# Guest-facing devices.
+devices = []
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
 # Guest RAM, held as vm-memory regions.
