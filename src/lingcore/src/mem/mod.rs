@@ -12,7 +12,7 @@
 use thiserror::Error;
 use vm_memory::mmap::FromRangesError;
 use vm_memory::region::GuestRegionCollectionError;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 
 /// Errors thrown while laying out or accessing guest RAM.
 #[derive(Debug, Error)]
@@ -89,6 +89,13 @@ impl GuestRam {
                 hva: region.as_ptr() as usize,
             })
             .collect()
+    }
+
+    /// Returns the regions as the `GuestMemoryMmap` taken by the kernel
+    /// loader.
+    #[cfg(all(feature = "boot", target_arch = "x86_64"))]
+    pub(crate) fn backing(&self) -> &GuestMemoryMmap {
+        &self.inner
     }
 
     pub fn write(&self, gpa: u64, bytes: &[u8]) -> Result<()> {

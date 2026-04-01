@@ -8,6 +8,8 @@
 //! `lingcore` is a library instead of a VMM. Each component is gated
 //! behind a Cargo feature.
 
+#[cfg(all(feature = "boot", target_arch = "x86_64"))]
+pub mod boot;
 #[cfg(feature = "devices")]
 pub mod devices;
 #[cfg(feature = "hv")]

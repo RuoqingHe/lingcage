@@ -17,10 +17,15 @@ version = "0.1.0"
 kvm-bindings = "0.14.0"
 kvm-ioctls = "0.24.0"
 libc = "0.2.180"
+linux-loader = { version = "0.13.2", default-features = false, features = [
+  "bzimage",
+  "elf",
+] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
-vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+# linux-loader 0.13 takes vm-memory no higher than 0.17.1.
+vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 vmm-sys-util = "0.15.0"
 
 # Member crates opt in via `lints.workspace = true`
