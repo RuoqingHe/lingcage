@@ -17,6 +17,10 @@ use vm_memory::{ByteValued, GuestAddress, ReadVolatile};
 
 use crate::mem::GuestRam;
 
+mod mode;
+
+pub use crate::boot::mode::enter_long_mode;
+
 /// Load address of the protected-mode kernel, 1 MiB as fixed by Linux
 /// x86 boot protocol.
 const LOAD_ADDRESS: u64 = 0x10_0000;
@@ -49,12 +53,18 @@ pub enum Error {
     /// Guest RAM does not cover `BOOT_PARAMS` or `CMDLINE`.
     #[error("no guest RAM for boot parameters")]
     NoRoomForParams,
+    /// Guest RAM does not cover `GDT`, `IDT` or the page tables.
+    #[error("no guest RAM for boot tables")]
+    NoRoomForTables,
     /// More RAM ranges than e820 table could hold.
     #[error("memory layout needs more than {E820_MAX_ENTRIES_ZEROPAGE} e820 entries")]
     TooManyRanges,
     /// Command line contains NUL byte, which is the terminator.
     #[error("command line contains NUL byte")]
     CmdlineHasNul,
+    /// vCPU refused the long mode state.
+    #[error("vCPU refused the long mode state")]
+    Vcpu(#[source] crate::hv::Error),
 }
 
 /// Result alias for kernel loading.
@@ -172,7 +182,7 @@ mod tests {
     const SETUP_SECTORS: u8 = 1;
 
     /// Build a bzImage with `payload` in place of the kernel.
-    fn bzimage(payload: &[u8]) -> Vec<u8> {
+    pub(in crate::boot) fn bzimage(payload: &[u8]) -> Vec<u8> {
         let setup = usize::from(SETUP_SECTORS + 1) * 512;
         let mut header = setup_header {
             setup_sects: SETUP_SECTORS,
