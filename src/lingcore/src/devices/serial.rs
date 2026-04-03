@@ -132,6 +132,19 @@ impl<W: Write> Serial<W> {
     }
 }
 
+impl<W: Write + Send> crate::devices::Device for Serial<W> {
+    /// Registers are one byte wide, wider read only returns the register at
+    /// `offset`.
+    fn read(&mut self, offset: u64, _size: u8) -> u64 {
+        u64::from(Serial::read(self, offset))
+    }
+
+    /// Wider write stores its lowest byte into the register at `offset`.
+    fn write(&mut self, offset: u64, _size: u8, value: u64) -> io::Result<()> {
+        Serial::write(self, offset, value as u8)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::devices::serial::*;

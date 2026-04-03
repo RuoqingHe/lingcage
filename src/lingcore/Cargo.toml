@@ -13,7 +13,7 @@ default = ["hv"]
 # Kernel loading into guest RAM. x86_64 only.
 boot = ["dep:linux-loader", "hv", "mem"]
 # Guest-facing devices.
-devices = []
+devices = ["vcpu"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
 # Guest RAM, held as vm-memory regions.
