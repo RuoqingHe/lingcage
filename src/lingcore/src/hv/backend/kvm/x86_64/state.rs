@@ -581,7 +581,7 @@ mod tests {
         let hv = KvmHv::new().expect("open /dev/kvm");
         let vm = hv.create_vm().expect("guest");
         // With in-kernel irqchip the capture carries the LAPIC.
-        vm.enable_irqchip().expect("in-kernel irqchip");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
         let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
 
         cpu.set_regs(&[(Reg::Rip, 0x1_2345), (Reg::Rax, 0xdead_beef)])

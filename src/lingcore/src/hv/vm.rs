@@ -48,11 +48,11 @@ pub trait Vm: Send + Sync {
     /// Returns whether the backend has `cap`.
     fn capability(&self, cap: Cap) -> bool;
 
-    /// Create the in-kernel irqchip. Kernel then handles guest idle, and
-    /// `VmExit::Halt` changes meaning accordingly, so the machine calls this
-    /// during setup. Default returns `Unsupported`.
-    fn enable_irqchip(&self) -> Result<()> {
-        Err(Error::Unsupported("enable_irqchip"))
+    /// Move the irqchip into the kernel. Kernel then handles guest idle
+    /// and changes the meaning of `VmExit::Halt`, so the machine calls
+    /// this during setup. Default returns `Unsupported`.
+    fn enable_in_kernel_irqchip(&self) -> Result<()> {
+        Err(Error::Unsupported("enable_in_kernel_irqchip"))
     }
 
     /// Capture the in-kernel irqchip state, PIC, IOAPIC and PIT on x86_64,

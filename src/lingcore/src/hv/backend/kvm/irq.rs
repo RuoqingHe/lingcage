@@ -288,7 +288,7 @@ mod tests {
         // GSI assignment, masking and route removal of irqfds.
         let hv = KvmHv::new().expect("open /dev/kvm");
         let vm = hv.create_vm().expect("guest");
-        vm.enable_irqchip().expect("in-kernel irqchip");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
 
         // Legacy line. Its pin is in each table written after this.
         let com1 = vm.create_irq_sender(4).expect("sender on IRQ 4");
@@ -353,7 +353,7 @@ mod tests {
     fn test_send_msi() {
         let hv = KvmHv::new().expect("open /dev/kvm");
         let vm = hv.create_vm().expect("guest");
-        vm.enable_irqchip().expect("in-kernel irqchip");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
         let msi = vm.create_msi_sender().expect("msi sender");
 
         // Without vCPU there is no LAPIC to deliver to. `KVM_SIGNAL_MSI`
@@ -379,7 +379,7 @@ mod tests {
             "pin bound with no controller behind it"
         );
 
-        vm.enable_irqchip().expect("in-kernel irqchip");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
         let com1 = vm.create_irq_sender(4).expect("sender on IRQ 4");
         com1.send().expect("pulse");
         com1.send().expect("pulse again");

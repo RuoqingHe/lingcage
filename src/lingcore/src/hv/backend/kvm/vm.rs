@@ -159,7 +159,7 @@ impl Vm for KvmVm {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn enable_irqchip(&self) -> Result<()> {
+    fn enable_in_kernel_irqchip(&self) -> Result<()> {
         self.fd
             .create_irq_chip()
             .map_err(kvm_err("KVM_CREATE_IRQCHIP"))?;
@@ -248,9 +248,9 @@ mod tests {
     fn test_irqchip_created_once() {
         let hv = KvmHv::new().expect("open /dev/kvm");
         let vm = hv.create_vm().expect("guest");
-        vm.enable_irqchip().expect("in-kernel irqchip");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
         // Second `KVM_CREATE_IRQCHIP` fails with `EEXIST`.
-        vm.enable_irqchip().expect_err("irqchip again");
+        vm.enable_in_kernel_irqchip().expect_err("irqchip again");
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -262,7 +262,7 @@ mod tests {
         let vm = hv.create_vm().expect("guest");
         // With in-kernel irqchip, `hlt` blocks inside `KVM_RUN` instead of
         // exiting as `Halt`.
-        vm.enable_irqchip().expect("in-kernel irqchip");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
         let mem = vm.create_vm_memory().expect("address space");
 
         let layout = Layout::from_size_align(0x1000, 0x1000).expect("page-aligned layout");
@@ -324,7 +324,7 @@ mod tests {
         // Interrupt caps are reported once the irqchip is in the kernel.
         assert!(!vm.capability(Cap::InKernelIrqChip));
         assert!(!vm.capability(Cap::IrqFd));
-        vm.enable_irqchip().expect("in-kernel irqchip");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
         assert!(vm.capability(Cap::InKernelIrqChip));
         assert!(vm.capability(Cap::IrqFd));
     }

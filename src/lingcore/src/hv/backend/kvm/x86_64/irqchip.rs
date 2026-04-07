@@ -317,7 +317,7 @@ mod tests {
         );
 
         let vm = hv.create_vm().expect("guest");
-        vm.enable_irqchip().expect("in-kernel irqchip");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
         let blob = vm.get_irqchip_state().expect("capture");
         assert_eq!(blob.backend, Backend::Kvm);
         assert_eq!(blob.arch, Arch::X86_64);
@@ -373,7 +373,7 @@ mod tests {
     fn test_uncovered_lines_restored_masked() {
         let hv = KvmHv::new().expect("open /dev/kvm");
         let vm = hv.create_vm().expect("guest");
-        vm.enable_irqchip().expect("in-kernel irqchip");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
 
         let blob = vm.get_irqchip_state().expect("capture");
         let mut text: serde_json::Value =
