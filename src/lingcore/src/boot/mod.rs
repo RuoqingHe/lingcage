@@ -166,7 +166,7 @@ pub fn write_boot_params(ram: &GuestRam, kernel: &Kernel, cmdline: &str) -> Resu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Cursor;
 
     use linux_loader::loader::bootparam::setup_header;
@@ -182,7 +182,7 @@ mod tests {
     const SETUP_SECTORS: u8 = 1;
 
     /// Build a bzImage with `payload` in place of the kernel.
-    pub(in crate::boot) fn bzimage(payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn bzimage(payload: &[u8]) -> Vec<u8> {
         let setup = usize::from(SETUP_SECTORS + 1) * 512;
         let mut header = setup_header {
             setup_sects: SETUP_SECTORS,

@@ -275,7 +275,8 @@ mod tests {
         write_boot_params(&ram, &kernel, "console=ttyS0").expect("parameters");
 
         let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
-        // KVM refuses `EFER.LME` unless long mode is reported by CPUID.
+        // Kernel reads CPUID for its model and feature bits. `KVM_SET_SREGS`
+        // writes `EFER` without checking the leaves.
         cpu.set_cpuid(&hv.supported_cpuid().expect("host CPUID"))
             .expect("model");
         enter_long_mode(&ram, &mut cpu, &kernel).expect("enter the kernel");
