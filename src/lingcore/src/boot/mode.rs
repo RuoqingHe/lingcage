@@ -272,7 +272,7 @@ mod tests {
         let mut payload = vec![0u8; ENTRY_64 as usize];
         payload.extend_from_slice(&PROGRAM);
         let kernel = load_kernel(&ram, &mut Cursor::new(bzimage(&payload))).expect("load");
-        write_boot_params(&ram, &kernel, "console=ttyS0").expect("parameters");
+        write_boot_params(&ram, &kernel, "console=ttyS0", None).expect("parameters");
 
         let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
         // Kernel reads CPUID for its model and feature bits. `KVM_SET_SREGS`

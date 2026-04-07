@@ -62,6 +62,8 @@ pub struct Config {
     pub memory: u64,
     /// Kernel image path, a bzImage on x86.
     pub kernel: PathBuf,
+    /// Initramfs path, a cpio archive loaded above the kernel.
+    pub initrd: Option<PathBuf>,
     /// Kernel command line.
     pub cmdline: String,
 }
@@ -117,7 +119,14 @@ impl<H: Hypervisor> Machine<H> {
 
         let mut image = File::open(&config.kernel).map_err(Error::Image)?;
         let kernel = boot::load_kernel(&ram, &mut image)?;
-        boot::write_boot_params(&ram, &kernel, &config.cmdline)?;
+        let initrd = match &config.initrd {
+            Some(path) => {
+                let mut image = File::open(path).map_err(Error::Image)?;
+                Some(boot::load_initrd(&ram, &kernel, &mut image)?)
+            }
+            None => None,
+        };
+        boot::write_boot_params(&ram, &kernel, &config.cmdline, initrd)?;
 
         let mut bus = Bus::new();
         bus.place_port(COM1, COM1_SIZE, Box::new(Serial::new(console)))?;
@@ -210,6 +219,7 @@ mod tests {
         let config = Config {
             memory: 16 << 20,
             kernel: image.clone(),
+            initrd: None,
             cmdline: "console=ttyS0".to_string(),
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
@@ -234,6 +244,7 @@ mod tests {
             let config = Config {
                 memory: 16 << 20,
                 kernel: PathBuf::from("/nonexistent/kernel"),
+                initrd: None,
                 cmdline: String::new(),
             };
             assert!(matches!(
