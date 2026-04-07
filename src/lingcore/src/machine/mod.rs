@@ -99,12 +99,17 @@ impl<H: Hypervisor> Machine<H> {
     /// Kernel is loaded before boot parameters are written, since they are
     /// built from its `setup_header`. CPUID is set before the vCPU runs,
     /// since a kernel reads its model and feature bits from it.
+    ///
+    /// The irqchip is created before the vCPU, since `KVM_CREATE_IRQCHIP`
+    /// fails once a vCPU exists. With irqchip in the kernel, `hlt` blocks
+    /// inside the run instead of exiting as `Halt`.
     pub fn new<W>(hv: &H, config: &Config, console: W) -> Result<Self>
     where
         W: Write + Send + 'static,
     {
         let ram = GuestRam::new(&layout(config.memory))?;
         let vm = hv.create_vm()?;
+        vm.enable_in_kernel_irqchip()?;
         let memory = vm.create_vm_memory()?;
         for region in ram.regions() {
             memory.mem_map(region.gpa, region.size, region.hva, MemMapOption::default())?;
@@ -185,9 +190,15 @@ mod tests {
         }
 
         // mov edx, 0x3f8 / mov al, 'o' / out dx, al / mov al, 'k' / out dx, al
-        // hlt
+        // in al, 0x61 / and al, 0xcf / out dx, al / ud2
+        //
+        // Port 0x61 belongs to the PIT. With PIT in the kernel, bits 4 and 5
+        // toggle and the rest read zero, without it the port is unclaimed and
+        // reads as all ones. `ud2` with an empty IDT triple faults, so the run
+        // ends in `Shutdown`.
         let program = [
-            0xba, 0xf8, 0x03, 0x00, 0x00, 0xb0, 0x6f, 0xee, 0xb0, 0x6b, 0xee, 0xf4,
+            0xba, 0xf8, 0x03, 0x00, 0x00, 0xb0, 0x6f, 0xee, 0xb0, 0x6b, 0xee, 0xe4, 0x61, 0x24,
+            0xcf, 0xee, 0x0f, 0x0b,
         ];
         let mut payload = vec![0u8; 0x200];
         payload.extend_from_slice(&program);
@@ -205,10 +216,10 @@ mod tests {
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
         std::fs::remove_file(&image).expect("remove the kernel image");
 
-        assert_eq!(machine.run().expect("run"), VmExit::Halt);
+        assert_eq!(machine.run().expect("run"), VmExit::Shutdown);
         assert_eq!(
             console.0.lock().unwrap().as_slice(),
-            b"ok",
+            b"ok\x00",
             "guest console got other bytes"
         );
     }
