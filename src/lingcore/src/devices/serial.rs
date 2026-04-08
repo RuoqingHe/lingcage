@@ -7,6 +7,8 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
+use crate::hv::irq::IrqSender;
+
 /// Receive buffer on read, transmit holding register on write. Low byte
 /// of the divisor while divisor latch is open.
 const DATA: u64 = 0;
@@ -36,18 +38,29 @@ const LSR_TRANSMIT_EMPTY: u8 = 0x60;
 /// `MSR` bits: data carrier detect, data set ready and clear to send.
 /// Reported as set since there is no modem behind the port.
 const MSR_CONNECTED: u8 = 0xb0;
+/// `IER` bit for transmit holding register empty interrupt enable.
+const IER_TRANSMIT_EMPTY: u8 = 0x02;
 /// `IIR` value for no interrupt pending.
 const IIR_NO_INTERRUPT: u8 = 0x01;
+/// `IIR` value for transmit holding register empty interrupt pending.
+const IIR_TRANSMIT_EMPTY: u8 = 0x02;
 /// `IIR` bits: FIFOs enabled, which identifies a 16550A.
 const IIR_FIFO_ENABLED: u8 = 0xc0;
 /// `FCR` bit which enables the FIFOs.
 const FCR_ENABLE: u8 = 0x01;
 
 /// 16550 UART. Transmitted bytes are written to `out`, bytes passed to
-/// `receive` are queued for the guest to read.
+/// `receive` are queued for the guest to read. With `IER_TRANSMIT_EMPTY`
+/// set, `line` is raised once transmit register becomes empty.
 pub struct Serial<W: Write> {
     out: W,
     input: VecDeque<u8>,
+    /// Interrupt line, `None` for a UART without one.
+    line: Option<Box<dyn IrqSender>>,
+    /// Set when the line is raised for empty transmit register, cleared by
+    /// the read of `IIR` which reports it, so a run of bytes only raises
+    /// the line once.
+    raised: bool,
     ier: u8,
     fcr: u8,
     lcr: u8,
@@ -62,6 +75,8 @@ impl<W: Write> Serial<W> {
         Serial {
             out,
             input: VecDeque::new(),
+            line: None,
+            raised: false,
             ier: 0,
             fcr: 0,
             lcr: 0,
@@ -69,6 +84,25 @@ impl<W: Write> Serial<W> {
             scr: 0,
             // 9600 baud with the 1.8432 MHz reference clock.
             divisor: 12,
+        }
+    }
+
+    /// Attach `line` as the interrupt line.
+    pub fn on_line(mut self, line: Box<dyn IrqSender>) -> Self {
+        self.line = Some(line);
+        self
+    }
+
+    /// Raise the line for empty transmit register if `IER_TRANSMIT_EMPTY` is
+    /// set and it is not raised yet. Error from `send` is propagated.
+    fn ask_for_attention(&mut self) -> io::Result<()> {
+        if self.ier & IER_TRANSMIT_EMPTY == 0 || self.raised {
+            return Ok(());
+        }
+        self.raised = true;
+        match &self.line {
+            Some(line) => line.send().map_err(io::Error::other),
+            None => Ok(()),
         }
     }
 
@@ -89,8 +123,22 @@ impl<W: Write> Serial<W> {
             DATA => self.input.pop_front().unwrap_or(0),
             IER if self.latched() => (self.divisor >> 8) as u8,
             IER => self.ier,
-            IIR if self.fcr & FCR_ENABLE != 0 => IIR_FIFO_ENABLED | IIR_NO_INTERRUPT,
-            IIR => IIR_NO_INTERRUPT,
+            IIR => {
+                let fifos = if self.fcr & FCR_ENABLE != 0 {
+                    IIR_FIFO_ENABLED
+                } else {
+                    0
+                };
+                // Reading `IIR` clears the interrupt, the next byte
+                // written raises the line again.
+                let reason = if self.raised {
+                    self.raised = false;
+                    IIR_TRANSMIT_EMPTY
+                } else {
+                    IIR_NO_INTERRUPT
+                };
+                fifos | reason
+            }
             LCR => self.lcr,
             MCR => self.mcr,
             LSR => {
@@ -107,8 +155,8 @@ impl<W: Write> Serial<W> {
     }
 
     /// Write `value` to the register at `offset`. Write to `LSR` or `MSR` is
-    /// dropped. A byte written to `DATA` is written to `out` and flushed,
-    /// error from either is propagated.
+    /// dropped. A byte written to `DATA` is written to `out` and flushed.
+    /// Error from either, or from raising the line, is propagated.
     pub fn write(&mut self, offset: u64, value: u8) -> io::Result<()> {
         match offset & 7 {
             DATA if self.latched() => {
@@ -117,11 +165,17 @@ impl<W: Write> Serial<W> {
             DATA => {
                 self.out.write_all(&[value])?;
                 self.out.flush()?;
+                // The byte has reached `out`, so transmit register is
+                // empty again.
+                self.ask_for_attention()?;
             }
             IER if self.latched() => {
                 self.divisor = (self.divisor & 0x00ff) | (u16::from(value) << 8);
             }
-            IER => self.ier = value,
+            IER => {
+                self.ier = value;
+                self.ask_for_attention()?;
+            }
             IIR => self.fcr = value,
             LCR => self.lcr = value,
             MCR => self.mcr = value,
@@ -147,7 +201,72 @@ impl<W: Write + Send> crate::devices::Device for Serial<W> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::devices::serial::*;
+
+    /// Interrupt line which counts its raises.
+    #[derive(Clone)]
+    struct Counter(Arc<AtomicUsize>);
+
+    impl Counter {
+        fn raises(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl IrqSender for Counter {
+        fn send(&self) -> crate::hv::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_transmit_interrupt_once_per_run() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut uart = Serial::new(Vec::new()).on_line(Box::new(line.clone()));
+
+        // With IER_TRANSMIT_EMPTY clear, bytes do not raise the line.
+        for byte in b"the kernel prints this by spinning on the line status" {
+            uart.write(DATA, *byte).expect("send a byte");
+        }
+        assert_eq!(line.raises(), 0, "line raised with IER clear");
+
+        // Register is empty, so enabling it raises the line immediately.
+        uart.write(IER, IER_TRANSMIT_EMPTY).expect("enable");
+        assert_eq!(line.raises(), 1);
+
+        // Line stays raised until IIR is read, so a run of bytes only raises
+        // it once.
+        for byte in b"and this goes out through the tty" {
+            uart.write(DATA, *byte).expect("send a byte");
+        }
+        assert_eq!(line.raises(), 1, "line raised per byte");
+
+        // Reading IIR identifies the interrupt and clears it.
+        assert_eq!(
+            uart.read(IIR) & 0x0f,
+            IIR_TRANSMIT_EMPTY,
+            "IIR reports no interrupt"
+        );
+        assert_eq!(
+            uart.read(IIR) & 0x0f,
+            IIR_NO_INTERRUPT,
+            "IIR still reports the interrupt"
+        );
+
+        // Next byte raises the line again.
+        uart.write(DATA, b'x').expect("send a byte");
+        assert_eq!(line.raises(), 2);
+
+        // With IER_TRANSMIT_EMPTY cleared again, byte does not raise the line.
+        uart.read(IIR);
+        uart.write(IER, 0).expect("disable");
+        uart.write(DATA, b'y').expect("send a byte");
+        assert_eq!(line.raises(), 2, "line raised after IER cleared");
+    }
 
     #[test]
     fn test_register_behaviour() {

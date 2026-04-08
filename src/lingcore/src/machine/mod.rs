@@ -33,6 +33,9 @@ const COM1: u16 = 0x3f8;
 /// Size of the 16550 register window in bytes.
 const COM1_SIZE: u16 = 8;
 
+/// IRQ of the first serial console, `ttyS0`.
+const COM1_IRQ: u8 = 4;
+
 /// Errors thrown while assembling a guest.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -108,6 +111,9 @@ impl<H: Hypervisor> Machine<H> {
     pub fn new<W>(hv: &H, config: &Config, console: W) -> Result<Self>
     where
         W: Write + Send + 'static,
+        // The sender is boxed into the `Serial`, a `dyn Device` owned by
+        // the `Bus`.
+        <H::Vm as Vm>::IrqSender: 'static,
     {
         let ram = GuestRam::new(&layout(config.memory))?;
         let vm = hv.create_vm()?;
@@ -129,7 +135,12 @@ impl<H: Hypervisor> Machine<H> {
         boot::write_boot_params(&ram, &kernel, &config.cmdline, initrd)?;
 
         let mut bus = Bus::new();
-        bus.place_port(COM1, COM1_SIZE, Box::new(Serial::new(console)))?;
+        let line = vm.create_irq_sender(COM1_IRQ)?;
+        bus.place_port(
+            COM1,
+            COM1_SIZE,
+            Box::new(Serial::new(console).on_line(Box::new(line))),
+        )?;
 
         let mut vcpu = vm.create_vcpu(0)?;
         vcpu.set_cpuid(&hv.supported_cpuid()?)?;
