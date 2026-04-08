@@ -27,9 +27,15 @@ const AMD_IDENTITY: u32 = 0x8000_001e;
 /// Bit offset of the 8-bit initial APIC ID in leaf 1 EBX.
 const INITIAL_APIC_ID: u32 = 24;
 
+/// Leaf 1 ECX bit 31, the hypervisor present bit. `supported_cpuid`
+/// leaves it clear since KVM counts it as emulated, and guest kernel
+/// only probes the hypervisor leaves at 0x4000_0000 with it set.
+const HYPERVISOR_PRESENT: u32 = 1 << 31;
+
 /// Returns leaves of `host` with the APIC ID fields set to `index`, the
-/// low byte in leaf 1, the full value in leaves 0xB, 0x1F and
-/// 0x8000001E. Other fields and leaves are unchanged.
+/// low byte in leaf 1 and the full value in leaves 0xB, 0x1F and
+/// 0x8000001E, and with `HYPERVISOR_PRESENT` set in leaf 1 ECX. Other
+/// fields and leaves are unchanged.
 pub fn for_vcpu(host: &[CpuidEntry], index: u16) -> Vec<CpuidEntry> {
     let id = u32::from(index);
     host.iter()
@@ -38,6 +44,7 @@ pub fn for_vcpu(host: &[CpuidEntry], index: u16) -> Vec<CpuidEntry> {
             match leaf.function {
                 FEATURES => {
                     leaf.ebx = (leaf.ebx & 0x00ff_ffff) | ((id & 0xff) << INITIAL_APIC_ID);
+                    leaf.ecx |= HYPERVISOR_PRESENT;
                 }
                 TOPOLOGY | TOPOLOGY_V2 => leaf.edx = id,
                 AMD_IDENTITY => leaf.eax = id,
@@ -97,7 +104,11 @@ mod tests {
         );
         // Bits 23:0 of EBX stay as the host.
         assert_eq!(features.ebx & 0x00ff_ffff, 0x0008_0800);
-        assert_eq!({ features.ecx }, 0x76f8_3203, "feature bit moved");
+        assert_eq!(
+            features.ecx,
+            0x76f8_3203 | HYPERVISOR_PRESENT,
+            "feature bit moved or hypervisor bit is clear"
+        );
         assert_eq!({ features.edx }, 0x078b_fbff, "feature bit moved");
 
         let topology = leaves
@@ -118,6 +129,27 @@ mod tests {
             .find(|l| l.function == 0x8000_0008)
             .expect("leaf");
         assert_eq!({ other.eax }, 0x0000_3030, "unrelated leaf changed");
+    }
+
+    #[test]
+    fn test_hypervisor_present_bit() {
+        let leaves = for_vcpu(&host(), 0);
+        let features = leaves
+            .iter()
+            .find(|l| l.function == FEATURES)
+            .expect("leaf");
+
+        assert_eq!(
+            features.ecx & HYPERVISOR_PRESENT,
+            HYPERVISOR_PRESENT,
+            "hypervisor bit is clear"
+        );
+        // Other ECX bits stay as the host.
+        assert_eq!(
+            features.ecx & !HYPERVISOR_PRESENT,
+            0x76f8_3203,
+            "host feature bit cleared"
+        );
     }
 
     #[test]
