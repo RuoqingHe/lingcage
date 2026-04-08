@@ -20,6 +20,8 @@ use crate::hv::vcpu::{Vcpu, VmExit};
 use crate::hv::vm::Vm;
 use crate::mem::GuestRam;
 
+mod cpuid;
+
 /// End of low RAM. Window from here to 4 GiB holds the I/O APIC and the
 /// LAPIC.
 const MMIO_HOLE: u64 = 0xc000_0000;
@@ -35,6 +37,9 @@ const COM1_SIZE: u16 = 8;
 
 /// IRQ of the first serial console, `ttyS0`.
 const COM1_IRQ: u8 = 4;
+
+/// Index of the vCPU the guest boots on.
+const BOOT_VCPU: u16 = 0;
 
 /// Errors thrown while assembling a guest.
 #[derive(Debug, Error)]
@@ -142,8 +147,8 @@ impl<H: Hypervisor> Machine<H> {
             Box::new(Serial::new(console).on_line(Box::new(line))),
         )?;
 
-        let mut vcpu = vm.create_vcpu(0)?;
-        vcpu.set_cpuid(&hv.supported_cpuid()?)?;
+        let mut vcpu = vm.create_vcpu(BOOT_VCPU)?;
+        vcpu.set_cpuid(&cpuid::for_vcpu(&hv.supported_cpuid()?, BOOT_VCPU))?;
         boot::enter_long_mode(&ram, &mut vcpu, &kernel)?;
 
         Ok(Machine {
