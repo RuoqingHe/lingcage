@@ -118,11 +118,8 @@ impl Vm for KvmVm {
 
     fn create_irq_sender(&self, pin: u8) -> Result<KvmIrqSender> {
         let eventfd = EventFd::new(EFD_NONBLOCK).map_err(kvm_err("eventfd"))?;
-        {
-            let mut routing = self.routing.lock().unwrap();
-            routing.pins.insert(pin);
-            routing.apply(&self.fd)?;
-        }
+        // `KVM_CREATE_IRQCHIP` routes the legacy lines and `Routing::apply`
+        // rewrites them, so binding a pin writes no table.
         self.fd
             .register_irqfd(&eventfd, u32::from(pin))
             .map_err(kvm_err("KVM_IRQFD"))?;

@@ -4,7 +4,7 @@
 
 //! Interrupt injection, legacy lines, MSIs and the GSI routing table.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 
@@ -48,6 +48,21 @@ const PIN_IRQCHIP: u32 = kvm_bindings::KVM_IRQCHIP_IOAPIC;
 #[cfg(not(target_arch = "x86_64"))]
 const PIN_IRQCHIP: u32 = 0;
 
+/// Pins of the in-kernel irqchip, 24 on the I/O APIC. `KVM_CREATE_IRQCHIP`
+/// routes them and `KVM_SET_GSI_ROUTING` overwrites the table, so each
+/// table written has to carry them again.
+const PIN_COUNT: u32 = 24;
+
+/// Last GSI carried by the 8259 pair. GSIs up to it get a PIC entry
+/// besides the IOAPIC one, same as the routing installed by
+/// `KVM_CREATE_IRQCHIP`.
+#[cfg(target_arch = "x86_64")]
+const LAST_PIC_PIN: u32 = 15;
+
+/// Pins of one 8259. GSIs from 8 route to the slave, at pin `gsi % 8`.
+#[cfg(target_arch = "x86_64")]
+const PIC_PINS: u32 = 8;
+
 /// First GSI taken by an irqfd. Legacy pins are `u8` and stay below it.
 const FIRST_MSI_GSI: u32 = 256;
 
@@ -72,11 +87,10 @@ impl Default for MsiRoute {
 }
 
 /// Routing table of the guest. `KVM_SET_GSI_ROUTING` overwrites the
-/// table, so legacy pins which have a sender are kept here and written
-/// together with MSI routes.
+/// table, so legacy lines go in together with MSI routes on each write.
+/// The in-kernel PIT raises GSI 0 with no sender bound to it.
 #[derive(Default)]
 pub(in crate::hv::backend::kvm) struct Routing {
-    pub(in crate::hv::backend::kvm) pins: BTreeSet<u8>,
     msi: BTreeMap<u32, MsiRoute>,
     next_gsi: u32,
 }
@@ -92,18 +106,36 @@ impl Routing {
     /// Write the table through `KVM_SET_GSI_ROUTING`. Masked routes are
     /// left out.
     pub(in crate::hv::backend::kvm) fn apply(&self, vm: &VmFd) -> Result<()> {
-        let mut entries = Vec::with_capacity(self.pins.len() + self.msi.len());
-        for &pin in &self.pins {
+        let mut entries = Vec::with_capacity(PIN_COUNT as usize * 2 + self.msi.len());
+        for gsi in 0..PIN_COUNT {
             let mut entry = kvm_irq_routing_entry {
-                gsi: u32::from(pin),
+                gsi,
                 type_: KVM_IRQ_ROUTING_IRQCHIP,
                 ..Default::default()
             };
             entry.u.irqchip = kvm_irq_routing_irqchip {
                 irqchip: PIN_IRQCHIP,
-                pin: u32::from(pin),
+                pin: gsi,
             };
             entries.push(entry);
+
+            #[cfg(target_arch = "x86_64")]
+            if gsi <= LAST_PIC_PIN {
+                let mut pic = kvm_irq_routing_entry {
+                    gsi,
+                    type_: KVM_IRQ_ROUTING_IRQCHIP,
+                    ..Default::default()
+                };
+                pic.u.irqchip = kvm_irq_routing_irqchip {
+                    irqchip: if gsi < PIC_PINS {
+                        kvm_bindings::KVM_IRQCHIP_PIC_MASTER
+                    } else {
+                        kvm_bindings::KVM_IRQCHIP_PIC_SLAVE
+                    },
+                    pin: gsi % PIC_PINS,
+                };
+                entries.push(pic);
+            }
         }
         for (&gsi, route) in &self.msi {
             if route.masked {
@@ -253,6 +285,8 @@ impl Drop for KvmIrqFd {
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "x86_64")]
+    use crate::hv::StateBlob;
+    #[cfg(target_arch = "x86_64")]
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     #[cfg(target_arch = "x86_64")]
     use crate::hv::backend::kvm::irq::*;
@@ -284,15 +318,60 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn test_pit_line_kept_in_routing_table() {
+        // In-kernel PIT raises GSI 0 with no sender bound to it, so a
+        // table written for an MSI route must still carry that line.
+        /// 8254 mode 2, rate generator.
+        const RATE_GENERATOR: u64 = 2;
+        /// Reload count, 0.84 ms at the 1.193182 MHz of 8254.
+        const PERIOD: u64 = 1000;
+
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
+
+        // PIT is unprogrammed after `KVM_CREATE_IRQCHIP`. Channel 0 is
+        // started through the irqchip state blob.
+        let blob = vm.get_irqchip_state().expect("irqchip state");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&blob.data).expect("decode the blob as JSON");
+        state["pit"]["channels"][0]["mode"] = serde_json::Value::from(RATE_GENERATOR);
+        state["pit"]["channels"][0]["count"] = serde_json::Value::from(PERIOD);
+        let started = StateBlob {
+            data: serde_json::to_vec(&state).expect("re-encode"),
+            ..blob
+        };
+        vm.set_irqchip_state(&started).expect("start the timer");
+
+        // Unmasking an MSI route rewrites the table.
+        let msi = vm.create_msi_sender().expect("msi sender");
+        let fd = msi.create_irqfd().expect("irqfd");
+        fd.set_addr(0xfee0_0000).expect("address");
+        fd.set_data(0x31).expect("data");
+        fd.set_masked(false).expect("unmask");
+
+        // With no vCPU to deliver to, the first tick stays latched.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let blob = vm.get_irqchip_state().expect("irqchip state");
+        let state: serde_json::Value =
+            serde_json::from_slice(&blob.data).expect("decode the blob as JSON");
+        // Master 8259 latches the edge in IRR until a CPU acknowledges it,
+        // so the tick is read from there.
+        let master = state["pic_master"]["irr"].as_u64().expect("the 8259 IRR");
+        assert_eq!(master & 1, 1, "IRQ 0 is not in IRR of master 8259");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn test_irqfd_routing() {
         // GSI assignment, masking and route removal of irqfds.
         let hv = KvmHv::new().expect("open /dev/kvm");
         let vm = hv.create_vm().expect("guest");
         vm.enable_in_kernel_irqchip().expect("in-kernel irqchip");
 
-        // Legacy line. Its pin is in each table written after this.
+        // Legacy line. Binding it writes no table, GSI 4 is in each one.
         let com1 = vm.create_irq_sender(4).expect("sender on IRQ 4");
-        assert!(vm.routing.lock().unwrap().pins.contains(&4));
 
         let msi = vm.create_msi_sender().expect("msi sender");
         let one = msi.create_irqfd().expect("irqfd");
@@ -332,10 +411,7 @@ mod tests {
         one.set_masked(false).expect("unmask again");
         assert!(assigned(&vm, &one), "unmasked irqfd is off its GSI");
 
-        let routing = vm.routing.lock().unwrap();
-        assert!(routing.pins.contains(&4), "legacy pin left the table");
-        assert_eq!(routing.msi.len(), 2);
-        drop(routing);
+        assert_eq!(vm.routing.lock().unwrap().msi.len(), 2);
 
         one.eventfd.write(1).expect("fire the irqfd");
         com1.send().expect("pulse IRQ 4");
