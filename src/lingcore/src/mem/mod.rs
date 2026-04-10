@@ -9,6 +9,8 @@
 //! covered by any region, the MMIO hole below 4G on x86 for example, is
 //! not RAM, and an access into it is refused.
 
+use std::sync::Arc;
+
 use thiserror::Error;
 use vm_memory::mmap::FromRangesError;
 use vm_memory::region::GuestRegionCollectionError;
@@ -54,8 +56,10 @@ pub struct Region {
 
 /// Host memory behind the guest physical address space, held as
 /// `vm_memory` regions.
+#[derive(Clone)]
 pub struct GuestRam {
-    inner: GuestMemoryMmap,
+    /// Shared with each vCPU thread. Unmapped when the last clone drops.
+    inner: Arc<GuestMemoryMmap>,
 }
 
 impl GuestRam {
@@ -76,7 +80,9 @@ impl GuestRam {
             }
             _ => Error::Take,
         })?;
-        Ok(GuestRam { inner })
+        Ok(GuestRam {
+            inner: Arc::new(inner),
+        })
     }
 
     /// Returns the regions in ascending address order.

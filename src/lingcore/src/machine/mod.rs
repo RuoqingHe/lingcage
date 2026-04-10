@@ -8,6 +8,8 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use thiserror::Error;
 
@@ -19,6 +21,7 @@ use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::vcpu::{Vcpu, VmExit};
 use crate::hv::vm::Vm;
 use crate::mem::GuestRam;
+use crate::vcpu::VmOps;
 
 mod cpuid;
 mod mptable;
@@ -65,6 +68,17 @@ pub enum Error {
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
+    /// vCPU thread panicked.
+    #[error("vCPU thread panicked")]
+    VcpuThread,
+    /// State of the guest does not permit the requested move.
+    #[error("invalid transition from {from:?} to {to:?}")]
+    BadTransition {
+        /// Current state.
+        from: State,
+        /// Requested state.
+        to: State,
+    },
 }
 
 /// Result alias for assembling a guest.
@@ -93,20 +107,71 @@ fn layout(size: u64) -> Vec<(u64, u64)> {
     }
 }
 
+/// Lifecycle state of a `Machine`. Allowed moves are `Created` to
+/// `Running` and `Running` to `Shutdown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    /// Assembled, vCPU 0 at the kernel entry.
+    Created,
+    /// Each vCPU running on its own thread.
+    Running,
+    /// Threads joined and exit reason read.
+    Shutdown,
+}
+
+impl State {
+    /// Returns `BadTransition` unless `next` is a valid move from `self`.
+    fn valid_transition(self, next: State) -> Result<()> {
+        match (self, next) {
+            (State::Created, State::Running) => Ok(()),
+            (State::Running, State::Shutdown) => Ok(()),
+            _ => Err(Error::BadTransition {
+                from: self,
+                to: next,
+            }),
+        }
+    }
+}
+
+/// The `Bus`, shared by vCPU threads under one lock.
+#[derive(Clone)]
+struct Devices(Arc<Mutex<Bus>>);
+
+impl VmOps for Devices {
+    #[cfg(target_arch = "x86_64")]
+    fn read_port(&mut self, port: u16, size: u8) -> crate::hv::Result<u32> {
+        self.0.lock().unwrap().read_port(port, size)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn write_port(&mut self, port: u16, size: u8, value: u32) -> crate::hv::Result<()> {
+        self.0.lock().unwrap().write_port(port, size, value)
+    }
+
+    fn read_mmio(&mut self, addr: u64, size: u8) -> crate::hv::Result<u64> {
+        self.0.lock().unwrap().read_mmio(addr, size)
+    }
+
+    fn write_mmio(&mut self, addr: u64, size: u8, value: u64) -> crate::hv::Result<()> {
+        self.0.lock().unwrap().write_mmio(addr, size, value)
+    }
+}
+
 /// Assembled guest, with its vCPU at the kernel entry.
 pub struct Machine<H: Hypervisor> {
-    /// VM the parts below were created from, kept so that it outlives them.
-    #[expect(dead_code, reason = "kept for the parts created from it")]
     vm: H::Vm,
     /// Address space the host pages are mapped into. Dropping it unmaps
     /// them.
     #[expect(dead_code, reason = "kept for the mappings")]
     memory: <H::Vm as Vm>::Memory,
-    /// Host pages backing guest RAM.
-    #[expect(dead_code, reason = "backs the mappings")]
     ram: GuestRam,
-    vcpu: <H::Vm as Vm>::Vcpu,
-    bus: Bus,
+    devices: Devices,
+    /// vCPUs not started yet, `start` moves them onto threads.
+    vcpus: Vec<<H::Vm as Vm>::Vcpu>,
+    /// One thread per started vCPU, `stop_vcpu` signals a vCPU through its
+    /// handle.
+    threads: Vec<JoinHandle<Result<VmExit>>>,
+    state: State,
 }
 
 impl<H: Hypervisor> Machine<H> {
@@ -163,15 +228,71 @@ impl<H: Hypervisor> Machine<H> {
             vm,
             memory,
             ram,
-            vcpu,
-            bus,
+            devices: Devices(Arc::new(Mutex::new(bus))),
+            vcpus: vec![vcpu],
+            threads: Vec::new(),
+            state: State::Created,
         })
     }
 
-    /// Run the guest until an exit not handled by the bus and return it.
-    /// Calling again resumes the guest.
-    pub fn run(&mut self) -> Result<VmExit> {
-        Ok(crate::vcpu::run(&mut self.vcpu, &mut self.bus)?)
+    /// Returns current state of the guest.
+    pub fn state(&self) -> State {
+        self.state
+    }
+
+    /// Start each vCPU on its own thread.
+    ///
+    /// Each thread holds a clone of `GuestRam`. Host pages are unmapped
+    /// together with the last clone instead of the `Machine`.
+    pub fn start(&mut self) -> Result<()>
+    where
+        H: 'static,
+    {
+        self.state.valid_transition(State::Running)?;
+        self.threads = self
+            .vcpus
+            .drain(..)
+            .map(|mut vcpu| {
+                let mut devices = self.devices.clone();
+                // The thread keeps the pages mapped after the `Machine` drops.
+                let ram = self.ram.clone();
+                std::thread::spawn(move || {
+                    let _ram = ram;
+                    Ok(crate::vcpu::run(&mut vcpu, &mut devices)?)
+                })
+            })
+            .collect();
+        self.state = State::Running;
+        Ok(())
+    }
+
+    /// Signal each vCPU thread out of `run`, the run returns `Interrupted`.
+    ///
+    /// Signal landing before the thread enters `run` is consumed by the
+    /// handler, so caller repeats the call until threads finish.
+    pub fn stop(&self) -> Result<()> {
+        if self.state != State::Running {
+            return Err(Error::BadTransition {
+                from: self.state,
+                to: State::Shutdown,
+            });
+        }
+        for (index, thread) in self.threads.iter().enumerate() {
+            self.vm.stop_vcpu(index as u16, thread)?;
+        }
+        Ok(())
+    }
+
+    /// Join the vCPU threads and return the first exit reason.
+    pub fn wait(&mut self) -> Result<VmExit> {
+        self.state.valid_transition(State::Shutdown)?;
+        let mut first = None;
+        for thread in self.threads.drain(..) {
+            let exit = thread.join().map_err(|_| Error::VcpuThread)?;
+            first = first.or(Some(exit));
+        }
+        self.state = State::Shutdown;
+        first.unwrap_or(Ok(VmExit::Shutdown))
     }
 }
 
@@ -250,12 +371,100 @@ mod tests {
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
         std::fs::remove_file(&image).expect("remove the kernel image");
 
-        assert_eq!(machine.run().expect("run"), VmExit::Shutdown);
+        machine.start().expect("start");
+        assert_eq!(machine.wait().expect("run"), VmExit::Shutdown);
         assert_eq!(
             console.0.lock().unwrap().as_slice(),
             b"ok\x00",
             "guest console got other bytes"
         );
+    }
+
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn test_stop_spinning_guest() {
+        use std::time::Duration;
+
+        use crate::boot::tests::bzimage;
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+        /// `jmp` to itself, guest spins without any exit.
+        const SPIN: [u8; 2] = [0xeb, 0xfe];
+
+        let mut payload = vec![0u8; 0x200];
+        payload.extend_from_slice(&SPIN);
+        let image = std::env::temp_dir().join(format!("lingcore-spin-{}", std::process::id()));
+        std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
+
+        let config = Config {
+            memory: 16 << 20,
+            kernel: image.clone(),
+            initrd: None,
+            cmdline: "console=ttyS0".to_string(),
+        };
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
+        std::fs::remove_file(&image).expect("remove the kernel image");
+
+        machine.start().expect("start the guest");
+        // Kick before the thread enters `run` has no effect, so repeat until
+        for _ in 0..64 {
+            if machine.threads.iter().all(|thread| thread.is_finished()) {
+                break;
+            }
+            machine.stop().expect("stop the guest");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Fail here instead of blocking in `wait` below.
+        assert!(
+            machine.threads.iter().all(|thread| thread.is_finished()),
+            "vCPU thread still running after 64 kicks"
+        );
+        assert_eq!(
+            machine.wait().expect("wait"),
+            VmExit::Interrupted,
+            "run did not end on the kick"
+        );
+    }
+
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn test_reject_bad_transition() {
+        use crate::boot::tests::bzimage;
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+        /// `ud2` triple faults with the empty IDT, run ends in `Shutdown`.
+        const FAULT: [u8; 2] = [0x0f, 0x0b];
+
+        let mut payload = vec![0u8; 0x200];
+        payload.extend_from_slice(&FAULT);
+        let image = std::env::temp_dir().join(format!("lingcore-state-{}", std::process::id()));
+        std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
+
+        let config = Config {
+            memory: 16 << 20,
+            kernel: image.clone(),
+            initrd: None,
+            cmdline: String::new(),
+        };
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
+        std::fs::remove_file(&image).expect("remove the kernel image");
+
+        // Before `start` there is no thread to stop or to wait on.
+        assert_eq!(machine.state(), State::Created);
+        assert!(matches!(machine.wait(), Err(Error::BadTransition { .. })));
+        assert!(matches!(machine.stop(), Err(Error::BadTransition { .. })));
+
+        machine.start().expect("start");
+        assert_eq!(machine.state(), State::Running);
+        // Second `start` would drop the handles of the first threads.
+        assert!(matches!(machine.start(), Err(Error::BadTransition { .. })));
+
+        assert_eq!(machine.wait().expect("wait"), VmExit::Shutdown);
+        assert_eq!(machine.state(), State::Shutdown);
+        assert!(matches!(machine.wait(), Err(Error::BadTransition { .. })));
+        assert!(matches!(machine.stop(), Err(Error::BadTransition { .. })));
     }
 
     #[test]
