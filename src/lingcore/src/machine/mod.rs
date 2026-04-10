@@ -21,6 +21,7 @@ use crate::hv::vm::Vm;
 use crate::mem::GuestRam;
 
 mod cpuid;
+mod mptable;
 
 /// End of low RAM. Window from here to 4 GiB holds the I/O APIC and the
 /// LAPIC.
@@ -41,6 +42,9 @@ const COM1_IRQ: u8 = 4;
 /// Index of the vCPU the guest boots on.
 const BOOT_VCPU: u16 = 0;
 
+/// Number of vCPUs given to a guest.
+const VCPUS: u16 = 1;
+
 /// Errors thrown while assembling a guest.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -58,6 +62,9 @@ pub enum Error {
     /// Failed to open or read the kernel image.
     #[error("failed to read kernel image")]
     Image(#[source] std::io::Error),
+    /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
+    #[error("MP table does not fit in its kilobyte")]
+    NoRoomForMpTable,
 }
 
 /// Result alias for assembling a guest.
@@ -138,6 +145,7 @@ impl<H: Hypervisor> Machine<H> {
             None => None,
         };
         boot::write_boot_params(&ram, &kernel, &config.cmdline, initrd)?;
+        mptable::write(&ram, VCPUS)?;
 
         let mut bus = Bus::new();
         let line = vm.create_irq_sender(COM1_IRQ)?;
