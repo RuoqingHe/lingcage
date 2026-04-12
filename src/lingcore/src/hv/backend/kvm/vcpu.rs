@@ -132,7 +132,18 @@ impl Vcpu for KvmVcpu {
         #[cfg(target_arch = "x86_64")]
         let mut port = false;
         let mut mmio = None;
-        let exit = match self.fd.run() {
+        // `KVM_RUN` on a vCPU in `KVM_MP_STATE_UNINITIALIZED` blocks until an
+        // INIT arrives and returns `EAGAIN` on a wake without one, so the
+        // call is repeated. Signal returns `EINTR`, which still ends the run.
+        let outcome = loop {
+            let result = self.fd.run();
+            match &result {
+                Err(err) if err.errno() == libc::EAGAIN && stop.is_none() => continue,
+                _ => break result,
+            }
+        };
+
+        let exit = match outcome {
             #[cfg(target_arch = "x86_64")]
             Ok(VcpuExit::IoOut(..) | VcpuExit::IoIn(..)) => {
                 port = true;
