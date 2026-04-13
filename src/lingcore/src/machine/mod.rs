@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use thiserror::Error;
@@ -46,8 +46,11 @@ const COM1_IRQ: u8 = 4;
 /// INIT and SIPI.
 const BOOT_VCPU: u16 = 0;
 
-/// Interval `wait` sleeps between checks of the threads.
+/// Interval between signals to a thread still in `run`.
 const POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Time given to threads to leave `run` before `VcpuStuck`.
+const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Errors thrown while assembling a guest.
 #[derive(Debug, Error)]
@@ -69,6 +72,9 @@ pub enum Error {
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
+    /// vCPU thread was still in `run` at `STOP_TIMEOUT`.
+    #[error("vCPU thread did not stop within timeout")]
+    VcpuStuck,
     /// vCPU thread panicked.
     #[error("vCPU thread panicked")]
     VcpuThread,
@@ -139,6 +145,44 @@ impl State {
     }
 }
 
+/// Stop flag shared by vCPU threads and `wait`. It is set by `stop` and
+/// by a thread ending, each thread reads the flag before re-entering
+/// `run`.
+#[derive(Default)]
+struct Kill {
+    signalled: Mutex<bool>,
+    woken: Condvar,
+}
+
+impl Kill {
+    /// Set the flag and wake `wait`.
+    fn signal(&self) {
+        *self.signalled.lock().unwrap() = true;
+        self.woken.notify_all();
+    }
+
+    fn is_signalled(&self) -> bool {
+        *self.signalled.lock().unwrap()
+    }
+
+    /// Block until the flag is set.
+    fn wait(&self) {
+        let mut signalled = self.signalled.lock().unwrap();
+        while !*signalled {
+            signalled = self.woken.wait(signalled).unwrap();
+        }
+    }
+}
+
+/// Set the `Kill` flag on drop, so that a panicking thread sets it too.
+struct SignalOnDrop(Arc<Kill>);
+
+impl Drop for SignalOnDrop {
+    fn drop(&mut self) {
+        self.0.signal();
+    }
+}
+
 /// The `Bus`, shared by vCPU threads under one lock.
 #[derive(Clone)]
 struct Devices(Arc<Mutex<Bus>>);
@@ -177,6 +221,7 @@ pub struct Machine<H: Hypervisor> {
     /// One thread per started vCPU, `stop_vcpu` signals a vCPU through its
     /// handle.
     threads: Vec<JoinHandle<Result<VmExit>>>,
+    kill: Arc<Kill>,
     state: State,
 }
 
@@ -249,6 +294,7 @@ impl<H: Hypervisor> Machine<H> {
             devices: Devices(Arc::new(Mutex::new(bus))),
             vcpus,
             threads: Vec::new(),
+            kill: Arc::new(Kill::default()),
             state: State::Created,
         })
     }
@@ -274,9 +320,18 @@ impl<H: Hypervisor> Machine<H> {
                 let mut devices = self.devices.clone();
                 // The thread keeps the pages mapped after the `Machine` drops.
                 let ram = self.ram.clone();
+                let kill = Arc::clone(&self.kill);
                 std::thread::spawn(move || {
                     let _ram = ram;
-                    Ok(crate::vcpu::run(&mut vcpu, &mut devices)?)
+                    let _signal = SignalOnDrop(Arc::clone(&kill));
+                    loop {
+                        let exit = crate::vcpu::run(&mut vcpu, &mut devices)?;
+                        // `Interrupted` with the flag clear is a stray
+                        // signal, vCPU re-enters `run`.
+                        if kill.is_signalled() || exit != VmExit::Interrupted {
+                            break Ok(exit);
+                        }
+                    }
                 })
             })
             .collect();
@@ -284,10 +339,11 @@ impl<H: Hypervisor> Machine<H> {
         Ok(())
     }
 
-    /// Signal each vCPU thread out of `run`, the run returns `Interrupted`.
+    /// Set the stop flag and signal the vCPU threads out of `run` until they
+    /// finish, the run returns `Interrupted`.
     ///
-    /// Signal landing before the thread enters `run` is consumed by the
-    /// handler, so caller repeats the call until threads finish.
+    /// The flag is set before the first signal, so a thread outside `run`
+    /// stops on reading it, the signal itself is consumed by the handler.
     pub fn stop(&self) -> Result<()> {
         if self.state != State::Running {
             return Err(Error::BadTransition {
@@ -295,26 +351,38 @@ impl<H: Hypervisor> Machine<H> {
                 to: State::Shutdown,
             });
         }
-        for (index, thread) in self.threads.iter().enumerate() {
-            self.vm.stop_vcpu(index as u16, thread)?;
+        self.kill.signal();
+        self.ask_until_out()
+    }
+
+    /// Signal unfinished threads once per `POLL` until they finish, or
+    /// return `VcpuStuck` after `STOP_TIMEOUT`.
+    fn ask_until_out(&self) -> Result<()> {
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        while !self.threads.iter().all(|thread| thread.is_finished()) {
+            if std::time::Instant::now() > deadline {
+                return Err(Error::VcpuStuck);
+            }
+            for (index, thread) in self.threads.iter().enumerate() {
+                if !thread.is_finished() {
+                    self.vm.stop_vcpu(index as u16, thread)?;
+                }
+            }
+            std::thread::sleep(POLL);
         }
         Ok(())
     }
 
-    /// Join the vCPU threads and return the first exit reason.
+    /// Join the vCPU threads and return the exit of the first thread
+    /// joined, in creation order.
     ///
-    /// Once one thread has finished, the rest are signalled until they
-    /// finish too, otherwise a vCPU still waiting for INIT stays inside
-    /// `run`.
+    /// Blocks on the stop flag, which a thread sets when it finishes. The
+    /// rest are then signalled out of `run`, otherwise a vCPU waiting for
+    /// INIT stays inside.
     pub fn wait(&mut self) -> Result<VmExit> {
         self.state.valid_transition(State::Shutdown)?;
-        while !self.threads.iter().any(|thread| thread.is_finished()) {
-            std::thread::sleep(POLL);
-        }
-        while !self.threads.iter().all(|thread| thread.is_finished()) {
-            self.stop()?;
-            std::thread::sleep(POLL);
-        }
+        self.kill.wait();
+        self.ask_until_out()?;
         let mut first = None;
         for thread in self.threads.drain(..) {
             let exit = thread.join().map_err(|_| Error::VcpuThread)?;
@@ -413,8 +481,6 @@ mod tests {
     #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_stop_spinning_guest() {
-        use std::time::Duration;
-
         use crate::boot::tests::bzimage;
         use crate::hv::backend::kvm::hypervisor::KvmHv;
 
@@ -438,18 +504,13 @@ mod tests {
         std::fs::remove_file(&image).expect("remove the kernel image");
 
         machine.start().expect("start the guest");
-        // Kick before the thread enters `run` has no effect, so repeat until
-        for _ in 0..64 {
-            if machine.threads.iter().all(|thread| thread.is_finished()) {
-                break;
-            }
-            machine.stop().expect("stop the guest");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // Fail here instead of blocking in `wait` below.
+        // Guest spins inside `run`, so only a signal to the thread ends it.
+        // One `stop` is enough, the flag is set before the first signal and
+        // a thread still in `run` is signalled again.
+        machine.stop().expect("stop the guest");
         assert!(
             machine.threads.iter().all(|thread| thread.is_finished()),
-            "vCPU thread still running after 64 kicks"
+            "stop returned with vCPU thread still running"
         );
         assert_eq!(
             machine.wait().expect("wait"),
