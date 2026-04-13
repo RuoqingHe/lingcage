@@ -18,7 +18,7 @@ use crate::devices::bus::Bus;
 use crate::devices::serial::Serial;
 use crate::hv::hypervisor::Hypervisor;
 use crate::hv::memory::{MemMapOption, VmMemory};
-use crate::hv::vcpu::{Vcpu, VmExit};
+use crate::hv::vcpu::{Stopper, Vcpu, VmExit};
 use crate::hv::vm::Vm;
 use crate::mem::GuestRam;
 use crate::vcpu::VmOps;
@@ -46,12 +46,6 @@ const COM1_IRQ: u8 = 4;
 /// INIT and SIPI.
 const BOOT_VCPU: u16 = 0;
 
-/// Interval between signals to a thread still in `run`.
-const POLL: std::time::Duration = std::time::Duration::from_millis(2);
-
-/// Time given to threads to leave `run` before `VcpuStuck`.
-const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Errors thrown while assembling a guest.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -72,9 +66,6 @@ pub enum Error {
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
-    /// vCPU thread was still in `run` at `STOP_TIMEOUT`.
-    #[error("vCPU thread did not stop within timeout")]
-    VcpuStuck,
     /// vCPU thread panicked.
     #[error("vCPU thread panicked")]
     VcpuThread,
@@ -221,6 +212,8 @@ pub struct Machine<H: Hypervisor> {
     /// One thread per started vCPU, `stop_vcpu` signals a vCPU through its
     /// handle.
     threads: Vec<JoinHandle<Result<VmExit>>>,
+    /// One `Stopper` per vCPU, in creation order, used by `ask_out`.
+    stoppers: Vec<Box<dyn Stopper>>,
     kill: Arc<Kill>,
     state: State,
 }
@@ -278,12 +271,14 @@ impl<H: Hypervisor> Machine<H> {
         // for the INIT sent by kernel once it has read the MP table.
         let host = hv.supported_cpuid()?;
         let mut vcpus = Vec::with_capacity(usize::from(config.vcpus));
+        let mut stoppers = Vec::with_capacity(usize::from(config.vcpus));
         for index in 0..config.vcpus {
             let mut vcpu = vm.create_vcpu(index)?;
             vcpu.set_cpuid(&cpuid::for_vcpu(&host, index))?;
             if index == BOOT_VCPU {
                 boot::enter_long_mode(&ram, &mut vcpu, &kernel)?;
             }
+            stoppers.push(vcpu.stopper());
             vcpus.push(vcpu);
         }
 
@@ -293,6 +288,7 @@ impl<H: Hypervisor> Machine<H> {
             ram,
             devices: Devices(Arc::new(Mutex::new(bus))),
             vcpus,
+            stoppers,
             threads: Vec::new(),
             kill: Arc::new(Kill::default()),
             state: State::Created,
@@ -339,11 +335,8 @@ impl<H: Hypervisor> Machine<H> {
         Ok(())
     }
 
-    /// Set the stop flag and signal the vCPU threads out of `run` until they
-    /// finish, the run returns `Interrupted`.
-    ///
-    /// The flag is set before the first signal, so a thread outside `run`
-    /// stops on reading it, the signal itself is consumed by the handler.
+    /// Set the stop flag and bring each vCPU out of `run`, the run returns
+    /// `Interrupted`.
     pub fn stop(&self) -> Result<()> {
         if self.state != State::Running {
             return Err(Error::BadTransition {
@@ -352,23 +345,18 @@ impl<H: Hypervisor> Machine<H> {
             });
         }
         self.kill.signal();
-        self.ask_until_out()
+        self.ask_out()
     }
 
-    /// Signal unfinished threads once per `POLL` until they finish, or
-    /// return `VcpuStuck` after `STOP_TIMEOUT`.
-    fn ask_until_out(&self) -> Result<()> {
-        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
-        while !self.threads.iter().all(|thread| thread.is_finished()) {
-            if std::time::Instant::now() > deadline {
-                return Err(Error::VcpuStuck);
-            }
-            for (index, thread) in self.threads.iter().enumerate() {
-                if !thread.is_finished() {
-                    self.vm.stop_vcpu(index as u16, thread)?;
-                }
-            }
-            std::thread::sleep(POLL);
+    /// Stop each vCPU through its `Stopper`, which the backend checks on
+    /// entry to `run`, and through `stop_vcpu`, a signal landing inside
+    /// `run`. One call covers both cases, so `wait` joins without retry.
+    fn ask_out(&self) -> Result<()> {
+        for stopper in &self.stoppers {
+            stopper.stop();
+        }
+        for (index, thread) in self.threads.iter().enumerate() {
+            self.vm.stop_vcpu(index as u16, thread)?;
         }
         Ok(())
     }
@@ -382,7 +370,7 @@ impl<H: Hypervisor> Machine<H> {
     pub fn wait(&mut self) -> Result<VmExit> {
         self.state.valid_transition(State::Shutdown)?;
         self.kill.wait();
-        self.ask_until_out()?;
+        self.ask_out()?;
         let mut first = None;
         for thread in self.threads.drain(..) {
             let exit = thread.join().map_err(|_| Error::VcpuThread)?;
@@ -504,14 +492,10 @@ mod tests {
         std::fs::remove_file(&image).expect("remove the kernel image");
 
         machine.start().expect("start the guest");
-        // Guest spins inside `run`, so only a signal to the thread ends it.
-        // One `stop` is enough, the flag is set before the first signal and
-        // a thread still in `run` is signalled again.
+        // Guest spins inside `run`, so only a stop ends it. One `stop` is
+        // enough, the `Stopper` covers a thread outside `run` and the signal
+        // covers one inside.
         machine.stop().expect("stop the guest");
-        assert!(
-            machine.threads.iter().all(|thread| thread.is_finished()),
-            "stop returned with vCPU thread still running"
-        );
         assert_eq!(
             machine.wait().expect("wait"),
             VmExit::Interrupted,

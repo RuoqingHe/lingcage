@@ -103,13 +103,13 @@ impl Vm for KvmVm {
             .fd
             .create_vcpu(u64::from(cpu_index))
             .map_err(kvm_err("KVM_CREATE_VCPU"))?;
-        Ok(KvmVcpu::new(
+        KvmVcpu::new(
             fd,
             #[cfg(target_arch = "x86_64")]
             self.xsave_size(),
             #[cfg(target_arch = "x86_64")]
             Arc::clone(&self.msrs),
-        ))
+        )
     }
 
     fn create_vm_memory(&self) -> Result<KvmMemory> {

@@ -4,7 +4,7 @@
 
 //! `KvmVcpu`, the `KVM_RUN` loop and register access.
 
-#[cfg(target_arch = "x86_64")]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 #[cfg(target_arch = "x86_64")]
@@ -12,9 +12,6 @@ use kvm_bindings::KVM_EXIT_IO_IN;
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 
-#[cfg(target_arch = "x86_64")]
-use crate::hv::Error;
-use crate::hv::Result;
 #[cfg(target_arch = "x86_64")]
 use crate::hv::StateBlob;
 #[cfg(target_arch = "x86_64")]
@@ -26,7 +23,8 @@ use crate::hv::backend::kvm::x86_64::MSR_BATCH;
 use crate::hv::backend::kvm::x86_64::cpuid::to_kvm;
 #[cfg(target_arch = "x86_64")]
 use crate::hv::backend::kvm::x86_64::state::VcpuState;
-use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
+use crate::hv::vcpu::{Stopper, Vcpu, VmEntry, VmExit};
+use crate::hv::{Error, Result};
 
 /// Exit still being reported or waiting for its value. KVM completes it
 /// on the next `KVM_RUN` from the `kvm_run` page.
@@ -59,10 +57,47 @@ fn le(data: &[u8]) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+/// Second mapping of the `kvm_run` page of a vCPU, shared through an
+/// `Arc` so that a `KvmStopper` outlives the `VcpuFd` and the mapping
+/// it keeps.
+struct RunPage {
+    page: *mut kvm_bindings::kvm_run,
+    bytes: usize,
+}
+
+// SAFETY: the only access through this mapping is a byte store to
+// `immediate_exit`, which KVM polls on entry to `KVM_RUN`, no other
+// field of the page is read or written through it.
+unsafe impl Send for RunPage {}
+// SAFETY: same as above.
+unsafe impl Sync for RunPage {}
+
+impl Drop for RunPage {
+    fn drop(&mut self) {
+        // SAFETY: `page` and `bytes` are the `mmap` result and length, and
+        // this is the last `Arc` share.
+        let unmapped = unsafe { libc::munmap(self.page.cast(), self.bytes) };
+        assert_eq!(unmapped, 0, "munmap of the run page failed");
+    }
+}
+
+/// `Stopper` of a `KvmVcpu`, a share of its run page.
+struct KvmStopper(Arc<RunPage>);
+
+impl Stopper for KvmStopper {
+    fn stop(&self) {
+        // SAFETY: the `Arc` keeps the page mapped for the store, and
+        // `immediate_exit` is a `u8`.
+        unsafe { (*self.0.page).immediate_exit = 1 };
+    }
+}
+
 /// vCPU handle, the fd returned by `KVM_CREATE_VCPU`, plus the read exit
 /// waiting for its value.
 pub struct KvmVcpu {
     fd: VcpuFd,
+    /// Run page mapping shared with the `Stopper`s of this vCPU.
+    run_page: Arc<RunPage>,
     pending: Option<Pending>,
     /// Bytes copied by `KVM_GET_XSAVE` and `KVM_SET_XSAVE` on this host.
     #[cfg(target_arch = "x86_64")]
@@ -79,19 +114,55 @@ impl KvmVcpu {
         fd: VcpuFd,
         #[cfg(target_arch = "x86_64")] xsave_size: usize,
         #[cfg(target_arch = "x86_64")] msrs: Arc<[u32]>,
-    ) -> Self {
-        KvmVcpu {
+    ) -> Result<Self> {
+        // `immediate_exit` is in the first page of the `kvm_run` area, so
+        // mapping one page is enough.
+        let bytes = page_size();
+        // SAFETY: `fd` is a vCPU fd, KVM maps its `kvm_run` page at offset 0.
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if page == libc::MAP_FAILED {
+            return Err(Error::Os {
+                op: "mmap the vCPU run page",
+                errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            });
+        }
+        Ok(KvmVcpu {
             fd,
+            run_page: Arc::new(RunPage {
+                page: page.cast(),
+                bytes,
+            }),
             pending: None,
             #[cfg(target_arch = "x86_64")]
             xsave_size,
             #[cfg(target_arch = "x86_64")]
             msrs,
-        }
+        })
     }
 }
 
+/// Host page size in bytes.
+fn page_size() -> usize {
+    // SAFETY: `sysconf` takes a name and touches no memory of ours.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(size > 0, "sysconf(_SC_PAGESIZE) failed");
+    size as usize
+}
+
 impl Vcpu for KvmVcpu {
+    fn stopper(&self) -> Box<dyn Stopper> {
+        Box::new(KvmStopper(Arc::clone(&self.run_page)))
+    }
+
     fn run(&mut self, entry: VmEntry) -> Result<VmExit> {
         match self.pending.take() {
             #[cfg(target_arch = "x86_64")]
@@ -180,6 +251,8 @@ impl Vcpu for KvmVcpu {
             }),
             Ok(_) => None,
             Err(err) => {
+                // A `Stopper` sets `immediate_exit` from another thread and
+                // KVM returns `EINTR` for it. Clear it here either way.
                 self.fd.set_kvm_immediate_exit(0);
                 // `EINTR` and `EAGAIN` are not failures, vCPU state is intact
                 // and caller re-enters.
@@ -669,6 +742,56 @@ mod tests {
         // SAFETY: `reset` came from `alloc_zeroed` with `layout`, and the
         // guest is not run anymore.
         unsafe { dealloc(reset, layout) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_stopper_interrupts_on_entry() {
+        // `Stopper` set between two runs makes the next one return
+        // `Interrupted` on entry, before the guest executes anything.
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mem = vm.create_vm_memory().expect("address space");
+
+        let layout = Layout::from_size_align(PAGE, PAGE).expect("page-aligned layout");
+        // SAFETY: `layout` has non-zero size.
+        let host = unsafe { alloc_zeroed(layout) };
+        assert!(!host.is_null());
+        // A page of `hlt`, so a run from any address in it exits `Halt`.
+        // SAFETY: the allocation is `PAGE` bytes.
+        unsafe { std::ptr::write_bytes(host, 0xf4, PAGE) };
+        mem.mem_map(
+            0xffff_f000,
+            PAGE as u64,
+            host as usize,
+            MemMapOption::default(),
+        )
+        .expect("map the reset vector");
+
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        let stopper = cpu.stopper();
+
+        // Without a stop the run reaches `hlt`.
+        assert_eq!(cpu.run(VmEntry::Run).expect("run"), VmExit::Halt);
+
+        // With the stop set, the run returns on entry.
+        stopper.stop();
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Interrupted,
+            "run did not return on entry"
+        );
+
+        // The run clears the stop.
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Halt,
+            "stop not cleared by the run"
+        );
+
+        // SAFETY: `host` came from `alloc_zeroed` with `layout`, and the
+        // guest is not run again.
+        unsafe { dealloc(host, layout) };
     }
 
     #[cfg(target_arch = "x86_64")]

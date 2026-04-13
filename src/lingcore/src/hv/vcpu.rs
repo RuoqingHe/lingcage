@@ -69,12 +69,23 @@ pub enum VmEntry {
     Mmio { data: u64 },
 }
 
+/// Handle for stopping a vCPU from another thread. Backend checks it on
+/// entry to `run`, so a stop requested between two runs is not lost.
+pub trait Stopper: Send + Sync {
+    /// Make the next `run` return `Interrupted` on entry.
+    fn stop(&self);
+}
+
 /// One virtual CPU. It is owned and run by a single thread, so the trait
 /// is `Send` but not `Sync`.
 pub trait Vcpu: Send {
     /// Run the vCPU until the next exit. Value for a pending `Io` or `Mmio`
     /// read is passed in `entry` on the following call.
     fn run(&mut self, entry: VmEntry) -> Result<VmExit>;
+
+    /// Returns a `Stopper` for this vCPU. It shares state already held by
+    /// the vCPU, so taking one can not fail, and it outlives the vCPU.
+    fn stopper(&self) -> Box<dyn Stopper>;
 
     /// Read one general register.
     #[cfg(target_arch = "x86_64")]
