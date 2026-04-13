@@ -42,11 +42,12 @@ const COM1_SIZE: u16 = 8;
 /// IRQ of the first serial console, `ttyS0`.
 const COM1_IRQ: u8 = 4;
 
-/// Index of the vCPU the guest boots on.
+/// Index of the vCPU the guest boots on. Kernel starts the rest with
+/// INIT and SIPI.
 const BOOT_VCPU: u16 = 0;
 
-/// Number of vCPUs given to a guest.
-const VCPUS: u16 = 1;
+/// Interval `wait` sleeps between checks of the threads.
+const POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Errors thrown while assembling a guest.
 #[derive(Debug, Error)]
@@ -71,6 +72,9 @@ pub enum Error {
     /// vCPU thread panicked.
     #[error("vCPU thread panicked")]
     VcpuThread,
+    /// `Config::vcpus` is zero.
+    #[error("guest needs at least one vCPU")]
+    NoVcpus,
     /// State of the guest does not permit the requested move.
     #[error("invalid transition from {from:?} to {to:?}")]
     BadTransition {
@@ -89,6 +93,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Config {
     /// Guest RAM size in bytes.
     pub memory: u64,
+    /// Number of vCPUs, at least one.
+    pub vcpus: u16,
     /// Kernel image path, a bzImage on x86.
     pub kernel: PathBuf,
     /// Initramfs path, a cpio archive loaded above the kernel.
@@ -192,6 +198,9 @@ impl<H: Hypervisor> Machine<H> {
         // the `Bus`.
         <H::Vm as Vm>::IrqSender: 'static,
     {
+        if config.vcpus == 0 {
+            return Err(Error::NoVcpus);
+        }
         let ram = GuestRam::new(&layout(config.memory))?;
         let vm = hv.create_vm()?;
         vm.enable_in_kernel_irqchip()?;
@@ -210,7 +219,7 @@ impl<H: Hypervisor> Machine<H> {
             None => None,
         };
         boot::write_boot_params(&ram, &kernel, &config.cmdline, initrd)?;
-        mptable::write(&ram, VCPUS)?;
+        mptable::write(&ram, config.vcpus)?;
 
         let mut bus = Bus::new();
         let line = vm.create_irq_sender(COM1_IRQ)?;
@@ -220,16 +229,25 @@ impl<H: Hypervisor> Machine<H> {
             Box::new(Serial::new(console).on_line(Box::new(line))),
         )?;
 
-        let mut vcpu = vm.create_vcpu(BOOT_VCPU)?;
-        vcpu.set_cpuid(&cpuid::for_vcpu(&hv.supported_cpuid()?, BOOT_VCPU))?;
-        boot::enter_long_mode(&ram, &mut vcpu, &kernel)?;
+        // Only vCPU 0 is entered in long mode. The rest wait in reset state
+        // for the INIT sent by kernel once it has read the MP table.
+        let host = hv.supported_cpuid()?;
+        let mut vcpus = Vec::with_capacity(usize::from(config.vcpus));
+        for index in 0..config.vcpus {
+            let mut vcpu = vm.create_vcpu(index)?;
+            vcpu.set_cpuid(&cpuid::for_vcpu(&host, index))?;
+            if index == BOOT_VCPU {
+                boot::enter_long_mode(&ram, &mut vcpu, &kernel)?;
+            }
+            vcpus.push(vcpu);
+        }
 
         Ok(Machine {
             vm,
             memory,
             ram,
             devices: Devices(Arc::new(Mutex::new(bus))),
-            vcpus: vec![vcpu],
+            vcpus,
             threads: Vec::new(),
             state: State::Created,
         })
@@ -284,8 +302,19 @@ impl<H: Hypervisor> Machine<H> {
     }
 
     /// Join the vCPU threads and return the first exit reason.
+    ///
+    /// Once one thread has finished, the rest are signalled until they
+    /// finish too, otherwise a vCPU still waiting for INIT stays inside
+    /// `run`.
     pub fn wait(&mut self) -> Result<VmExit> {
         self.state.valid_transition(State::Shutdown)?;
+        while !self.threads.iter().any(|thread| thread.is_finished()) {
+            std::thread::sleep(POLL);
+        }
+        while !self.threads.iter().all(|thread| thread.is_finished()) {
+            self.stop()?;
+            std::thread::sleep(POLL);
+        }
         let mut first = None;
         for thread in self.threads.drain(..) {
             let exit = thread.join().map_err(|_| Error::VcpuThread)?;
@@ -363,6 +392,7 @@ mod tests {
         let console = Tap(Arc::new(Mutex::new(Vec::new())));
         let config = Config {
             memory: 16 << 20,
+            vcpus: 1,
             kernel: image.clone(),
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
@@ -398,6 +428,7 @@ mod tests {
 
         let config = Config {
             memory: 16 << 20,
+            vcpus: 1,
             kernel: image.clone(),
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
@@ -443,6 +474,7 @@ mod tests {
 
         let config = Config {
             memory: 16 << 20,
+            vcpus: 1,
             kernel: image.clone(),
             initrd: None,
             cmdline: String::new(),
@@ -467,6 +499,90 @@ mod tests {
         assert!(matches!(machine.stop(), Err(Error::BadTransition { .. })));
     }
 
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn test_all_vcpus_exit_on_first_stop() {
+        use crate::boot::tests::bzimage;
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+        /// `ud2` triple faults with the empty IDT, run ends in `Shutdown`.
+        const FAULT: [u8; 2] = [0x0f, 0x0b];
+        const VCPUS: u16 = 4;
+
+        let mut payload = vec![0u8; 0x200];
+        payload.extend_from_slice(&FAULT);
+        let image = std::env::temp_dir().join(format!("lingcore-smp-{}", std::process::id()));
+        std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
+
+        let config = Config {
+            memory: 16 << 20,
+            vcpus: VCPUS,
+            kernel: image.clone(),
+            initrd: None,
+            cmdline: String::new(),
+        };
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
+        std::fs::remove_file(&image).expect("remove the kernel image");
+
+        machine.start().expect("start");
+        assert_eq!(
+            machine.threads.len(),
+            usize::from(VCPUS),
+            "vCPU left unstarted"
+        );
+
+        // Only vCPU 0 runs, the rest wait for an INIT which is not sent.
+        // `wait` runs on its own thread so that a hang fails on the timeout
+        // below.
+        let reason = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&reason);
+        let (sender, waited) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _sender = sender;
+            let mut machine = machine;
+            let exit = machine.wait();
+            *sink.lock().unwrap() = Some((exit, machine.state()));
+        });
+        assert!(
+            matches!(
+                waited.recv_timeout(std::time::Duration::from_secs(20)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "wait did not return in 20 s"
+        );
+
+        let (exit, state) = reason.lock().unwrap().take().expect("reason");
+        assert_eq!(
+            exit.expect("wait"),
+            VmExit::Shutdown,
+            "run did not end on the fault"
+        );
+        assert_eq!(state, State::Shutdown);
+    }
+
+    #[test]
+    fn test_reject_zero_vcpus() {
+        let config = Config {
+            memory: 16 << 20,
+            vcpus: 0,
+            kernel: PathBuf::from("/nonexistent/kernel"),
+            initrd: None,
+            cmdline: String::new(),
+        };
+        #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+        {
+            use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+            let hv = KvmHv::new().expect("open /dev/kvm");
+            assert!(matches!(
+                Machine::new(&hv, &config, Vec::new()),
+                Err(Error::NoVcpus)
+            ));
+        }
+        let _ = &config;
+    }
+
     #[test]
     fn test_reject_unreadable_kernel() {
         #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
@@ -476,6 +592,7 @@ mod tests {
             let hv = KvmHv::new().expect("open /dev/kvm");
             let config = Config {
                 memory: 16 << 20,
+                vcpus: 1,
                 kernel: PathBuf::from("/nonexistent/kernel"),
                 initrd: None,
                 cmdline: String::new(),
