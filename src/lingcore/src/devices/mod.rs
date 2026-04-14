@@ -5,6 +5,9 @@
 //! Guest devices, addressed by register offset. The machine layout
 //! places a device in x86 port space or in an MMIO window.
 
+use std::io;
+use std::sync::{Arc, Mutex};
+
 use thiserror::Error;
 
 pub mod bus;
@@ -39,4 +42,44 @@ pub trait Device: Send {
 
     /// Handle a write of `size` bytes at `offset`.
     fn write(&mut self, offset: u64, size: u8, value: u64) -> std::io::Result<()>;
+}
+
+/// Device taking bytes from outside of the guest, console input for
+/// example.
+pub trait Receive: Send + Sync {
+    /// Queue `bytes` for the guest to read.
+    fn receive(&self, bytes: &[u8]) -> io::Result<()>;
+}
+
+/// Device behind a mutex, which is reached from outside the bus as well
+/// as through it. Lock of the bus only covers a device reached through
+/// the bus.
+pub struct Shared<D>(Arc<Mutex<D>>);
+
+impl<D> Shared<D> {
+    /// Wrap `device`, a clone shares it.
+    pub fn new(device: D) -> Self {
+        Shared(Arc::new(Mutex::new(device)))
+    }
+
+    /// Run `f` with the device locked.
+    pub fn with<R>(&self, f: impl FnOnce(&mut D) -> R) -> R {
+        f(&mut self.0.lock().unwrap())
+    }
+}
+
+impl<D> Clone for Shared<D> {
+    fn clone(&self) -> Self {
+        Shared(Arc::clone(&self.0))
+    }
+}
+
+impl<D: Device> Device for Shared<D> {
+    fn read(&mut self, offset: u64, size: u8) -> u64 {
+        self.with(|device| device.read(offset, size))
+    }
+
+    fn write(&mut self, offset: u64, size: u8, value: u64) -> io::Result<()> {
+        self.with(|device| device.write(offset, size, value))
+    }
 }

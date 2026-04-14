@@ -222,6 +222,13 @@ impl<W: Write> Serial<W> {
     }
 }
 
+impl<W: Write + Send> crate::devices::Receive for crate::devices::Shared<Serial<W>> {
+    /// Queue `bytes` without waiting for the guest to read them.
+    fn receive(&self, bytes: &[u8]) -> io::Result<()> {
+        self.with(|uart| uart.receive(bytes))
+    }
+}
+
 impl<W: Write + Send> crate::devices::Device for Serial<W> {
     /// Registers are one byte wide, wider read only returns the register at
     /// `offset`.

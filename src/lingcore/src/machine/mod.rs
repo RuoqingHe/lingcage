@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::boot;
 use crate::devices::bus::Bus;
 use crate::devices::serial::Serial;
+use crate::devices::{Receive, Shared};
 use crate::hv::hypervisor::Hypervisor;
 use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::vcpu::{Stopper, Vcpu, VmExit};
@@ -207,6 +208,8 @@ pub struct Machine<H: Hypervisor> {
     memory: <H::Vm as Vm>::Memory,
     ram: GuestRam,
     devices: Devices,
+    /// Share of the console UART for input, the bus holds the other one.
+    console: Arc<dyn Receive>,
     /// vCPUs not started yet, `start` moves them onto threads.
     vcpus: Vec<<H::Vm as Vm>::Vcpu>,
     /// One thread per started vCPU, `stop_vcpu` signals a vCPU through its
@@ -261,11 +264,8 @@ impl<H: Hypervisor> Machine<H> {
 
         let mut bus = Bus::new();
         let line = vm.create_irq_sender(COM1_IRQ)?;
-        bus.place_port(
-            COM1,
-            COM1_SIZE,
-            Box::new(Serial::new(console).on_line(Box::new(line))),
-        )?;
+        let uart = Shared::new(Serial::new(console).on_line(Box::new(line)));
+        bus.place_port(COM1, COM1_SIZE, Box::new(uart.clone()))?;
 
         // Only vCPU 0 is entered in long mode. The rest wait in reset state
         // for the INIT sent by kernel once it has read the MP table.
@@ -287,6 +287,7 @@ impl<H: Hypervisor> Machine<H> {
             memory,
             ram,
             devices: Devices(Arc::new(Mutex::new(bus))),
+            console: Arc::new(uart),
             vcpus,
             stoppers,
             threads: Vec::new(),
@@ -298,6 +299,12 @@ impl<H: Hypervisor> Machine<H> {
     /// Returns current state of the guest.
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// Returns a share of the console, for input from another thread while
+    /// the guest is running.
+    pub fn console(&self) -> Arc<dyn Receive> {
+        Arc::clone(&self.console)
     }
 
     /// Start each vCPU on its own thread.
@@ -463,6 +470,77 @@ mod tests {
             console.0.lock().unwrap().as_slice(),
             b"ok\x00",
             "guest console got other bytes"
+        );
+    }
+
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn test_console_input_to_running_guest() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+
+        use crate::boot::tests::bzimage;
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+        /// Console sink for the test to read back.
+        #[derive(Clone)]
+        struct Tap(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Tap {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Guest polls `DATA` until it reads a non-zero byte and echoes it.
+        // `DATA` reads zero while the queue is empty, so one read finds and
+        // takes the byte. `ecx` bounds the poll, with no byte the guest
+        // echoes the zero and stops, so a failure shows as wrong byte
+        // instead of a hang.
+        let program = [
+            0xb9, 0x00, 0x00, 0x01, 0x00, // mov ecx, 0x10000
+            0xba, 0xf8, 0x03, 0x00, 0x00, // mov edx, 0x3f8
+            0xec, // poll: in al, dx
+            0x84, 0xc0, //       test al, al
+            0x75, 0x02, //       jnz send
+            0xe2, 0xf9, //       loop poll
+            0xee, // send: out dx, al
+            0x0f, 0x0b, //       ud2
+        ];
+        let mut payload = vec![0u8; 0x200];
+        payload.extend_from_slice(&program);
+
+        let image = std::env::temp_dir().join(format!("lingcore-input-{}", std::process::id()));
+        std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
+
+        let console = Tap(Arc::new(Mutex::new(Vec::new())));
+        let config = Config {
+            memory: 16 << 20,
+            vcpus: 1,
+            kernel: image.clone(),
+            initrd: None,
+            cmdline: "console=ttyS0".to_string(),
+        };
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
+        std::fs::remove_file(&image).expect("remove the kernel image");
+
+        // The share is taken before `start` and used after, with the guest
+        // on its vCPU thread.
+        let input = machine.console();
+        machine.start().expect("start the guest");
+        input.receive(b"Z").expect("receive a byte");
+
+        assert_eq!(machine.wait().expect("run"), VmExit::Shutdown);
+        assert_eq!(
+            console.0.lock().unwrap().as_slice(),
+            b"Z",
+            "guest did not echo the byte"
         );
     }
 
