@@ -38,29 +38,33 @@ const LSR_TRANSMIT_EMPTY: u8 = 0x60;
 /// `MSR` bits: data carrier detect, data set ready and clear to send.
 /// Reported as set since there is no modem behind the port.
 const MSR_CONNECTED: u8 = 0xb0;
-/// `IER` bit for transmit holding register empty interrupt enable.
+/// `IER` bit enabling the received data available interrupt.
+const IER_DATA_READY: u8 = 0x01;
+/// `IER` bit enabling the transmit holding register empty interrupt.
 const IER_TRANSMIT_EMPTY: u8 = 0x02;
 /// `IIR` value for no interrupt pending.
 const IIR_NO_INTERRUPT: u8 = 0x01;
 /// `IIR` value for transmit holding register empty interrupt pending.
 const IIR_TRANSMIT_EMPTY: u8 = 0x02;
+/// `IIR` reports received data available interrupt pending. It is
+/// reported ahead of `IIR_TRANSMIT_EMPTY`.
+const IIR_DATA_READY: u8 = 0x04;
 /// `IIR` bits: FIFOs enabled, which identifies a 16550A.
 const IIR_FIFO_ENABLED: u8 = 0xc0;
 /// `FCR` bit which enables the FIFOs.
 const FCR_ENABLE: u8 = 0x01;
 
 /// 16550 UART. Transmitted bytes are written to `out`, bytes passed to
-/// `receive` are queued for the guest to read. With `IER_TRANSMIT_EMPTY`
-/// set, `line` is raised once transmit register becomes empty.
+/// `receive` are queued for the guest to read. `line` is raised for empty
+/// transmit register and for queued input, according to `IER` bits.
 pub struct Serial<W: Write> {
     out: W,
     input: VecDeque<u8>,
     /// Interrupt line, `None` for a UART without one.
     line: Option<Box<dyn IrqSender>>,
-    /// Set when the line is raised for empty transmit register, cleared by
-    /// the read of `IIR` which reports it, so a run of bytes only raises
-    /// the line once.
-    raised: bool,
+    /// Pending interrupts as `IIR` bits. A reason already pending does not
+    /// raise the line again, so a run of bytes only raises it once.
+    asking: u8,
     ier: u8,
     fcr: u8,
     lcr: u8,
@@ -76,7 +80,7 @@ impl<W: Write> Serial<W> {
             out,
             input: VecDeque::new(),
             line: None,
-            raised: false,
+            asking: 0,
             ier: 0,
             fcr: 0,
             lcr: 0,
@@ -93,22 +97,42 @@ impl<W: Write> Serial<W> {
         self
     }
 
-    /// Raise the line for empty transmit register if `IER_TRANSMIT_EMPTY` is
-    /// set and it is not raised yet. Error from `send` is propagated.
-    fn ask_for_attention(&mut self) -> io::Result<()> {
-        if self.ier & IER_TRANSMIT_EMPTY == 0 || self.raised {
+    /// Raise the line for `reason` unless it is pending already. Error from
+    /// `send` is propagated.
+    fn ask_for_attention(&mut self, reason: u8) -> io::Result<()> {
+        if self.asking & reason != 0 {
             return Ok(());
         }
-        self.raised = true;
+        self.asking |= reason;
         match &self.line {
             Some(line) => line.send().map_err(io::Error::other),
             None => Ok(()),
         }
     }
 
-    /// Queue `bytes` for the guest to read from `DATA`.
-    pub fn receive(&mut self, bytes: &[u8]) {
+    /// Raise the line for empty transmit register if `IER_TRANSMIT_EMPTY` is
+    /// set.
+    fn ask_about_transmit(&mut self) -> io::Result<()> {
+        if self.ier & IER_TRANSMIT_EMPTY == 0 {
+            return Ok(());
+        }
+        self.ask_for_attention(IIR_TRANSMIT_EMPTY)
+    }
+
+    /// Raise the line for queued input if `IER_DATA_READY` is set and there
+    /// is byte queued.
+    fn ask_about_input(&mut self) -> io::Result<()> {
+        if self.ier & IER_DATA_READY == 0 || self.input.is_empty() {
+            return Ok(());
+        }
+        self.ask_for_attention(IIR_DATA_READY)
+    }
+
+    /// Queue `bytes` for the guest to read from `DATA` and raise the line
+    /// for them.
+    pub fn receive(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.input.extend(bytes);
+        self.ask_about_input()
     }
 
     fn latched(&self) -> bool {
@@ -120,7 +144,15 @@ impl<W: Write> Serial<W> {
     pub fn read(&mut self, offset: u64) -> u8 {
         match offset & 7 {
             DATA if self.latched() => self.divisor as u8,
-            DATA => self.input.pop_front().unwrap_or(0),
+            DATA => {
+                let byte = self.input.pop_front().unwrap_or(0);
+                // `IIR` keeps reporting input while bytes remain, the
+                // read which empties the queue clears it.
+                if self.input.is_empty() {
+                    self.asking &= !IIR_DATA_READY;
+                }
+                byte
+            }
             IER if self.latched() => (self.divisor >> 8) as u8,
             IER => self.ier,
             IIR => {
@@ -129,10 +161,13 @@ impl<W: Write> Serial<W> {
                 } else {
                     0
                 };
-                // Reading `IIR` clears the interrupt, the next byte
-                // written raises the line again.
-                let reason = if self.raised {
-                    self.raised = false;
+                // Input is reported first and stays pending until `DATA`
+                // empties the queue. Reading `IIR` clears the transmit
+                // interrupt, and the next byte written raises the line again.
+                let reason = if self.asking & IIR_DATA_READY != 0 {
+                    IIR_DATA_READY
+                } else if self.asking & IIR_TRANSMIT_EMPTY != 0 {
+                    self.asking &= !IIR_TRANSMIT_EMPTY;
                     IIR_TRANSMIT_EMPTY
                 } else {
                     IIR_NO_INTERRUPT
@@ -167,14 +202,15 @@ impl<W: Write> Serial<W> {
                 self.out.flush()?;
                 // The byte has reached `out`, so transmit register is
                 // empty again.
-                self.ask_for_attention()?;
+                self.ask_about_transmit()?;
             }
             IER if self.latched() => {
                 self.divisor = (self.divisor & 0x00ff) | (u16::from(value) << 8);
             }
             IER => {
                 self.ier = value;
-                self.ask_for_attention()?;
+                self.ask_about_transmit()?;
+                self.ask_about_input()?;
             }
             IIR => self.fcr = value,
             LCR => self.lcr = value,
@@ -269,6 +305,80 @@ mod tests {
     }
 
     #[test]
+    fn test_input_interrupt_on_receive() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut uart = Serial::new(Vec::new()).on_line(Box::new(line.clone()));
+
+        // With IER_DATA_READY clear, byte does not raise the line but stays
+        // queued.
+        uart.receive(b"a").expect("receive a byte");
+        assert_eq!(line.raises(), 0, "line raised with IER clear");
+
+        // A byte is queued, so enabling it raises the line immediately.
+        uart.write(IER, IER_DATA_READY).expect("enable");
+        assert_eq!(line.raises(), 1);
+
+        // Interrupt stays pending until the queue is read empty, so a run of
+        // bytes only raises the line once.
+        uart.receive(b"bcde").expect("receive a run");
+        assert_eq!(line.raises(), 1, "line raised per byte");
+
+        // Reading IIR reports the input, and it stays pending while bytes
+        // remain.
+        assert_eq!(uart.read(IIR) & 0x0f, IIR_DATA_READY);
+        assert_eq!(uart.read(DATA), b'a');
+        assert_eq!(
+            uart.read(IIR) & 0x0f,
+            IIR_DATA_READY,
+            "IIR cleared with bytes still queued"
+        );
+
+        // Reading the last byte clears it.
+        for byte in b"bcde" {
+            assert_eq!(uart.read(DATA), *byte);
+        }
+        assert_eq!(
+            uart.read(IIR) & 0x0f,
+            IIR_NO_INTERRUPT,
+            "IIR still reports input with the queue empty"
+        );
+
+        // Next byte raises the line again.
+        uart.receive(b"f").expect("receive a byte");
+        assert_eq!(line.raises(), 2);
+
+        // With IER_DATA_READY cleared again, byte does not raise the line.
+        uart.write(IER, 0).expect("disable");
+        uart.read(DATA);
+        uart.receive(b"g").expect("receive a byte");
+        assert_eq!(line.raises(), 2, "line raised after IER cleared");
+    }
+
+    #[test]
+    fn test_input_reported_before_transmit() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut uart = Serial::new(Vec::new()).on_line(Box::new(line.clone()));
+
+        // Both enabled, and both pending at the same time.
+        uart.write(IER, IER_DATA_READY | IER_TRANSMIT_EMPTY)
+            .expect("enable");
+        assert_eq!(line.raises(), 1, "empty register did not raise the line");
+        uart.receive(b"Z").expect("receive a byte");
+        assert_eq!(line.raises(), 2);
+
+        // Input is reported first, empty transmit register is reported once
+        // the byte is read.
+        assert_eq!(uart.read(IIR) & 0x0f, IIR_DATA_READY);
+        assert_eq!(uart.read(DATA), b'Z');
+        assert_eq!(
+            uart.read(IIR) & 0x0f,
+            IIR_TRANSMIT_EMPTY,
+            "transmit interrupt lost behind the input"
+        );
+        assert_eq!(uart.read(IIR) & 0x0f, IIR_NO_INTERRUPT);
+    }
+
+    #[test]
     fn test_register_behaviour() {
         // Scratch, status, FIFO and divisor latch registers.
         let mut uart = Serial::new(Vec::new());
@@ -302,7 +412,7 @@ mod tests {
         );
 
         // Received byte sets data ready until it is read.
-        uart.receive(b"Z");
+        uart.receive(b"Z").expect("receive a byte");
         assert_eq!(uart.read(LSR), LSR_TRANSMIT_EMPTY | LSR_DATA_READY);
         assert_eq!(uart.read(DATA), b'Z');
         assert_eq!(uart.read(LSR), LSR_TRANSMIT_EMPTY);
@@ -411,7 +521,7 @@ mod tests {
             .expect("map the reset vector");
 
         let mut console = Console(Serial::new(Vec::new()));
-        console.0.receive(b"Z");
+        console.0.receive(b"Z").expect("receive a byte");
         let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
         assert_eq!(run(&mut cpu, &mut console).expect("run"), VmExit::Halt);
         assert_eq!(
