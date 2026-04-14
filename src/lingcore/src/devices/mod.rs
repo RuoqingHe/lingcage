@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
+use crate::hv::vcpu::VmExit;
+
 pub mod bus;
+pub mod i8042;
 pub mod serial;
 
 /// Errors thrown while placing a device on the bus.
@@ -40,8 +43,9 @@ pub trait Device: Send {
     /// Returns the value of a read of `size` bytes at `offset`.
     fn read(&mut self, offset: u64, size: u8) -> u64;
 
-    /// Handle a write of `size` bytes at `offset`.
-    fn write(&mut self, offset: u64, size: u8, value: u64) -> std::io::Result<()>;
+    /// Handle a write of `size` bytes at `offset`. Returns `Some` for a
+    /// write which stops the guest.
+    fn write(&mut self, offset: u64, size: u8, value: u64) -> io::Result<Option<VmExit>>;
 }
 
 /// Device taking bytes from outside of the guest, console input for
@@ -79,7 +83,7 @@ impl<D: Device> Device for Shared<D> {
         self.with(|device| device.read(offset, size))
     }
 
-    fn write(&mut self, offset: u64, size: u8, value: u64) -> io::Result<()> {
+    fn write(&mut self, offset: u64, size: u8, value: u64) -> io::Result<Option<VmExit>> {
         self.with(|device| device.write(offset, size, value))
     }
 }

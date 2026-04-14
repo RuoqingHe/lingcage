@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::boot;
 use crate::devices::bus::Bus;
+use crate::devices::i8042::I8042;
 use crate::devices::serial::Serial;
 use crate::devices::{Receive, Shared};
 use crate::hv::hypervisor::Hypervisor;
@@ -39,6 +40,10 @@ const COM1: u16 = 0x3f8;
 
 /// Size of the 16550 register window in bytes.
 const COM1_SIZE: u16 = 8;
+
+/// Command port of the i8042 keyboard controller. Data port is not
+/// placed on the bus.
+const I8042_COMMAND: u16 = 0x64;
 
 /// IRQ of the first serial console, `ttyS0`.
 const COM1_IRQ: u8 = 4;
@@ -186,7 +191,7 @@ impl VmOps for Devices {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn write_port(&mut self, port: u16, size: u8, value: u32) -> crate::hv::Result<()> {
+    fn write_port(&mut self, port: u16, size: u8, value: u32) -> crate::hv::Result<Option<VmExit>> {
         self.0.lock().unwrap().write_port(port, size, value)
     }
 
@@ -194,7 +199,7 @@ impl VmOps for Devices {
         self.0.lock().unwrap().read_mmio(addr, size)
     }
 
-    fn write_mmio(&mut self, addr: u64, size: u8, value: u64) -> crate::hv::Result<()> {
+    fn write_mmio(&mut self, addr: u64, size: u8, value: u64) -> crate::hv::Result<Option<VmExit>> {
         self.0.lock().unwrap().write_mmio(addr, size, value)
     }
 }
@@ -266,6 +271,7 @@ impl<H: Hypervisor> Machine<H> {
         let line = vm.create_irq_sender(COM1_IRQ)?;
         let uart = Shared::new(Serial::new(console).on_line(Box::new(line)));
         bus.place_port(COM1, COM1_SIZE, Box::new(uart.clone()))?;
+        bus.place_port(I8042_COMMAND, 1, Box::new(I8042))?;
 
         // Only vCPU 0 is entered in long mode. The rest wait in reset state
         // for the INIT sent by kernel once it has read the MP table.
@@ -541,6 +547,45 @@ mod tests {
             console.0.lock().unwrap().as_slice(),
             b"Z",
             "guest did not echo the byte"
+        );
+    }
+
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn test_i8042_reset_exits_reboot() {
+        use crate::boot::tests::bzimage;
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+        // Guest writes the reset command, then executes `ud2`. A run which
+        // dropped the reset ends on the fault instead, so exit reason tells
+        // the two apart.
+        let program = [
+            0xb0, 0xfe, // mov al, 0xfe
+            0xe6, 0x64, // out 0x64, al
+            0x0f, 0x0b, // ud2
+        ];
+        let mut payload = vec![0u8; 0x200];
+        payload.extend_from_slice(&program);
+
+        let image = std::env::temp_dir().join(format!("lingcore-reset-{}", std::process::id()));
+        std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
+
+        let config = Config {
+            memory: 16 << 20,
+            vcpus: 1,
+            kernel: image.clone(),
+            initrd: None,
+            cmdline: "console=ttyS0".to_string(),
+        };
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
+        std::fs::remove_file(&image).expect("remove the kernel image");
+
+        machine.start().expect("start the guest");
+        assert_eq!(
+            machine.wait().expect("run"),
+            VmExit::Reboot,
+            "guest ran past the reset"
         );
     }
 

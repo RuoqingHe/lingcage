@@ -10,6 +10,7 @@ use std::io;
 
 use crate::devices::{Device, Error, Result};
 use crate::hv;
+use crate::hv::vcpu::VmExit;
 use crate::vcpu::VmOps;
 
 /// Device placed at `base` covering `size` bytes.
@@ -73,10 +74,10 @@ fn read(list: &mut [Placed], addr: u64, size: u8) -> u64 {
 }
 
 /// Write `size` bytes at `addr`, write to unclaimed address is dropped.
-fn write(list: &mut [Placed], addr: u64, size: u8, value: u64) -> io::Result<()> {
+fn write(list: &mut [Placed], addr: u64, size: u8, value: u64) -> io::Result<Option<VmExit>> {
     match find(list, addr) {
         Some((device, offset)) => device.write(offset, size, value),
-        None => Ok(()),
+        None => Ok(None),
     }
 }
 
@@ -114,7 +115,7 @@ impl VmOps for Bus {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn write_port(&mut self, port: u16, size: u8, value: u32) -> hv::Result<()> {
+    fn write_port(&mut self, port: u16, size: u8, value: u32) -> hv::Result<Option<VmExit>> {
         write(&mut self.ports, u64::from(port), size, u64::from(value)).map_err(sink_err)
     }
 
@@ -122,7 +123,7 @@ impl VmOps for Bus {
         Ok(read(&mut self.mmio, addr, size))
     }
 
-    fn write_mmio(&mut self, addr: u64, size: u8, value: u64) -> hv::Result<()> {
+    fn write_mmio(&mut self, addr: u64, size: u8, value: u64) -> hv::Result<Option<VmExit>> {
         write(&mut self.mmio, addr, size, value).map_err(sink_err)
     }
 }

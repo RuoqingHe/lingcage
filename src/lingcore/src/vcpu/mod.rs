@@ -22,15 +22,17 @@ pub trait VmOps {
     #[cfg(target_arch = "x86_64")]
     fn read_port(&mut self, port: u16, size: u8) -> Result<u32>;
 
-    /// Handle a port write of `size` bytes.
+    /// Handle a port write of `size` bytes. `Some` ends the run with that
+    /// exit.
     #[cfg(target_arch = "x86_64")]
-    fn write_port(&mut self, port: u16, size: u8, value: u32) -> Result<()>;
+    fn write_port(&mut self, port: u16, size: u8, value: u32) -> Result<Option<VmExit>>;
 
     /// Returns the value of an MMIO read of `size` bytes.
     fn read_mmio(&mut self, addr: u64, size: u8) -> Result<u64>;
 
-    /// Handle an MMIO write of `size` bytes.
-    fn write_mmio(&mut self, addr: u64, size: u8, value: u64) -> Result<()>;
+    /// Handle an MMIO write of `size` bytes. `Some` ends the run with that
+    /// exit.
+    fn write_mmio(&mut self, addr: u64, size: u8, value: u64) -> Result<Option<VmExit>>;
 }
 
 /// Run `vcpu` until it exits for a reason not handled by `bus`, and
@@ -49,10 +51,10 @@ pub fn run<V: Vcpu, B: VmOps>(vcpu: &mut V, bus: &mut B) -> Result<VmExit> {
                 port,
                 write: Some(value),
                 size,
-            } => {
-                bus.write_port(port, size, value)?;
-                VmEntry::Run
-            }
+            } => match bus.write_port(port, size, value)? {
+                None => VmEntry::Run,
+                Some(exit) => return Ok(exit),
+            },
             #[cfg(target_arch = "x86_64")]
             VmExit::Io {
                 port,
@@ -65,10 +67,10 @@ pub fn run<V: Vcpu, B: VmOps>(vcpu: &mut V, bus: &mut B) -> Result<VmExit> {
                 addr,
                 write: Some(value),
                 size,
-            } => {
-                bus.write_mmio(addr, size, value)?;
-                VmEntry::Run
-            }
+            } => match bus.write_mmio(addr, size, value)? {
+                None => VmEntry::Run,
+                Some(exit) => return Ok(exit),
+            },
             VmExit::Mmio {
                 addr,
                 write: None,
@@ -121,9 +123,9 @@ mod tests {
             Ok(self.port_answer)
         }
 
-        fn write_port(&mut self, port: u16, size: u8, value: u32) -> Result<()> {
+        fn write_port(&mut self, port: u16, size: u8, value: u32) -> Result<Option<VmExit>> {
             self.seen.push(Access::PortWrite(port, size, value));
-            Ok(())
+            Ok(None)
         }
 
         fn read_mmio(&mut self, addr: u64, size: u8) -> Result<u64> {
@@ -134,9 +136,9 @@ mod tests {
             Ok(self.mmio_answer)
         }
 
-        fn write_mmio(&mut self, addr: u64, size: u8, value: u64) -> Result<()> {
+        fn write_mmio(&mut self, addr: u64, size: u8, value: u64) -> Result<Option<VmExit>> {
             self.seen.push(Access::MmioWrite(addr, size, value));
-            Ok(())
+            Ok(None)
         }
     }
 

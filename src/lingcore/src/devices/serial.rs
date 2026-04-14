@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::io::{self, Write};
 
 use crate::hv::irq::IrqSender;
+use crate::hv::vcpu::VmExit;
 
 /// Receive buffer on read, transmit holding register on write. Low byte
 /// of the divisor while divisor latch is open.
@@ -236,9 +237,11 @@ impl<W: Write + Send> crate::devices::Device for Serial<W> {
         u64::from(Serial::read(self, offset))
     }
 
-    /// Wider write stores its lowest byte into the register at `offset`.
-    fn write(&mut self, offset: u64, _size: u8, value: u64) -> io::Result<()> {
-        Serial::write(self, offset, value as u8)
+    /// Wider write stores its lowest byte into the register at `offset`. No
+    /// write stops the guest.
+    fn write(&mut self, offset: u64, _size: u8, value: u64) -> io::Result<Option<VmExit>> {
+        Serial::write(self, offset, value as u8)?;
+        Ok(None)
     }
 }
 
@@ -479,11 +482,12 @@ mod tests {
                 }
             }
 
-            fn write_port(&mut self, port: u16, _size: u8, value: u32) -> Result<()> {
+            fn write_port(&mut self, port: u16, _size: u8, value: u32) -> Result<Option<VmExit>> {
                 match port.checked_sub(COM1) {
                     Some(offset) if offset < 8 => self
                         .0
                         .write(u64::from(offset), value as u8)
+                        .map(|()| None)
                         .map_err(|_| Error::Other("console sink write failed")),
                     _ => Err(Error::Other("no device at that port")),
                 }
@@ -493,7 +497,7 @@ mod tests {
                 Err(Error::Other("no device at this address"))
             }
 
-            fn write_mmio(&mut self, _addr: u64, _size: u8, _value: u64) -> Result<()> {
+            fn write_mmio(&mut self, _addr: u64, _size: u8, _value: u64) -> Result<Option<VmExit>> {
                 Err(Error::Other("no device at this address"))
             }
         }
