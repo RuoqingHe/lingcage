@@ -22,6 +22,8 @@ machine = ["boot", "devices", "hv", "mem", "vcpu"]
 mem = ["dep:vm-memory"]
 # vCPU run loop and the bus which it dispatches to.
 vcpu = ["hv"]
+# Virtio devices and the split virtqueue.
+virtio = ["devices", "mem"]
 # KVM backend.
 kvm = [
   "dep:kvm-bindings",

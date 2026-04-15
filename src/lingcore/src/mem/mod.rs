@@ -113,6 +113,15 @@ impl GuestRam {
             })
     }
 
+    /// Returns whether `count` bytes from `gpa` are backed. Range crossing a
+    /// hole between regions is not.
+    pub fn holds(&self, gpa: u64, count: u64) -> bool {
+        match usize::try_from(count) {
+            Ok(count) => self.inner.check_range(GuestAddress(gpa), count),
+            Err(_) => false,
+        }
+    }
+
     /// Read from guest address `gpa` into `bytes`.
     pub fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<()> {
         self.inner

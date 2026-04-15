@@ -15,6 +15,8 @@ use crate::hv::vcpu::VmExit;
 pub mod bus;
 pub mod i8042;
 pub mod serial;
+#[cfg(feature = "virtio")]
+pub mod virtio;
 
 /// Errors thrown while placing a device on the bus.
 #[derive(Debug, Error)]
