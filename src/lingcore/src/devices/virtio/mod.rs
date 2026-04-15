@@ -11,6 +11,9 @@ use thiserror::Error;
 
 pub mod queue;
 
+use crate::devices::virtio::queue::Queue;
+use crate::mem::GuestRam;
+
 /// Errors thrown while reading a virtqueue.
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum Error {
@@ -57,3 +60,41 @@ pub enum Error {
 
 /// Result alias for virtqueue access.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Device behind a transport, with its kind, its features and the work
+/// done when a queue is notified. Transport runs the handshake and checks
+/// the chains.
+pub trait Device: Send {
+    /// Returns the device ID, as numbered in section 5 of virtio 1.2.
+    fn device_id(&self) -> u32;
+
+    /// Returns features offered besides `VIRTIO_F_VERSION_1`. Default offers
+    /// none.
+    fn features(&self) -> u64 {
+        0
+    }
+
+    /// Returns the number of virtqueues. Default is one.
+    fn queue_count(&self) -> u16 {
+        1
+    }
+
+    /// Returns the largest queue size accepted. Default is 256.
+    fn queue_size_max(&self) -> u16 {
+        256
+    }
+
+    /// Returns a read of `size` bytes at `offset` of configuration space.
+    /// Default returns zero.
+    fn read_config(&mut self, _offset: u64, _size: u8) -> u64 {
+        0
+    }
+
+    /// Handle a write of `size` bytes at `offset` of configuration space.
+    /// Default drops it.
+    fn write_config(&mut self, _offset: u64, _size: u8, _value: u64) {}
+
+    /// Handle a notification on queue `index`. Pop chains from `queue` and
+    /// report each of them as used.
+    fn notify(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()>;
+}
