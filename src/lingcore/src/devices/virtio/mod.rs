@@ -9,6 +9,7 @@
 
 use thiserror::Error;
 
+pub mod mmio;
 pub mod queue;
 
 use crate::devices::virtio::queue::Queue;
