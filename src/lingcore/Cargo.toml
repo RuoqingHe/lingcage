@@ -17,7 +17,7 @@ devices = ["vcpu"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
 # Guest assembly, RAM, kernel, bus and the run loop.
-machine = ["boot", "devices", "hv", "mem", "vcpu"]
+machine = ["boot", "devices", "hv", "mem", "vcpu", "virtio"]
 # Guest RAM, held as vm-memory regions.
 mem = ["dep:vm-memory"]
 # vCPU run loop and the bus which it dispatches to.

@@ -9,6 +9,7 @@
 
 use thiserror::Error;
 
+pub mod entropy;
 pub mod mmio;
 pub mod queue;
 
@@ -51,6 +52,9 @@ pub enum Error {
         /// Length of the buffer in bytes.
         len: u32,
     },
+    /// Failed to read the backing source of the device.
+    #[error("failed to read device source")]
+    Source,
     /// Ring or descriptor table access outside of guest RAM.
     #[error("ring access at {gpa:#x} is not backed")]
     Ring {

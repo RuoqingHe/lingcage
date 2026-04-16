@@ -17,6 +17,8 @@ use crate::boot;
 use crate::devices::bus::Bus;
 use crate::devices::i8042::I8042;
 use crate::devices::serial::Serial;
+use crate::devices::virtio::entropy::Entropy;
+use crate::devices::virtio::mmio::{self, Transport};
 use crate::devices::{Receive, Shared};
 use crate::hv::hypervisor::Hypervisor;
 use crate::hv::memory::{MemMapOption, VmMemory};
@@ -48,6 +50,15 @@ const I8042_COMMAND: u16 = 0x64;
 /// IRQ of the first serial console, `ttyS0`.
 const COM1_IRQ: u8 = 4;
 
+/// MMIO address of the entropy source, in the hole below the APICs.
+const ENTROPY_AT: u64 = 0xd000_0000;
+
+/// IRQ of the entropy source, an ISA line free on PC.
+const ENTROPY_IRQ: u8 = 5;
+
+/// Host file read by the entropy source.
+const ENTROPY_SOURCE: &str = "/dev/urandom";
+
 /// Index of the vCPU the guest boots on. Kernel starts the rest with
 /// INIT and SIPI.
 const BOOT_VCPU: u16 = 0;
@@ -69,6 +80,9 @@ pub enum Error {
     /// Failed to open or read the kernel image.
     #[error("failed to read kernel image")]
     Image(#[source] std::io::Error),
+    /// Failed to open the entropy source file.
+    #[error("failed to open entropy source")]
+    Entropy(#[source] std::io::Error),
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
@@ -264,7 +278,16 @@ impl<H: Hypervisor> Machine<H> {
             }
             None => None,
         };
-        boot::write_boot_params(&ram, &kernel, &config.cmdline, initrd)?;
+        // Neither a bus nor a table names a virtio MMIO device on PC, so
+        // the kernel reads its size, address and line from command line.
+        let cmdline = format!(
+            "{} virtio_mmio.device={:#x}@{:#x}:{}",
+            config.cmdline,
+            mmio::SIZE,
+            ENTROPY_AT,
+            ENTROPY_IRQ
+        );
+        boot::write_boot_params(&ram, &kernel, &cmdline, initrd)?;
         mptable::write(&ram, config.vcpus)?;
 
         let mut bus = Bus::new();
@@ -272,6 +295,18 @@ impl<H: Hypervisor> Machine<H> {
         let uart = Shared::new(Serial::new(console).on_line(Box::new(line)));
         bus.place_port(COM1, COM1_SIZE, Box::new(uart.clone()))?;
         bus.place_port(I8042_COMMAND, 1, Box::new(I8042))?;
+
+        let seed = File::open(ENTROPY_SOURCE).map_err(Error::Entropy)?;
+        let line = vm.create_irq_sender(ENTROPY_IRQ)?;
+        bus.place_mmio(
+            ENTROPY_AT,
+            mmio::SIZE,
+            Box::new(Transport::new(
+                Box::new(Entropy::new(seed)),
+                ram.clone(),
+                Box::new(line),
+            )),
+        )?;
 
         // Only vCPU 0 is entered in long mode. The rest wait in reset state
         // for the INIT sent by kernel once it has read the MP table.
