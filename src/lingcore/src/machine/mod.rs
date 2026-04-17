@@ -5,7 +5,7 @@
 //! Machine assembly. Guest RAM, the kernel loaded into it, a bus with
 //! the serial console, and a vCPU entered at the kernel in long mode.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,6 +17,7 @@ use crate::boot;
 use crate::devices::bus::Bus;
 use crate::devices::i8042::I8042;
 use crate::devices::serial::Serial;
+use crate::devices::virtio::block::Block;
 use crate::devices::virtio::entropy::Entropy;
 use crate::devices::virtio::mmio::{self, Transport};
 use crate::devices::{Receive, Shared};
@@ -50,11 +51,13 @@ const I8042_COMMAND: u16 = 0x64;
 /// IRQ of the first serial console, `ttyS0`.
 const COM1_IRQ: u8 = 4;
 
-/// MMIO address of the entropy source, in the hole below the APICs.
-const ENTROPY_AT: u64 = 0xd000_0000;
+/// MMIO address of the first virtio register block, in the hole below
+/// the APICs. Each device takes the next block.
+const VIRTIO_AT: u64 = 0xd000_0000;
 
-/// IRQ of the entropy source, an ISA line free on PC.
-const ENTROPY_IRQ: u8 = 5;
+/// IRQ of the first virtio device, an ISA line free on PC. Each device
+/// takes the next line.
+const VIRTIO_IRQ: u8 = 5;
 
 /// Host file read by the entropy source.
 const ENTROPY_SOURCE: &str = "/dev/urandom";
@@ -83,6 +86,9 @@ pub enum Error {
     /// Failed to open the entropy source file.
     #[error("failed to open entropy source")]
     Entropy(#[source] std::io::Error),
+    /// Failed to open the disk file or read its length.
+    #[error("failed to open disk file")]
+    Disk(#[source] std::io::Error),
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
@@ -118,6 +124,40 @@ pub struct Config {
     pub initrd: Option<PathBuf>,
     /// Kernel command line.
     pub cmdline: String,
+    /// File backing the disk of the guest, if any.
+    pub disk: Option<PathBuf>,
+}
+
+/// Returns the number of virtio devices. Entropy source is always there,
+/// disk comes with `Config::disk`.
+fn virtio_count(config: &Config) -> u8 {
+    1 + u8::from(config.disk.is_some())
+}
+
+/// Returns MMIO address of virtio register block `slot`.
+fn virtio_at(slot: u8) -> u64 {
+    VIRTIO_AT + u64::from(slot) * mmio::SIZE
+}
+
+/// Place `device` on `bus` in virtio register block `slot`, on line
+/// `VIRTIO_IRQ + slot`.
+fn place_virtio<V: Vm>(
+    bus: &mut Bus,
+    vm: &V,
+    ram: &GuestRam,
+    slot: u8,
+    device: Box<dyn crate::devices::virtio::Device>,
+) -> Result<()>
+where
+    V::IrqSender: 'static,
+{
+    let line = vm.create_irq_sender(VIRTIO_IRQ + slot)?;
+    bus.place_mmio(
+        virtio_at(slot),
+        mmio::SIZE,
+        Box::new(Transport::new(device, ram.clone(), Box::new(line))),
+    )?;
+    Ok(())
 }
 
 /// Returns the guest ranges occupied by `size` bytes of RAM, up to
@@ -279,14 +319,17 @@ impl<H: Hypervisor> Machine<H> {
             None => None,
         };
         // Neither a bus nor a table names a virtio MMIO device on PC, so
-        // the kernel reads its size, address and line from command line.
-        let cmdline = format!(
-            "{} virtio_mmio.device={:#x}@{:#x}:{}",
-            config.cmdline,
-            mmio::SIZE,
-            ENTROPY_AT,
-            ENTROPY_IRQ
-        );
+        // the kernel reads size, address and line of each one from command
+        // line, in the order register blocks are placed below.
+        let mut cmdline = config.cmdline.clone();
+        for slot in 0..virtio_count(config) {
+            cmdline.push_str(&format!(
+                " virtio_mmio.device={:#x}@{:#x}:{}",
+                mmio::SIZE,
+                virtio_at(slot),
+                VIRTIO_IRQ + slot
+            ));
+        }
         boot::write_boot_params(&ram, &kernel, &cmdline, initrd)?;
         mptable::write(&ram, config.vcpus)?;
 
@@ -297,16 +340,16 @@ impl<H: Hypervisor> Machine<H> {
         bus.place_port(I8042_COMMAND, 1, Box::new(I8042))?;
 
         let seed = File::open(ENTROPY_SOURCE).map_err(Error::Entropy)?;
-        let line = vm.create_irq_sender(ENTROPY_IRQ)?;
-        bus.place_mmio(
-            ENTROPY_AT,
-            mmio::SIZE,
-            Box::new(Transport::new(
-                Box::new(Entropy::new(seed)),
-                ram.clone(),
-                Box::new(line),
-            )),
-        )?;
+        place_virtio(&mut bus, &vm, &ram, 0, Box::new(Entropy::new(seed)))?;
+        if let Some(path) = &config.disk {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(Error::Disk)?;
+            let disk = Block::new(file).map_err(Error::Disk)?;
+            place_virtio(&mut bus, &vm, &ram, 1, Box::new(disk))?;
+        }
 
         // Only vCPU 0 is entered in long mode. The rest wait in reset state
         // for the INIT sent by kernel once it has read the MP table.
@@ -500,6 +543,7 @@ mod tests {
             kernel: image.clone(),
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
+            disk: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -566,6 +610,7 @@ mod tests {
             kernel: image.clone(),
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
+            disk: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -611,6 +656,7 @@ mod tests {
             kernel: image.clone(),
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
+            disk: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -644,6 +690,7 @@ mod tests {
             kernel: image.clone(),
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
+            disk: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -681,6 +728,7 @@ mod tests {
             kernel: image.clone(),
             initrd: None,
             cmdline: String::new(),
+            disk: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -723,6 +771,7 @@ mod tests {
             kernel: image.clone(),
             initrd: None,
             cmdline: String::new(),
+            disk: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -772,6 +821,7 @@ mod tests {
             kernel: PathBuf::from("/nonexistent/kernel"),
             initrd: None,
             cmdline: String::new(),
+            disk: None,
         };
         #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
         {
@@ -799,6 +849,7 @@ mod tests {
                 kernel: PathBuf::from("/nonexistent/kernel"),
                 initrd: None,
                 cmdline: String::new(),
+                disk: None,
             };
             assert!(matches!(
                 Machine::new(&hv, &config, Vec::new()),
