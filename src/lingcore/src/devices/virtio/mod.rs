@@ -9,6 +9,7 @@
 
 use thiserror::Error;
 
+pub mod block;
 pub mod entropy;
 pub mod mmio;
 pub mod queue;
@@ -52,6 +53,9 @@ pub enum Error {
         /// Length of the buffer in bytes.
         len: u32,
     },
+    /// Chain without a writable status byte at the end.
+    #[error("chain is not shaped like a request")]
+    Request,
     /// Failed to read the backing source of the device.
     #[error("failed to read device source")]
     Source,
