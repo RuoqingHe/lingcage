@@ -33,6 +33,24 @@ pub enum Error {
         /// Start of the range.
         base: u64,
     },
+    #[error("failed to encode or decode device state")]
+    State,
+    /// `Blob::kind` is another kind of device.
+    #[error("state of {found} device restored into {wanted} device")]
+    WrongState {
+        /// Kind of device the blob was captured from.
+        found: String,
+        /// Kind of device restoring it.
+        wanted: &'static str,
+    },
+    /// `Blob::version` is not the layout version this build reads.
+    #[error("{kind} device does not support state layout version {version}")]
+    WrongVersion {
+        /// Kind of the device.
+        kind: &'static str,
+        /// Layout version the blob was written with.
+        version: u32,
+    },
 }
 
 /// Result alias for placing devices.
@@ -48,6 +66,33 @@ pub trait Device: Send {
     /// Handle a write of `size` bytes at `offset`. Returns `Some` for a
     /// write which stops the guest.
     fn write(&mut self, offset: u64, size: u8, value: u64) -> io::Result<Option<VmExit>>;
+
+    /// Capture device state as a `Blob`. Default returns `None`, a stateless
+    /// device is skipped on restore.
+    fn capture(&self) -> Result<Option<Blob>> {
+        Ok(None)
+    }
+
+    /// Restore a blob returned by `capture` on the same kind of device.
+    /// Default returns `WrongState`.
+    fn restore(&mut self, blob: &Blob) -> Result<()> {
+        Err(Error::WrongState {
+            found: blob.kind.clone(),
+            wanted: "stateless",
+        })
+    }
+}
+
+/// State captured from a device, bytes in the layout of the device
+/// itself, tagged with device kind and layout version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blob {
+    /// Kind of device `data` was captured from.
+    pub kind: String,
+    /// Layout version of `data`, private to device kind.
+    pub version: u32,
+    /// State bytes in layout of the device.
+    pub data: Vec<u8>,
 }
 
 /// Device taking bytes from outside of the guest, console input for
@@ -87,5 +132,13 @@ impl<D: Device> Device for Shared<D> {
 
     fn write(&mut self, offset: u64, size: u8, value: u64) -> io::Result<Option<VmExit>> {
         self.with(|device| device.write(offset, size, value))
+    }
+
+    fn capture(&self) -> Result<Option<Blob>> {
+        self.with(|device| device.capture())
+    }
+
+    fn restore(&mut self, blob: &Blob) -> Result<()> {
+        self.with(|device| device.restore(blob))
     }
 }

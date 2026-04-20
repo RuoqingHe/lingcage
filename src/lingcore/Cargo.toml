@@ -12,8 +12,8 @@ version.workspace = true
 default = ["hv"]
 # Kernel loading into guest RAM. x86_64 only.
 boot = ["dep:linux-loader", "hv", "mem"]
-# Guest-facing devices.
-devices = ["vcpu"]
+# Guest-facing devices, serde carries their state.
+devices = ["dep:serde", "dep:serde_json", "vcpu"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
 # Guest assembly, RAM, kernel, bus and the run loop.

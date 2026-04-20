@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
+use crate::devices::{Blob, Device, Error, Result};
 use crate::hv::irq::IrqSender;
 use crate::hv::vcpu::VmExit;
 
@@ -223,6 +224,27 @@ impl<W: Write> Serial<W> {
     }
 }
 
+/// `Blob::kind` of UART.
+const KIND: &str = "serial";
+/// Layout version of `SerialState`. Blob of another version is reported
+/// as `WrongVersion`.
+const STATE_VERSION: u32 = 1;
+
+/// Registers and unread input of UART, encoded as `Blob::data` through
+/// serde_json. Sink and line are wired up again by the machine.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct SerialState {
+    ier: u8,
+    fcr: u8,
+    lcr: u8,
+    mcr: u8,
+    scr: u8,
+    divisor: u16,
+    asking: u8,
+    input: Vec<u8>,
+}
+
 impl<W: Write + Send> crate::devices::Receive for crate::devices::Shared<Serial<W>> {
     /// Queue `bytes` without waiting for the guest to read them.
     fn receive(&self, bytes: &[u8]) -> io::Result<()> {
@@ -230,8 +252,8 @@ impl<W: Write + Send> crate::devices::Receive for crate::devices::Shared<Serial<
     }
 }
 
-impl<W: Write + Send> crate::devices::Device for Serial<W> {
-    /// Registers are one byte wide, wider read only returns the register at
+impl<W: Write + Send> Device for Serial<W> {
+    /// Registers are one byte wide. Wider read only returns the register at
     /// `offset`.
     fn read(&mut self, offset: u64, _size: u8) -> u64 {
         u64::from(Serial::read(self, offset))
@@ -242,6 +264,50 @@ impl<W: Write + Send> crate::devices::Device for Serial<W> {
     fn write(&mut self, offset: u64, _size: u8, value: u64) -> io::Result<Option<VmExit>> {
         Serial::write(self, offset, value as u8)?;
         Ok(None)
+    }
+
+    fn capture(&self) -> Result<Option<Blob>> {
+        let state = SerialState {
+            ier: self.ier,
+            fcr: self.fcr,
+            lcr: self.lcr,
+            mcr: self.mcr,
+            scr: self.scr,
+            divisor: self.divisor,
+            asking: self.asking,
+            input: self.input.iter().copied().collect(),
+        };
+        let data = serde_json::to_vec(&state).map_err(|_| Error::State)?;
+        Ok(Some(Blob {
+            kind: KIND.to_string(),
+            version: STATE_VERSION,
+            data,
+        }))
+    }
+
+    fn restore(&mut self, blob: &Blob) -> Result<()> {
+        if blob.kind != KIND {
+            return Err(Error::WrongState {
+                found: blob.kind.clone(),
+                wanted: KIND,
+            });
+        }
+        if blob.version != STATE_VERSION {
+            return Err(Error::WrongVersion {
+                kind: KIND,
+                version: blob.version,
+            });
+        }
+        let state: SerialState = serde_json::from_slice(&blob.data).map_err(|_| Error::State)?;
+        self.ier = state.ier;
+        self.fcr = state.fcr;
+        self.lcr = state.lcr;
+        self.mcr = state.mcr;
+        self.scr = state.scr;
+        self.divisor = state.divisor;
+        self.asking = state.asking;
+        self.input = state.input.into_iter().collect();
+        Ok(())
     }
 }
 
@@ -386,6 +452,72 @@ mod tests {
             "transmit interrupt lost behind the input"
         );
         assert_eq!(uart.read(IIR) & 0x0f, IIR_NO_INTERRUPT);
+    }
+
+    #[test]
+    fn test_capture_restore_registers_and_input() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut uart = Serial::new(Vec::new()).on_line(Box::new(line.clone()));
+
+        // Divisor programmed, both interrupts enabled, FIFOs on, a byte in
+        // scratch register and some unread input.
+        uart.write(LCR, LCR_DLAB).expect("open the latch");
+        uart.write(DATA, 0x34).expect("divisor low");
+        uart.write(IER, 0x12).expect("divisor high");
+        uart.write(LCR, 0x03).expect("close the latch");
+        uart.write(IER, IER_DATA_READY | IER_TRANSMIT_EMPTY)
+            .expect("ask");
+        uart.write(IIR, FCR_ENABLE).expect("fifo control");
+        uart.write(MCR, 0x0b).expect("modem control");
+        uart.write(SCR, 0xa5).expect("scratch");
+        uart.receive(b"typed").expect("receive a run");
+
+        let blob = Device::capture(&uart)
+            .expect("capture")
+            .expect("UART has state");
+        assert_eq!(blob.kind, KIND);
+
+        // Fresh UART on the same line.
+        let mut taken_up = Serial::new(Vec::new()).on_line(Box::new(line.clone()));
+        Device::restore(&mut taken_up, &blob).expect("restore");
+
+        // Each readable register and the unread input should match.
+        for register in [IER, IIR, LCR, MCR, LSR, MSR, SCR] {
+            assert_eq!(
+                taken_up.read(register),
+                uart.read(register),
+                "register {register} differs after restore"
+            );
+        }
+        for byte in b"typed" {
+            assert_eq!(taken_up.read(DATA), *byte, "input changed on restore");
+        }
+
+        // Also the divisor behind the latch.
+        taken_up.write(LCR, LCR_DLAB).expect("open the latch");
+        assert_eq!(taken_up.read(DATA), 0x34);
+        assert_eq!(taken_up.read(IER), 0x12);
+    }
+
+    #[test]
+    fn test_reject_foreign_state() {
+        let mut uart = Serial::new(Vec::new());
+        let mut blob = Device::capture(&uart).expect("capture").expect("state");
+
+        let from_elsewhere = Blob {
+            kind: "i8042".to_string(),
+            ..blob.clone()
+        };
+        assert!(matches!(
+            Device::restore(&mut uart, &from_elsewhere),
+            Err(Error::WrongState { .. })
+        ));
+
+        blob.version += 1;
+        assert!(matches!(
+            Device::restore(&mut uart, &blob),
+            Err(Error::WrongVersion { .. })
+        ));
     }
 
     #[test]
