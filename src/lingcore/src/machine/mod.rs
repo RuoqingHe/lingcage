@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -62,6 +63,11 @@ const VIRTIO_IRQ: u8 = 5;
 /// Host file read by the entropy source.
 const ENTROPY_SOURCE: &str = "/dev/urandom";
 
+/// Maximum time `pause` waits for vCPU threads to park. The stop lands
+/// as a signal plus a flag read on entry to `run`, so a thread still
+/// inside after this long is reported as `NotHeld`.
+const HOLD_WITHIN: Duration = Duration::from_secs(10);
+
 /// Index of the vCPU the guest boots on. Kernel starts the rest with
 /// INIT and SIPI.
 const BOOT_VCPU: u16 = 0;
@@ -92,6 +98,12 @@ pub enum Error {
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
+    /// vCPU thread did not park within `HOLD_WITHIN`.
+    #[error("vCPU did not stop for pause")]
+    NotHeld,
+    /// Guest stopped while `pause` was waiting.
+    #[error("guest stopped during pause")]
+    StoppedWhileHeld,
     /// vCPU thread panicked.
     #[error("vCPU thread panicked")]
     VcpuThread,
@@ -171,13 +183,17 @@ fn layout(size: u64) -> Vec<(u64, u64)> {
 }
 
 /// Lifecycle state of a `Machine`. Allowed moves are `Created` to
-/// `Running` and `Running` to `Shutdown`.
+/// `Running`, `Running` to `Paused` and back, and either of those to
+/// `Shutdown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Assembled, vCPU 0 at the kernel entry.
     Created,
     /// Each vCPU running on its own thread.
     Running,
+    /// Each vCPU thread parked outside `run`, so that registers and RAM can
+    /// be read.
+    Paused,
     /// Threads joined and exit reason read.
     Shutdown,
 }
@@ -187,7 +203,9 @@ impl State {
     fn valid_transition(self, next: State) -> Result<()> {
         match (self, next) {
             (State::Created, State::Running) => Ok(()),
-            (State::Running, State::Shutdown) => Ok(()),
+            (State::Running, State::Paused) => Ok(()),
+            (State::Paused, State::Running) => Ok(()),
+            (State::Running | State::Paused, State::Shutdown) => Ok(()),
             _ => Err(Error::BadTransition {
                 from: self,
                 to: next,
@@ -196,41 +214,105 @@ impl State {
     }
 }
 
-/// Stop flag shared by vCPU threads and `wait`. It is set by `stop` and
-/// by a thread ending, each thread reads the flag before re-entering
-/// `run`.
-#[derive(Default)]
-struct Kill {
-    signalled: Mutex<bool>,
-    woken: Condvar,
+/// Order read by a vCPU thread after an `Interrupted` exit.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Order {
+    /// Re-enter `run`.
+    #[default]
+    Run,
+    /// Park until the order changes.
+    Hold,
+    /// Leave the loop, guest is stopping.
+    Stop,
 }
 
-impl Kill {
-    /// Set the flag and wake `wait`.
-    fn signal(&self) {
-        *self.signalled.lock().unwrap() = true;
-        self.woken.notify_all();
+/// Current order and number of threads parked on it.
+#[derive(Default)]
+struct Standing {
+    order: Order,
+    parked: usize,
+}
+
+/// Order shared by vCPU threads and `pause`, `stop` and `wait`. Each
+/// thread reads the order before re-entering `run`, `parked` counts the
+/// threads parked on a `Hold`.
+#[derive(Default)]
+struct Orders {
+    standing: Mutex<Standing>,
+    changed: Condvar,
+}
+
+impl Orders {
+    /// Set the order and wake up the threads.
+    fn tell(&self, order: Order) {
+        self.standing.lock().unwrap().order = order;
+        self.changed.notify_all();
     }
 
-    fn is_signalled(&self) -> bool {
-        *self.signalled.lock().unwrap()
+    fn standing(&self) -> Order {
+        self.standing.lock().unwrap().order
     }
 
-    /// Block until the flag is set.
-    fn wait(&self) {
-        let mut signalled = self.signalled.lock().unwrap();
-        while !*signalled {
-            signalled = self.woken.wait(signalled).unwrap();
+    /// Park the thread while the order is `Hold`, counted in `parked`.
+    /// Returns at once on any other order.
+    fn wait_out_a_hold(&self) {
+        let mut standing = self.standing.lock().unwrap();
+        if standing.order != Order::Hold {
+            return;
+        }
+        standing.parked += 1;
+        self.changed.notify_all();
+        while standing.order == Order::Hold {
+            standing = self.changed.wait(standing).unwrap();
+        }
+        standing.parked -= 1;
+    }
+
+    /// Block until `count` threads are parked, the order leaves `Hold`, or
+    /// `within` elapses.
+    fn wait_until_still(&self, count: usize, within: Duration) -> Still {
+        let deadline = Instant::now() + within;
+        let mut standing = self.standing.lock().unwrap();
+        loop {
+            if standing.parked >= count {
+                return Still::Held;
+            }
+            if standing.order != Order::Hold {
+                return Still::Stopped;
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return Still::Waiting;
+            };
+            standing = self.changed.wait_timeout(standing, left).unwrap().0;
+        }
+    }
+
+    /// Block until the order is `Stop`.
+    fn wait_for_a_stop(&self) {
+        let mut standing = self.standing.lock().unwrap();
+        while standing.order != Order::Stop {
+            standing = self.changed.wait(standing).unwrap();
         }
     }
 }
 
-/// Set the `Kill` flag on drop, so that a panicking thread sets it too.
-struct SignalOnDrop(Arc<Kill>);
+/// Outcome of waiting for vCPU threads to park.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Still {
+    /// Each thread is parked.
+    Held,
+    /// Order left `Hold` before the threads parked.
+    Stopped,
+    /// A thread had not parked when the wait elapsed.
+    Waiting,
+}
+
+/// Set `Order::Stop` on drop, so that a panicking thread sets it too.
+struct SignalOnDrop(Arc<Orders>);
 
 impl Drop for SignalOnDrop {
     fn drop(&mut self) {
-        self.0.signal();
+        self.0.tell(Order::Stop);
     }
 }
 
@@ -276,7 +358,7 @@ pub struct Machine<H: Hypervisor> {
     threads: Vec<JoinHandle<Result<VmExit>>>,
     /// One `Stopper` per vCPU, in creation order, used by `ask_out`.
     stoppers: Vec<Box<dyn Stopper>>,
-    kill: Arc<Kill>,
+    orders: Arc<Orders>,
     state: State,
 }
 
@@ -375,7 +457,7 @@ impl<H: Hypervisor> Machine<H> {
             vcpus,
             stoppers,
             threads: Vec::new(),
-            kill: Arc::new(Kill::default()),
+            orders: Arc::new(Orders::default()),
             state: State::Created,
         })
     }
@@ -407,16 +489,22 @@ impl<H: Hypervisor> Machine<H> {
                 let mut devices = self.devices.clone();
                 // The thread keeps the pages mapped after the `Machine` drops.
                 let ram = self.ram.clone();
-                let kill = Arc::clone(&self.kill);
+                let orders = Arc::clone(&self.orders);
                 std::thread::spawn(move || {
                     let _ram = ram;
-                    let _signal = SignalOnDrop(Arc::clone(&kill));
+                    let _signal = SignalOnDrop(Arc::clone(&orders));
                     loop {
                         let exit = crate::vcpu::run(&mut vcpu, &mut devices)?;
-                        // `Interrupted` with the flag clear is a stray
-                        // signal, vCPU re-enters `run`.
-                        if kill.is_signalled() || exit != VmExit::Interrupted {
+                        // `Interrupted` is a signal, either stray or from
+                        // `ask_out`, so the order read next decides. Any
+                        // other exit ends the thread.
+                        if exit != VmExit::Interrupted {
                             break Ok(exit);
+                        }
+                        match orders.standing() {
+                            Order::Run => {}
+                            Order::Hold => orders.wait_out_a_hold(),
+                            Order::Stop => break Ok(exit),
                         }
                     }
                 })
@@ -426,16 +514,45 @@ impl<H: Hypervisor> Machine<H> {
         Ok(())
     }
 
-    /// Set the stop flag and bring each vCPU out of `run`, the run returns
+    /// Set `Order::Hold` and bring each vCPU out of `run`, then block until
+    /// each thread has parked, at most `HOLD_WITHIN`. Guest stopping in the
+    /// meantime is reported as `StoppedWhileHeld`, thread still inside `run`
+    /// as `NotHeld`.
+    pub fn pause(&mut self) -> Result<()> {
+        self.state.valid_transition(State::Paused)?;
+        self.orders.tell(Order::Hold);
+        self.ask_out()?;
+        match self
+            .orders
+            .wait_until_still(self.threads.len(), HOLD_WITHIN)
+        {
+            Still::Held => {
+                self.state = State::Paused;
+                Ok(())
+            }
+            Still::Stopped => Err(Error::StoppedWhileHeld),
+            Still::Waiting => Err(Error::NotHeld),
+        }
+    }
+
+    /// Set `Order::Run`, parked threads re-enter `run`.
+    pub fn resume(&mut self) -> Result<()> {
+        self.state.valid_transition(State::Running)?;
+        self.orders.tell(Order::Run);
+        self.state = State::Running;
+        Ok(())
+    }
+
+    /// Set `Order::Stop` and bring each vCPU out of `run`. The run returns
     /// `Interrupted`.
     pub fn stop(&self) -> Result<()> {
-        if self.state != State::Running {
+        if self.state != State::Running && self.state != State::Paused {
             return Err(Error::BadTransition {
                 from: self.state,
                 to: State::Shutdown,
             });
         }
-        self.kill.signal();
+        self.orders.tell(Order::Stop);
         self.ask_out()
     }
 
@@ -460,7 +577,7 @@ impl<H: Hypervisor> Machine<H> {
     /// INIT stays inside.
     pub fn wait(&mut self) -> Result<VmExit> {
         self.state.valid_transition(State::Shutdown)?;
-        self.kill.wait();
+        self.orders.wait_for_a_stop();
         self.ask_out()?;
         let mut first = None;
         for thread in self.threads.drain(..) {
@@ -668,6 +785,105 @@ mod tests {
             VmExit::Reboot,
             "guest ran past the reset"
         );
+    }
+
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn test_pause_and_resume() {
+        // Check output stops while paused, state is readable, and resume works.
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        use crate::boot::tests::bzimage;
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+        /// Sink which counts the bytes written.
+        #[derive(Clone)]
+        struct Counter(Arc<Mutex<usize>>);
+
+        impl Counter {
+            fn sent(&self) -> usize {
+                *self.0.lock().unwrap()
+            }
+        }
+
+        impl Write for Counter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                *self.0.lock().unwrap() += buf.len();
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Write a byte to the UART in a loop.
+        let program = [
+            0xba, 0xf8, 0x03, 0x00, 0x00, // mov edx, 0x3f8
+            0xb0, 0x78, // mov al, 'x'
+            0xee, // out dx, al
+            0xeb, 0xfb, // jmp back to the mov
+        ];
+        let mut payload = vec![0u8; 0x200];
+        payload.extend_from_slice(&program);
+
+        let image = std::env::temp_dir().join(format!("lingcore-hold-{}", std::process::id()));
+        std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
+
+        let console = Counter(Arc::new(Mutex::new(0)));
+        let config = Config {
+            memory: 16 << 20,
+            vcpus: 1,
+            kernel: image.clone(),
+            initrd: None,
+            cmdline: "console=ttyS0".to_string(),
+            disk: None,
+        };
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
+        std::fs::remove_file(&image).expect("remove the kernel image");
+
+        machine.start().expect("start the guest");
+        assert_eq!(machine.state(), State::Running);
+
+        // Wait for output before pausing, so that a count which stops moving
+        // means the pause, not a slow start.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while console.sent() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "guest produced no output in 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        machine.pause().expect("pause the guest");
+        assert_eq!(machine.state(), State::Paused);
+
+        // `pause` returns once each thread is parked, not before.
+        assert_eq!(
+            machine.orders.standing.lock().unwrap().parked,
+            usize::from(config.vcpus),
+            "pause returned with vCPU thread not parked yet"
+        );
+
+        // Running guest writes thousands of bytes in 100 ms.
+        let held = console.sent();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(console.sent(), held, "paused guest kept writing");
+
+        machine.resume().expect("resume the guest");
+        assert_eq!(machine.state(), State::Running);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while console.sent() == held {
+            assert!(Instant::now() < deadline, "resumed guest stayed still");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        machine.stop().expect("stop the guest");
+        assert_eq!(machine.wait().expect("wait"), VmExit::Interrupted);
     }
 
     #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
