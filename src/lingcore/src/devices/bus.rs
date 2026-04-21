@@ -8,7 +8,7 @@
 
 use std::io;
 
-use crate::devices::{Device, Error, Result};
+use crate::devices::{Blob, Device, Error, Result};
 use crate::hv;
 use crate::hv::vcpu::VmExit;
 use crate::vcpu::VmOps;
@@ -105,6 +105,47 @@ impl Bus {
     /// Place `device` in MMIO space at `base` covering `size` bytes.
     pub fn place_mmio(&mut self, base: u64, size: u64, device: Box<dyn Device>) -> Result<()> {
         place(&mut self.mmio, base, size, device)
+    }
+
+    /// Returns the placed devices in placement order, port space first on
+    /// x86_64 and then MMIO.
+    fn placed(&self) -> impl Iterator<Item = &Placed> {
+        #[cfg(target_arch = "x86_64")]
+        let all = self.ports.iter().chain(self.mmio.iter());
+        #[cfg(not(target_arch = "x86_64"))]
+        let all = self.mmio.iter();
+        all
+    }
+
+    /// Mutable version of `placed`.
+    fn placed_mut(&mut self) -> impl Iterator<Item = &mut Placed> {
+        #[cfg(target_arch = "x86_64")]
+        let all = self.ports.iter_mut().chain(self.mmio.iter_mut());
+        #[cfg(not(target_arch = "x86_64"))]
+        let all = self.mmio.iter_mut();
+        all
+    }
+
+    /// Returns state of each device in `placed` order. Stateless device
+    /// contributes `None`, so that the list lines up with the bus.
+    pub fn capture(&self) -> Result<Vec<Option<Blob>>> {
+        self.placed()
+            .map(|placed| placed.device.capture())
+            .collect()
+    }
+
+    /// Restore the list returned by `capture`, a list of another length is
+    /// reported as `State`.
+    pub fn restore(&mut self, blobs: &[Option<Blob>]) -> Result<()> {
+        if blobs.len() != self.placed().count() {
+            return Err(Error::State);
+        }
+        for (placed, blob) in self.placed_mut().zip(blobs) {
+            if let Some(blob) = blob {
+                placed.device.restore(blob)?;
+            }
+        }
+        Ok(())
     }
 }
 

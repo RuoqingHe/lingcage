@@ -21,7 +21,7 @@ use crate::devices::serial::Serial;
 use crate::devices::virtio::block::Block;
 use crate::devices::virtio::entropy::Entropy;
 use crate::devices::virtio::mmio::{self, Transport};
-use crate::devices::{Receive, Shared};
+use crate::devices::{Blob, Receive, Shared};
 use crate::hv::hypervisor::Hypervisor;
 use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::vcpu::{Stopper, Vcpu, VmExit};
@@ -98,7 +98,8 @@ pub enum Error {
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
-    /// vCPU thread did not park within `HOLD_WITHIN`.
+    /// vCPU thread did not park within `HOLD_WITHIN`, or still holds its
+    /// vCPU.
     #[error("vCPU did not stop for pause")]
     NotHeld,
     /// Guest stopped while `pause` was waiting.
@@ -351,8 +352,10 @@ pub struct Machine<H: Hypervisor> {
     devices: Devices,
     /// Share of the console UART for input, the bus holds the other one.
     console: Arc<dyn Receive>,
-    /// vCPUs not started yet, `start` moves them onto threads.
-    vcpus: Vec<<H::Vm as Vm>::Vcpu>,
+    /// vCPUs, each one shared with the thread driving it. Thread holds the
+    /// lock for the duration of one `run` and releases it before parking,
+    /// so vCPUs of a paused guest can be locked from outside.
+    vcpus: Vec<Arc<Mutex<<H::Vm as Vm>::Vcpu>>>,
     /// One thread per started vCPU, `stop_vcpu` signals a vCPU through its
     /// handle.
     threads: Vec<JoinHandle<Result<VmExit>>>,
@@ -445,7 +448,7 @@ impl<H: Hypervisor> Machine<H> {
                 boot::enter_long_mode(&ram, &mut vcpu, &kernel)?;
             }
             stoppers.push(vcpu.stopper());
-            vcpus.push(vcpu);
+            vcpus.push(Arc::new(Mutex::new(vcpu)));
         }
 
         Ok(Machine {
@@ -467,6 +470,29 @@ impl<H: Hypervisor> Machine<H> {
         self.state
     }
 
+    /// Returns state of each vCPU and each device. `BadTransition` unless
+    /// the guest is `Paused`, `NotHeld` if a thread still holds a vCPU.
+    pub fn read_state(&self) -> Result<(Vec<crate::hv::StateBlob>, Vec<Option<Blob>>)> {
+        if self.state != State::Paused {
+            return Err(Error::BadTransition {
+                from: self.state,
+                to: State::Paused,
+            });
+        }
+        // Locked vCPU means its thread is still inside `run`, so the lock is
+        // tried instead of waited on.
+        let processors = self
+            .vcpus
+            .iter()
+            .map(|vcpu| match vcpu.try_lock() {
+                Ok(vcpu) => vcpu.get_state().map_err(Error::from),
+                Err(_) => Err(Error::NotHeld),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let devices = self.devices.0.lock().unwrap().capture()?;
+        Ok((processors, devices))
+    }
+
     /// Returns a share of the console, for input from another thread while
     /// the guest is running.
     pub fn console(&self) -> Arc<dyn Receive> {
@@ -484,17 +510,22 @@ impl<H: Hypervisor> Machine<H> {
         self.state.valid_transition(State::Running)?;
         self.threads = self
             .vcpus
-            .drain(..)
-            .map(|mut vcpu| {
+            .iter()
+            .map(|vcpu| {
                 let mut devices = self.devices.clone();
                 // The thread keeps the pages mapped after the `Machine` drops.
                 let ram = self.ram.clone();
                 let orders = Arc::clone(&self.orders);
+                let vcpu = Arc::clone(vcpu);
                 std::thread::spawn(move || {
                     let _ram = ram;
                     let _signal = SignalOnDrop(Arc::clone(&orders));
                     loop {
-                        let exit = crate::vcpu::run(&mut vcpu, &mut devices)?;
+                        // Lock is released before the thread parks on a hold.
+                        let exit = {
+                            let mut held = vcpu.lock().unwrap();
+                            crate::vcpu::run(&mut *held, &mut devices)?
+                        };
                         // `Interrupted` is a signal, either stray or from
                         // `ask_out`, so the order read next decides. Any
                         // other exit ends the thread.
@@ -881,6 +912,31 @@ mod tests {
             assert!(Instant::now() < deadline, "resumed guest stayed still");
             std::thread::sleep(Duration::from_millis(5));
         }
+
+        // Paused guest can be read, running one is refused.
+        machine.pause().expect("pause the guest again");
+        let (processors, devices) = machine.read_state().expect("read the paused guest");
+        assert_eq!(processors.len(), usize::from(config.vcpus));
+        assert!(
+            !processors[0].data.is_empty(),
+            "state blob of vCPU 0 is empty"
+        );
+        assert_eq!(
+            devices.len(),
+            3,
+            "the console, the keyboard controller and the entropy source"
+        );
+        assert!(
+            devices
+                .iter()
+                .any(|blob| { blob.as_ref().is_some_and(|blob| blob.kind == "serial") }),
+            "no blob of kind serial among them"
+        );
+        machine.resume().expect("resume the guest again");
+        assert!(
+            machine.read_state().is_err(),
+            "read_state passed on a running guest"
+        );
 
         machine.stop().expect("stop the guest");
         assert_eq!(machine.wait().expect("wait"), VmExit::Interrupted);
