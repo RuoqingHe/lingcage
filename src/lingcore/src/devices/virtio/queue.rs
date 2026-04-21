@@ -120,6 +120,18 @@ impl Queue {
         write_u16(ram, offset(self.used_ring, 2)?, self.next_used.0)
     }
 
+    /// Returns the next available index and the next used index. Rings
+    /// themselves stay in guest RAM.
+    pub fn cursors(&self) -> (u16, u16) {
+        (self.next_avail.0, self.next_used.0)
+    }
+
+    /// Set the indices returned by `cursors`.
+    pub fn set_cursors(&mut self, next_avail: u16, next_used: u16) {
+        self.next_avail = Wrapping(next_avail);
+        self.next_used = Wrapping(next_used);
+    }
+
     /// Walk the chain from `head`, check each link and buffer.
     fn walk(&self, ram: &GuestRam, head: u16) -> Result<Chain> {
         let mut descriptors = Vec::new();

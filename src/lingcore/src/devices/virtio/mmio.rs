@@ -10,9 +10,9 @@
 
 use std::io;
 
-use crate::devices::Device as BusDevice;
 use crate::devices::virtio::Device;
 use crate::devices::virtio::queue::Queue;
+use crate::devices::{Blob, Device as BusDevice, Error as BusError, Result as BusResult};
 use crate::hv::irq::IrqSender;
 use crate::hv::vcpu::VmExit;
 use crate::mem::GuestRam;
@@ -68,6 +68,40 @@ const STATUS_FAILED: u32 = 0x80;
 /// `VIRTIO_F_VERSION_1`, feature bit 32. Driver which does not accept it
 /// is a legacy driver, which is not supported by this transport.
 const VERSION_1: u64 = 1 << 32;
+
+/// `Blob::kind` of transport.
+const KIND: &str = "virtio-mmio";
+/// Layout version of `TransportState`. Blob of any other version is
+/// reported as `WrongVersion`.
+const STATE_VERSION: u32 = 1;
+
+/// Ring addresses, size and readiness of one queue, plus its cursors.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct SlotState {
+    size: u16,
+    desc: u64,
+    avail: u64,
+    used: u64,
+    ready: bool,
+    next_avail: u16,
+    next_used: u16,
+}
+
+/// Registers and queues of a transport, encoded as `Blob::data` through
+/// serde_json. Rings stay in guest RAM, and the device behind the
+/// transport captures its own state.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct TransportState {
+    status: u32,
+    device_features_sel: u32,
+    driver_features: u64,
+    driver_features_sel: u32,
+    queue_sel: u32,
+    interrupt_status: u32,
+    queues: Vec<SlotState>,
+}
 
 /// Ring addresses of one queue, written one register at a time.
 #[derive(Default)]
@@ -238,6 +272,62 @@ impl Transport {
     }
 }
 
+impl Transport {
+    fn state(&self) -> TransportState {
+        TransportState {
+            status: self.status,
+            device_features_sel: self.device_features_sel,
+            driver_features: self.driver_features,
+            driver_features_sel: self.driver_features_sel,
+            queue_sel: self.queue_sel,
+            interrupt_status: self.interrupt_status,
+            queues: self
+                .queues
+                .iter()
+                .map(|slot| {
+                    let (next_avail, next_used) =
+                        slot.queue.as_ref().map_or((0, 0), Queue::cursors);
+                    SlotState {
+                        size: slot.size,
+                        desc: slot.desc,
+                        avail: slot.avail,
+                        used: slot.used,
+                        ready: slot.queue.is_some(),
+                        next_avail,
+                        next_used,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Restore `state`. Queues are restored up to the shorter one of the two
+    /// lists, a ring marked ready is rebuilt with its cursors.
+    fn take_up(&mut self, state: TransportState) -> BusResult<()> {
+        self.status = state.status;
+        self.device_features_sel = state.device_features_sel;
+        self.driver_features = state.driver_features;
+        self.driver_features_sel = state.driver_features_sel;
+        self.queue_sel = state.queue_sel;
+        self.interrupt_status = state.interrupt_status;
+        for (slot, taken) in self.queues.iter_mut().zip(state.queues) {
+            slot.size = taken.size;
+            slot.desc = taken.desc;
+            slot.avail = taken.avail;
+            slot.used = taken.used;
+            slot.queue = None;
+            if !taken.ready {
+                continue;
+            }
+            let mut queue = Queue::new(taken.size, taken.desc, taken.avail, taken.used)
+                .map_err(|_| BusError::State)?;
+            queue.set_cursors(taken.next_avail, taken.next_used);
+            slot.queue = Some(queue);
+        }
+        Ok(())
+    }
+}
+
 impl BusDevice for Transport {
     fn read(&mut self, offset: u64, size: u8) -> u64 {
         match offset.checked_sub(CONFIG) {
@@ -253,6 +343,33 @@ impl BusDevice for Transport {
             None => self.write_register(offset, value as u32)?,
         }
         Ok(None)
+    }
+
+    fn capture(&self) -> BusResult<Option<Blob>> {
+        let data = serde_json::to_vec(&self.state()).map_err(|_| BusError::State)?;
+        Ok(Some(Blob {
+            kind: KIND.to_string(),
+            version: STATE_VERSION,
+            data,
+        }))
+    }
+
+    fn restore(&mut self, blob: &Blob) -> BusResult<()> {
+        if blob.kind != KIND {
+            return Err(BusError::WrongState {
+                found: blob.kind.clone(),
+                wanted: KIND,
+            });
+        }
+        if blob.version != STATE_VERSION {
+            return Err(BusError::WrongVersion {
+                kind: KIND,
+                version: blob.version,
+            });
+        }
+        let state: TransportState =
+            serde_json::from_slice(&blob.data).map_err(|_| BusError::State)?;
+        self.take_up(state)
     }
 }
 
@@ -299,10 +416,12 @@ mod tests {
         }
     }
 
-    /// Backend which fills each writable buffer with `0xa5`.
+    /// Backend which fills each writable buffer with `0xa5` and counts the
+    /// chains served.
     #[derive(Default)]
     struct Filler {
         refuse: bool,
+        served: Arc<AtomicUsize>,
     }
 
     impl Device for Filler {
@@ -323,6 +442,7 @@ mod tests {
                 return Err(Error::Indirect);
             }
             while let Some(chain) = queue.pop(ram)? {
+                self.served.fetch_add(1, Ordering::SeqCst);
                 let mut written = 0;
                 for descriptor in &chain.descriptors {
                     if descriptor.writable() {
@@ -343,6 +463,13 @@ mod tests {
     fn transport(line: &Counter) -> Transport {
         let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
         Transport::new(Box::new(Filler::default()), ram, Box::new(line.clone()))
+    }
+
+    /// Read `idx` of the used ring.
+    fn used_index(ram: &GuestRam) -> u16 {
+        let mut bytes = [0u8; 2];
+        ram.read(USED_RING + 2, &mut bytes).expect("used index");
+        u16::from_le_bytes(bytes)
     }
 
     /// Read a register the way a driver does, four bytes wide.
@@ -453,6 +580,78 @@ mod tests {
     }
 
     #[test]
+    fn test_capture_restore_queue() {
+        // Ring cursors survive so a served chain is not served twice.
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut mmio = transport(&line);
+        let ram = mmio.ram.clone();
+
+        // Two buffers, published one at a time, one chain before capture
+        // and one after.
+        for index in 0..2u16 {
+            let mut descriptor = [0u8; 16];
+            let at = BUFFER + u64::from(index) * 16;
+            descriptor[0..8].copy_from_slice(&at.to_le_bytes());
+            descriptor[8..12].copy_from_slice(&16u32.to_le_bytes());
+            descriptor[12..14].copy_from_slice(&2u16.to_le_bytes());
+            ram.write(DESC_TABLE + u64::from(index) * 16, &descriptor)
+                .expect("descriptor");
+            ram.write(AVAIL_RING + 4 + u64::from(index) * 2, &index.to_le_bytes())
+                .expect("head");
+        }
+
+        set(&mut mmio, QUEUE_NUM, 8);
+        set(&mut mmio, QUEUE_DESC_LOW, DESC_TABLE as u32);
+        set(&mut mmio, QUEUE_AVAIL_LOW, AVAIL_RING as u32);
+        set(&mut mmio, QUEUE_USED_LOW, USED_RING as u32);
+        set(&mut mmio, QUEUE_READY, 1);
+        // Handshake, with feature bit 32 accepted.
+        set(&mut mmio, DRIVER_FEATURES_SEL, 1);
+        set(&mut mmio, DRIVER_FEATURES, (VERSION_1 >> 32) as u32);
+        set(&mut mmio, STATUS, 0x0f);
+
+        // First chain is published and notified.
+        ram.write(AVAIL_RING + 2, &1u16.to_le_bytes())
+            .expect("index");
+        set(&mut mmio, QUEUE_NOTIFY, 0);
+        assert_eq!(used_index(&ram), 1);
+
+        let blob = BusDevice::capture(&mmio)
+            .expect("capture")
+            .expect("transport has state");
+        assert_eq!(blob.kind, KIND);
+
+        // Fresh transport over the same guest RAM and line.
+        let served = Arc::new(AtomicUsize::new(0));
+        let mut taken_up = Transport::new(
+            Box::new(Filler {
+                refuse: false,
+                served: Arc::clone(&served),
+            }),
+            ram.clone(),
+            Box::new(line.clone()),
+        );
+        BusDevice::restore(&mut taken_up, &blob).expect("restore");
+
+        // Ready ring, status and pending interrupt are restored.
+        assert_eq!(reg(&mut taken_up, QUEUE_READY), 1);
+        assert_eq!(reg(&mut taken_up, STATUS), 0x0f);
+        assert_eq!(reg(&mut taken_up, INTERRUPT_STATUS), INTERRUPT_VRING);
+
+        // Second chain, notified on the restored transport. Cursor reset
+        // to zero would serve the first chain again.
+        ram.write(AVAIL_RING + 2, &2u16.to_le_bytes())
+            .expect("index");
+        set(&mut taken_up, QUEUE_NOTIFY, 0);
+        assert_eq!(used_index(&ram), 2);
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "chain served before capture is served again"
+        );
+    }
+
+    #[test]
     fn test_bad_queue_size_not_built() {
         let line = Counter(Arc::new(AtomicUsize::new(0)));
         let mut mmio = transport(&line);
@@ -477,7 +676,10 @@ mod tests {
         let line = Counter(Arc::new(AtomicUsize::new(0)));
         let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
         let mut mmio = Transport::new(
-            Box::new(Filler { refuse: true }),
+            Box::new(Filler {
+                refuse: true,
+                served: Arc::new(AtomicUsize::new(0)),
+            }),
             ram,
             Box::new(line.clone()),
         );
