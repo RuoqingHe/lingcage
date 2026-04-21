@@ -4,10 +4,10 @@
 
 //! Virtio entropy device, section 5.4 of virtio 1.2.
 //!
-//! Device reads from the `Read` source it is created with, so a cloned
-//! guest can be given its own source.
+//! Device reads from the file it is created with, so a cloned guest can
+//! be given its own source.
 
-use std::io::Read;
+use std::fs::File;
 
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::{Device, Error, Result};
@@ -16,19 +16,19 @@ use crate::mem::GuestRam;
 /// Device ID of entropy device, section 5.4.
 const DEVICE_ID: u32 = 4;
 
-/// Entropy device backed by a `Read` source.
-pub struct Entropy<R> {
-    source: R,
+/// Entropy device backed by a file.
+pub struct Entropy {
+    source: File,
 }
 
-impl<R: Read> Entropy<R> {
+impl Entropy {
     /// Create an entropy device reading from `source`.
-    pub fn new(source: R) -> Self {
+    pub fn new(source: File) -> Self {
         Entropy { source }
     }
 }
 
-impl<R: Read + Send> Device for Entropy<R> {
+impl Device for Entropy {
     fn device_id(&self) -> u32 {
         DEVICE_ID
     }
@@ -39,14 +39,14 @@ impl<R: Read + Send> Device for Entropy<R> {
         while let Some(chain) = queue.pop(ram)? {
             let mut written = 0u32;
             for descriptor in chain.descriptors.iter().filter(|d| d.writable()) {
-                let mut bytes = vec![0u8; descriptor.len as usize];
-                let taken = self.source.read(&mut bytes).map_err(|_| Error::Source)?;
-                ram.write(descriptor.addr, &bytes[..taken])
-                    .map_err(|_| Error::Ring {
-                        gpa: descriptor.addr,
-                    })?;
+                let want = descriptor.len as usize;
+                // File is read into guest RAM directly, so `descriptor.len`
+                // does not decide any host allocation.
+                let taken = ram
+                    .fill_from(descriptor.addr, &mut self.source, want)
+                    .map_err(|_| Error::Source)?;
                 written += taken as u32;
-                if taken < bytes.len() {
+                if taken < want {
                     break;
                 }
             }
@@ -58,9 +58,20 @@ impl<R: Read + Send> Device for Entropy<R> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use crate::devices::virtio::entropy::*;
+
+    /// File holding `bytes`, unlinked once opened.
+    fn source_of(bytes: &[u8], tag: &str) -> File {
+        let path = std::env::temp_dir().join(format!(
+            "lingcore-seed-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, bytes).expect("write the seed");
+        let file = File::open(&path).expect("open the seed");
+        std::fs::remove_file(&path).expect("remove the seed");
+        file
+    }
 
     const RAM_SIZE: u64 = 0x10000;
     const DESC_TABLE: u64 = 0x1000;
@@ -97,7 +108,7 @@ mod tests {
         let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
         let mut queue = Queue::new(8, DESC_TABLE, AVAIL_RING, USED_RING).expect("ring");
         let seed: Vec<u8> = (0..16u8).collect();
-        let mut device = Entropy::new(Cursor::new(seed.clone()));
+        let mut device = Entropy::new(source_of(&seed, "served"));
 
         ask_for(&ram, 16, 0);
         device.notify(0, &mut queue, &ram).expect("notify");
@@ -112,7 +123,7 @@ mod tests {
     fn test_short_read_reported() {
         let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
         let mut queue = Queue::new(8, DESC_TABLE, AVAIL_RING, USED_RING).expect("ring");
-        let mut device = Entropy::new(Cursor::new(vec![0xa5u8; 4]));
+        let mut device = Entropy::new(source_of(&[0xa5u8; 4], "dry"));
 
         // 16-byte buffer over a 4-byte source is reported used with 4.
         ask_for(&ram, 16, 0);
@@ -129,7 +140,7 @@ mod tests {
     fn test_readonly_buffer_untouched() {
         let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
         let mut queue = Queue::new(8, DESC_TABLE, AVAIL_RING, USED_RING).expect("ring");
-        let mut device = Entropy::new(Cursor::new(vec![0xa5u8; 16]));
+        let mut device = Entropy::new(source_of(&[0xa5u8; 16], "kept"));
 
         // Descriptor without `VIRTQ_DESC_F_WRITE` is not filled.
         let mut descriptor = [0u8; 16];

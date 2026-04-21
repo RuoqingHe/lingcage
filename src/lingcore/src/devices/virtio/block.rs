@@ -7,7 +7,8 @@
 //! A request chain is made of a 16-byte header, data buffers and one
 //! writable status byte. Data may span several buffers.
 
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{self, Seek, SeekFrom, Write};
 
 use crate::devices::virtio::queue::{Chain, Descriptor, Queue};
 use crate::devices::virtio::{Device, Error, Result};
@@ -37,16 +38,16 @@ const IOERR: u8 = 1;
 /// `VIRTIO_BLK_S_UNSUPP`, request type or shape is not supported.
 const UNSUPPORTED: u8 = 2;
 
-/// Block device backed by a seekable `disk`.
-pub struct Block<D> {
-    disk: D,
+/// Block device backed by a file.
+pub struct Block {
+    disk: File,
     sectors: u64,
 }
 
-impl<D: Seek> Block<D> {
+impl Block {
     /// Create a block device over `disk`. Its length is only read once here,
     /// a file which grows later is not read beyond the capacity reported.
-    pub fn new(mut disk: D) -> io::Result<Self> {
+    pub fn new(mut disk: File) -> io::Result<Self> {
         let bytes = disk.seek(SeekFrom::End(0))?;
         Ok(Block {
             disk,
@@ -61,7 +62,7 @@ struct Header {
     sector: u64,
 }
 
-impl<D: Read + Write + Seek + Send> Device for Block<D> {
+impl Device for Block {
     fn device_id(&self) -> u32 {
         DEVICE_ID
     }
@@ -100,7 +101,7 @@ impl<D: Read + Write + Seek + Send> Device for Block<D> {
     }
 }
 
-impl<D: Read + Write + Seek> Block<D> {
+impl Block {
     /// Serve one request. Returns the status byte and bytes written into
     /// guest RAM.
     fn serve(&mut self, chain: &Chain, ram: &GuestRam) -> (u8, u32) {
@@ -147,19 +148,17 @@ impl<D: Read + Write + Seek> Block<D> {
             return (IOERR, 0);
         }
 
+        // Bytes move between the file and guest RAM directly, so
+        // `descriptor.len` does not decide any host allocation.
         let mut moved = 0u32;
         for descriptor in data {
-            let mut bytes = vec![0u8; descriptor.len as usize];
+            let want = descriptor.len as usize;
             if into_guest {
-                if self.disk.read_exact(&mut bytes).is_err()
-                    || ram.write(descriptor.addr, &bytes).is_err()
-                {
-                    return (IOERR, moved);
+                match ram.fill_from(descriptor.addr, &mut self.disk, want) {
+                    Ok(taken) if taken == want => moved += descriptor.len,
+                    _ => return (IOERR, moved),
                 }
-                moved += descriptor.len;
-            } else if ram.read(descriptor.addr, &mut bytes).is_err()
-                || self.disk.write_all(&bytes).is_err()
-            {
+            } else if ram.drain_to(descriptor.addr, &mut self.disk, want).is_err() {
                 return (IOERR, moved);
             }
         }
@@ -194,7 +193,6 @@ fn read_header(chain: &Chain, ram: &GuestRam) -> Option<Header> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
 
     use crate::devices::virtio::block::*;
 
@@ -215,13 +213,37 @@ mod tests {
         GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages")
     }
 
-    fn disk() -> Block<Cursor<Vec<u8>>> {
-        // Sector `n` is filled with byte `n`.
+    /// Disk of `SECTORS` sectors, sector `n` filled with byte `n`. File is
+    /// unlinked once opened.
+    fn disk() -> Block {
+        let path = std::env::temp_dir().join(format!(
+            "lingcore-disk-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let mut bytes = Vec::new();
         for sector in 0..SECTORS {
             bytes.extend(std::iter::repeat_n(sector as u8, SECTOR as usize));
         }
-        Block::new(Cursor::new(bytes)).expect("measure the disk")
+        std::fs::write(&path, &bytes).expect("write the disk");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open the disk");
+        std::fs::remove_file(&path).expect("remove the disk");
+        Block::new(file).expect("measure the disk")
+    }
+
+    /// Read sector `index` from the file behind `block`.
+    fn sector_of(block: &mut Block, index: u64) -> Vec<u8> {
+        let mut bytes = vec![0u8; SECTOR as usize];
+        block
+            .disk
+            .seek(SeekFrom::Start(index * SECTOR))
+            .expect("seek");
+        std::io::Read::read_exact(&mut block.disk, &mut bytes).expect("read the sector back");
+        bytes
     }
 
     fn describe(ram: &GuestRam, index: u16, addr: u64, len: u32, flags: u16, next: u16) {
@@ -350,8 +372,7 @@ mod tests {
         assert_eq!(status(&ram), OK);
         // Write leaves guest RAM untouched, used length is the status byte.
         assert_eq!(reported(&ram, 0), 1);
-        let written = &block.disk.get_ref()[5 * SECTOR as usize..6 * SECTOR as usize];
-        assert_eq!(written, [0xa5u8; SECTOR as usize]);
+        assert_eq!(sector_of(&mut block, 5), vec![0xa5u8; SECTOR as usize]);
     }
 
     #[test]
@@ -383,7 +404,7 @@ mod tests {
         let ram = ram();
         let mut queue = queue();
         let mut block = disk();
-        let before = block.disk.get_ref().len();
+        let before = block.disk.metadata().expect("measure").len();
 
         // Write past the end would grow the backing file, so range check
         // refuses it before the seek.
@@ -391,7 +412,7 @@ mod tests {
         block.notify(0, &mut queue, &ram).expect("notify");
         assert_eq!(status(&ram), IOERR);
         assert_eq!(
-            block.disk.get_ref().len(),
+            block.disk.metadata().expect("measure").len(),
             before,
             "write past the end grew the backing file"
         );
@@ -406,7 +427,25 @@ mod tests {
         );
         block.notify(0, &mut queue, &ram).expect("notify");
         assert_eq!(status(&ram), IOERR);
-        assert_eq!(block.disk.get_ref().len(), before);
+        assert_eq!(block.disk.metadata().expect("measure").len(), before);
+    }
+
+    #[test]
+    fn test_short_read_reported_ioerr() {
+        let ram = ram();
+        let mut queue = queue();
+
+        // Capacity was read once. A file shrunk afterwards has sectors inside
+        // the capacity but no bytes behind them.
+        let mut block = disk();
+        block
+            .disk
+            .set_len(4 * SECTOR)
+            .expect("shrink the disk after measuring");
+
+        request(&ram, REQUEST_IN, 6, &[(SECTOR as u32, true)], 0);
+        block.notify(0, &mut queue, &ram).expect("serve");
+        assert_eq!(status(&ram), IOERR, "short read from disk reported as OK");
     }
 
     #[test]

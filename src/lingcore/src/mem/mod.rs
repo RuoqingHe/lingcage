@@ -9,6 +9,7 @@
 //! covered by any region, the MMIO hole below 4G on x86 for example, is
 //! not RAM, and an access into it is refused.
 
+use std::fs::File;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -35,6 +36,12 @@ pub enum Error {
         gpa: u64,
         /// Length of the access in bytes.
         count: usize,
+    },
+    /// Copy between guest RAM and a file stopped short.
+    #[error("short copy between guest address {gpa:#x} and file")]
+    Copy {
+        /// Guest address of the copy.
+        gpa: u64,
     },
 }
 
@@ -122,6 +129,22 @@ impl GuestRam {
         }
     }
 
+    /// Read up to `count` bytes from `source` into guest RAM at `gpa`, with
+    /// no buffer on host side. Returns the number of bytes read.
+    pub fn fill_from(&self, gpa: u64, source: &mut File, count: usize) -> Result<usize> {
+        self.inner
+            .read_volatile_from(GuestAddress(gpa), source, count)
+            .map_err(|_| Error::Copy { gpa })
+    }
+
+    /// Write `count` bytes of guest RAM at `gpa` to `sink`. Short write is
+    /// reported as `Copy`.
+    pub fn drain_to(&self, gpa: u64, sink: &mut File, count: usize) -> Result<()> {
+        self.inner
+            .write_all_volatile_to(GuestAddress(gpa), sink, count)
+            .map_err(|_| Error::Copy { gpa })
+    }
+
     /// Read from guest address `gpa` into `bytes`.
     pub fn read(&self, gpa: u64, bytes: &mut [u8]) -> Result<()> {
         self.inner
@@ -140,6 +163,54 @@ mod tests {
     const PAGE: u64 = 4096;
     /// Start of the hole below 4G left for devices.
     const HOLE: u64 = 0xc000_0000;
+
+    /// File holding `bytes`, opened for reading and writing, unlinked once
+    /// opened.
+    fn file_of(bytes: &[u8], tag: &str) -> std::fs::File {
+        let path = std::env::temp_dir().join(format!(
+            "lingcore-mem-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, bytes).expect("write the file");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open the file");
+        std::fs::remove_file(&path).expect("remove the file");
+        file
+    }
+
+    #[test]
+    fn test_fill_and_drain_file() {
+        const COUNT: usize = 4 << 20;
+        let ram = GuestRam::new(&[(0, 8 << 20)]).expect("host pages");
+        let mut source = file_of(&vec![0xa5u8; COUNT], "source");
+
+        // 4 MiB from the file into guest RAM.
+        assert_eq!(ram.fill_from(0, &mut source, COUNT).expect("fill"), COUNT);
+        let mut landed = [0u8; 8];
+        ram.read(COUNT as u64 - 8, &mut landed).expect("read back");
+        assert_eq!(landed, [0xa5u8; 8]);
+
+        // And 4 MiB back out to a file.
+        let mut sink = file_of(&[], "sink");
+        ram.drain_to(0, &mut sink, COUNT).expect("drain");
+        assert_eq!(
+            sink.metadata().expect("measure").len(),
+            COUNT as u64,
+            "sink is short"
+        );
+    }
+
+    #[test]
+    fn test_fill_short_source() {
+        let ram = GuestRam::new(&[(0, 1 << 20)]).expect("host pages");
+        let mut source = file_of(&[0xa5u8; 100], "dry");
+        // Count returned is what the source had, not what was asked for.
+        assert_eq!(ram.fill_from(0, &mut source, 4096).expect("fill"), 100);
+    }
 
     #[test]
     fn test_layout_with_hole() {
