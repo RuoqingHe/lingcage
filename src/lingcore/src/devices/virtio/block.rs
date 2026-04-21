@@ -8,7 +8,7 @@
 //! writable status byte. Data may span several buffers.
 
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Seek, SeekFrom};
 
 use crate::devices::virtio::queue::{Chain, Descriptor, Queue};
 use crate::devices::virtio::{Device, Error, Result};
@@ -112,7 +112,9 @@ impl Block {
         match header.kind {
             REQUEST_IN => self.transfer(header.sector, data, ram, true),
             REQUEST_OUT => self.transfer(header.sector, data, ram, false),
-            REQUEST_FLUSH => match self.disk.flush() {
+            // `Write::flush` on a `File` returns `Ok(())` without syscall,
+            // `sync_data` is `fdatasync`.
+            REQUEST_FLUSH => match self.disk.sync_data() {
                 Ok(()) => (OK, 0),
                 Err(_) => (IOERR, 0),
             },
