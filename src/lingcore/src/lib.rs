@@ -14,6 +14,7 @@ pub mod boot;
 pub mod devices;
 #[cfg(feature = "hv")]
 pub mod hv;
+// Boot tables are of a PC and the ioeventfds are eventfds.
 #[cfg(all(feature = "machine", target_os = "linux", target_arch = "x86_64"))]
 pub mod machine;
 #[cfg(feature = "mem")]

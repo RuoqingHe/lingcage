@@ -16,7 +16,7 @@ boot = ["dep:linux-loader", "hv", "mem"]
 devices = ["dep:serde", "dep:serde_json", "vcpu"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
-# Guest assembly, RAM, kernel, bus and the run loop.
+# Guest assembly, RAM, kernel, bus and the run loop. x86_64 Linux only.
 machine = ["boot", "devices", "hv", "mem", "serde", "vcpu", "virtio"]
 # serde derives on the hv state types.
 serde = ["dep:serde"]
