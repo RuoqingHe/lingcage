@@ -5,11 +5,20 @@
 //! Kernel-side ioeventfds. An eventfd is bound to a guest address
 //! through `KVM_IOEVENTFD`.
 
+use std::time::Duration;
+
 use crate::hv::Result;
 
 /// eventfd signalled by the kernel on a guest write to the address it
 /// is bound to. The write does not exit to VMM.
-pub trait IoeventFd: Send + Sync {}
+pub trait IoeventFd: Send + Sync {
+    /// Wait at most `within` for a signal. Returns the accumulated count
+    /// cleared by the read, or `None` once `within` elapses.
+    fn wait(&self, within: Duration) -> Result<Option<u64>>;
+
+    /// Signal the eventfd from VMM side, a `wait` on it returns.
+    fn signal(&self) -> Result<()>;
+}
 
 /// Registry of ioeventfds supported by a backend. Without one, an
 /// ioeventfd write reaches the device as `VmExit::Mmio`.

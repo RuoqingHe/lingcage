@@ -5,7 +5,9 @@
 //! Ioeventfds, the eventfds signalled by `KVM_IOEVENTFD` on guest
 //! writes.
 
+use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
@@ -48,7 +50,37 @@ pub struct KvmIoeventFd {
     bound: Mutex<Option<(u64, Datamatch)>>,
 }
 
-impl IoeventFd for KvmIoeventFd {}
+impl IoeventFd for KvmIoeventFd {
+    fn wait(&self, within: Duration) -> Result<Option<u64>> {
+        let mut waiting = libc::pollfd {
+            fd: self.eventfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let milliseconds = i32::try_from(within.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: `waiting` is one initialized `pollfd`, and `self.eventfd`
+        // keeps the fd open during the call.
+        let ready = unsafe { libc::poll(&raw mut waiting, 1, milliseconds) };
+        if ready < 0 {
+            return Err(kvm_err("poll")(vmm_sys_util::errno::Error::last()));
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        // The read returns the counter and resets it, so a signal between
+        // poll and read is not lost.
+        self.eventfd
+            .read()
+            .map(Some)
+            .map_err(|err| kvm_err("eventfd read")(vmm_sys_util::errno::Error::from(err)))
+    }
+
+    fn signal(&self) -> Result<()> {
+        self.eventfd
+            .write(1)
+            .map_err(|err| kvm_err("eventfd write")(vmm_sys_util::errno::Error::from(err)))
+    }
+}
 
 /// Ioeventfd registry, which issues `KVM_IOEVENTFD` on the VM fd.
 pub struct KvmIoeventFdRegistry {
@@ -166,6 +198,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_signal_wakes_wait() {
+        use std::time::Instant;
+
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let registry = vm.create_ioeventfd_registry().expect("registry");
+        let eventfd = registry.create().expect("ioeventfd");
+
+        // The wait runs on its own thread, so a `wait` which blocks fails
+        // the test through `recv_timeout` instead of hanging it.
+        let eventfd = Arc::new(eventfd);
+        let waiting = Arc::clone(&eventfd);
+        let (done, answered) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let _ = done.send((waiting.wait(Duration::from_millis(50)), started.elapsed()));
+        });
+        let (answer, took) = answered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wait did not return in 5 s");
+        assert_eq!(answer.expect("wait"), None);
+        assert!(took >= Duration::from_millis(50));
+
+        // `signal` writes the eventfd from VMM side and wakes up a `wait`.
+        eventfd.signal().expect("signal");
+        assert_eq!(eventfd.wait(Duration::from_secs(5)).expect("wait"), Some(1));
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_ioeventfd_avoids_mmio_exit() {
@@ -232,7 +293,17 @@ mod tests {
             VmExit::Halt,
             "write exited as MMIO"
         );
-        assert_eq!(eventfd.eventfd.read().expect("ioeventfd signalled"), 1);
+        assert_eq!(
+            eventfd.wait(Duration::from_secs(5)).expect("wait"),
+            Some(1),
+            "ioeventfd not signalled"
+        );
+        // The read has reset the counter, so next wait returns `None`.
+        assert_eq!(
+            eventfd.wait(Duration::from_millis(50)).expect("wait"),
+            None,
+            "count read twice"
+        );
         // SAFETY: same as above.
         unsafe { dealloc(reset, layout) };
     }
