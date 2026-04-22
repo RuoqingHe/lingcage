@@ -39,7 +39,9 @@ const QUEUE_SEL: u64 = 0x030;
 const QUEUE_NUM_MAX: u64 = 0x034;
 const QUEUE_NUM: u64 = 0x038;
 const QUEUE_READY: u64 = 0x044;
-const QUEUE_NOTIFY: u64 = 0x050;
+/// Register which a driver writes queue index to on a kick. Machine binds
+/// an ioeventfd on it.
+pub const QUEUE_NOTIFY: u64 = 0x050;
 const INTERRUPT_STATUS: u64 = 0x060;
 const INTERRUPT_ACK: u64 = 0x064;
 const STATUS: u64 = 0x070;
@@ -253,8 +255,9 @@ impl Transport {
     }
 
     /// Handle a `QUEUE_NOTIFY` write for queue `index` and raise the line
-    /// once the device has processed it.
-    fn notify(&mut self, index: u16) -> io::Result<()> {
+    /// once the device has processed it. Signal on the ioeventfd reaches
+    /// here from the device thread.
+    pub fn notify(&mut self, index: u16) -> io::Result<()> {
         let Some(slot) = self.queues.get_mut(usize::from(index)) else {
             return Ok(());
         };

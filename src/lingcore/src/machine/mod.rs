@@ -24,6 +24,7 @@ use crate::devices::virtio::mmio::{self, Transport};
 use crate::devices::{Blob, Receive, Shared};
 use crate::hv::hypervisor::Hypervisor;
 use crate::hv::memory::{MemMapOption, VmMemory};
+use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
 use crate::hv::vcpu::{Stopper, Vcpu, VmExit};
 use crate::hv::vm::Vm;
 use crate::mem::GuestRam;
@@ -63,9 +64,17 @@ const VIRTIO_IRQ: u8 = 5;
 /// Host file read by the entropy source.
 const ENTROPY_SOURCE: &str = "/dev/urandom";
 
-/// Maximum time `pause` waits for vCPU threads to park. The stop lands
-/// as a signal plus a flag read on entry to `run`, so a thread still
-/// inside after this long is reported as `NotHeld`.
+/// Queue index an ioeventfd is bound on. Each device here has one queue,
+/// kick naming another one exits as MMIO.
+const VIRTIO_QUEUE: u16 = 0;
+
+/// Maximum time a device thread waits on its ioeventfd before reading
+/// the order.
+const DEVICE_TICK: Duration = Duration::from_millis(200);
+
+/// Maximum time `pause` waits for vCPU and device threads to park. The
+/// stop lands as a signal plus a flag read on entry to `run`, so a vCPU
+/// thread still inside after this long is reported as `NotHeld`.
 const HOLD_WITHIN: Duration = Duration::from_secs(10);
 
 /// Index of the vCPU the guest boots on. Kernel starts the rest with
@@ -98,14 +107,14 @@ pub enum Error {
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
-    /// vCPU thread did not park within `HOLD_WITHIN`, or still holds its
-    /// vCPU.
+    /// vCPU or device thread did not park within `HOLD_WITHIN`, or a vCPU
+    /// thread still holds its vCPU.
     #[error("vCPU did not stop for pause")]
     NotHeld,
     /// Guest stopped while `pause` was waiting.
     #[error("guest stopped during pause")]
     StoppedWhileHeld,
-    /// vCPU thread panicked.
+    /// vCPU or device thread panicked.
     #[error("vCPU thread panicked")]
     VcpuThread,
     /// `Config::vcpus` is zero.
@@ -152,25 +161,44 @@ fn virtio_at(slot: u8) -> u64 {
     VIRTIO_AT + u64::from(slot) * mmio::SIZE
 }
 
+/// Virtio device as placed, the transport on the bus and the ioeventfd
+/// bound on its notify register. Device thread waits on the ioeventfd
+/// with the transport unlocked.
+struct Wired {
+    transport: Shared<Transport>,
+    ioeventfd: Arc<dyn IoeventFd>,
+}
+
 /// Place `device` on `bus` in virtio register block `slot`, on line
-/// `VIRTIO_IRQ + slot`.
+/// `VIRTIO_IRQ + slot`, with an ioeventfd bound on its `QUEUE_NOTIFY`.
 fn place_virtio<V: Vm>(
     bus: &mut Bus,
     vm: &V,
+    registry: &V::IoeventFdRegistry,
     ram: &GuestRam,
     slot: u8,
     device: Box<dyn crate::devices::virtio::Device>,
-) -> Result<()>
+) -> Result<Wired>
 where
     V::IrqSender: 'static,
+    <V::IoeventFdRegistry as IoeventFdRegistry>::IoeventFd: 'static,
 {
     let line = vm.create_irq_sender(VIRTIO_IRQ + slot)?;
-    bus.place_mmio(
-        virtio_at(slot),
-        mmio::SIZE,
-        Box::new(Transport::new(device, ram.clone(), Box::new(line))),
+    let transport = Shared::new(Transport::new(device, ram.clone(), Box::new(line)));
+    bus.place_mmio(virtio_at(slot), mmio::SIZE, Box::new(transport.clone()))?;
+
+    let ioeventfd = registry.create()?;
+    // Only a 4-byte write of `VIRTIO_QUEUE` signals it, other kicks exit.
+    registry.register(
+        &ioeventfd,
+        virtio_at(slot) + mmio::QUEUE_NOTIFY,
+        4,
+        Some(u64::from(VIRTIO_QUEUE)),
     )?;
-    Ok(())
+    Ok(Wired {
+        transport,
+        ioeventfd: Arc::new(ioeventfd),
+    })
 }
 
 /// Returns the guest ranges occupied by `size` bytes of RAM, up to
@@ -192,8 +220,8 @@ pub enum State {
     Created,
     /// Each vCPU running on its own thread.
     Running,
-    /// Each vCPU thread parked outside `run`, so that registers and RAM can
-    /// be read.
+    /// Each vCPU thread parked outside `run` and each device thread between
+    /// kicks, so that registers, RAM and devices can be read.
     Paused,
     /// Threads joined and exit reason read.
     Shutdown,
@@ -215,7 +243,8 @@ impl State {
     }
 }
 
-/// Order read by a vCPU thread after an `Interrupted` exit.
+/// Order read by a vCPU thread after an `Interrupted` exit, and by a
+/// device thread after each ioeventfd wait.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Order {
     /// Re-enter `run`.
@@ -234,9 +263,9 @@ struct Standing {
     parked: usize,
 }
 
-/// Order shared by vCPU threads and `pause`, `stop` and `wait`. Each
-/// thread reads the order before re-entering `run`, `parked` counts the
-/// threads parked on a `Hold`.
+/// Order shared by vCPU and device threads and `pause`, `stop` and
+/// `wait`. Each thread reads the order before its next run or wait,
+/// `parked` counts the threads parked on a `Hold`.
 #[derive(Default)]
 struct Orders {
     standing: Mutex<Standing>,
@@ -297,8 +326,8 @@ impl Orders {
     }
 }
 
-/// Outcome of waiting for vCPU threads to park.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Outcome of waiting for the threads to park.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Still {
     /// Each thread is parked.
     Held,
@@ -356,7 +385,14 @@ pub struct Machine<H: Hypervisor> {
     /// lock for the duration of one `run` and releases it before parking,
     /// so vCPUs of a paused guest can be locked from outside.
     vcpus: Vec<Arc<Mutex<<H::Vm as Vm>::Vcpu>>>,
-    /// One thread per started vCPU, `stop_vcpu` signals a vCPU through its
+    /// Virtio devices, each with the ioeventfd bound on its notify register.
+    wired: Vec<Wired>,
+    /// One thread per device once started, each waiting on its ioeventfd.
+    device_threads: Vec<JoinHandle<()>>,
+    /// Registry the ioeventfds were created from, kept while they are bound.
+    #[expect(dead_code, reason = "kept for the bindings")]
+    registry: <H::Vm as Vm>::IoeventFdRegistry,
+    /// One thread per started vCPU. `stop_vcpu` signals a vCPU through its
     /// handle.
     threads: Vec<JoinHandle<Result<VmExit>>>,
     /// One `Stopper` per vCPU, in creation order, used by `ask_out`.
@@ -382,6 +418,9 @@ impl<H: Hypervisor> Machine<H> {
         // The sender is boxed into the `Serial`, a `dyn Device` owned by
         // the `Bus`.
         <H::Vm as Vm>::IrqSender: 'static,
+        // The ioeventfd is moved onto the device thread as an
+        // `Arc<dyn IoeventFd>`.
+        <<H::Vm as Vm>::IoeventFdRegistry as IoeventFdRegistry>::IoeventFd: 'static,
     {
         if config.vcpus == 0 {
             return Err(Error::NoVcpus);
@@ -424,8 +463,16 @@ impl<H: Hypervisor> Machine<H> {
         bus.place_port(COM1, COM1_SIZE, Box::new(uart.clone()))?;
         bus.place_port(I8042_COMMAND, 1, Box::new(I8042))?;
 
+        let registry = vm.create_ioeventfd_registry()?;
         let seed = File::open(ENTROPY_SOURCE).map_err(Error::Entropy)?;
-        place_virtio(&mut bus, &vm, &ram, 0, Box::new(Entropy::new(seed)))?;
+        let mut wired = vec![place_virtio(
+            &mut bus,
+            &vm,
+            &registry,
+            &ram,
+            0,
+            Box::new(Entropy::new(seed)),
+        )?];
         if let Some(path) = &config.disk {
             let file = OpenOptions::new()
                 .read(true)
@@ -433,7 +480,14 @@ impl<H: Hypervisor> Machine<H> {
                 .open(path)
                 .map_err(Error::Disk)?;
             let disk = Block::new(file).map_err(Error::Disk)?;
-            place_virtio(&mut bus, &vm, &ram, 1, Box::new(disk))?;
+            wired.push(place_virtio(
+                &mut bus,
+                &vm,
+                &registry,
+                &ram,
+                1,
+                Box::new(disk),
+            )?);
         }
 
         // Only vCPU 0 is entered in long mode. The rest wait in reset state
@@ -456,6 +510,9 @@ impl<H: Hypervisor> Machine<H> {
             memory,
             ram,
             devices: Devices(Arc::new(Mutex::new(bus))),
+            wired,
+            device_threads: Vec::new(),
+            registry,
             console: Arc::new(uart),
             vcpus,
             stoppers,
@@ -499,7 +556,7 @@ impl<H: Hypervisor> Machine<H> {
         Arc::clone(&self.console)
     }
 
-    /// Start each vCPU on its own thread.
+    /// Start each vCPU and each device on its own thread.
     ///
     /// Each thread holds a clone of `GuestRam`. Host pages are unmapped
     /// together with the last clone instead of the `Machine`.
@@ -541,6 +598,41 @@ impl<H: Hypervisor> Machine<H> {
                 })
             })
             .collect();
+
+        // One thread per device, waiting on its ioeventfd. It reads the same
+        // order as vCPU threads, so a paused guest is not captured with a
+        // chain half served. On error the thread exits and machine state is
+        // unchanged.
+        self.device_threads = self
+            .wired
+            .iter()
+            .map(|wired| {
+                let transport = wired.transport.clone();
+                let ioeventfd = Arc::clone(&wired.ioeventfd);
+                let orders = Arc::clone(&self.orders);
+                std::thread::spawn(move || {
+                    loop {
+                        // Signal during `notify` or a hold stays counted
+                        // for the next wait.
+                        match ioeventfd.wait(DEVICE_TICK) {
+                            Ok(Some(_rings)) => {
+                                if transport.with(|t| t.notify(VIRTIO_QUEUE)).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(_) => break,
+                        }
+                        match orders.standing() {
+                            Order::Run => {}
+                            Order::Hold => orders.wait_out_a_hold(),
+                            Order::Stop => break,
+                        }
+                    }
+                })
+            })
+            .collect();
+
         self.state = State::Running;
         Ok(())
     }
@@ -553,10 +645,8 @@ impl<H: Hypervisor> Machine<H> {
         self.state.valid_transition(State::Paused)?;
         self.orders.tell(Order::Hold);
         self.ask_out()?;
-        match self
-            .orders
-            .wait_until_still(self.threads.len(), HOLD_WITHIN)
-        {
+        let working = self.threads.len() + self.device_threads.len();
+        match self.orders.wait_until_still(working, HOLD_WITHIN) {
             Still::Held => {
                 self.state = State::Paused;
                 Ok(())
@@ -597,11 +687,15 @@ impl<H: Hypervisor> Machine<H> {
         for (index, thread) in self.threads.iter().enumerate() {
             self.vm.stop_vcpu(index as u16, thread)?;
         }
+        // Signal wakes each device thread now instead of at the next tick.
+        for wired in &self.wired {
+            wired.ioeventfd.signal()?;
+        }
         Ok(())
     }
 
-    /// Join the vCPU threads and return the exit of the first thread
-    /// joined, in creation order.
+    /// Join the vCPU threads, then the device threads, and return the exit
+    /// of the first vCPU thread joined, in creation order.
     ///
     /// Blocks on the stop flag, which a thread sets when it finishes. The
     /// rest are then signalled out of `run`, otherwise a vCPU waiting for
@@ -615,6 +709,9 @@ impl<H: Hypervisor> Machine<H> {
             let exit = thread.join().map_err(|_| Error::VcpuThread)?;
             first = first.or(Some(exit));
         }
+        for thread in self.device_threads.drain(..) {
+            thread.join().map_err(|_| Error::VcpuThread)?;
+        }
         self.state = State::Shutdown;
         first.unwrap_or(Ok(VmExit::Shutdown))
     }
@@ -623,6 +720,43 @@ impl<H: Hypervisor> Machine<H> {
 #[cfg(test)]
 mod tests {
     use crate::machine::*;
+
+    #[test]
+    fn test_hold_waits_for_all_threads() {
+        // Pause does not return until each told thread has parked.
+        use std::sync::mpsc;
+
+        let orders = Arc::new(Orders::default());
+        orders.tell(Order::Hold);
+
+        // One thread parks on the hold.
+        let parking = Arc::clone(&orders);
+        let (parked, told) = mpsc::channel();
+        std::thread::spawn(move || {
+            parking.wait_out_a_hold();
+            let _ = parked.send(());
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while orders.standing.lock().unwrap().parked < 1 {
+            assert!(std::time::Instant::now() < deadline, "no thread parked");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The wait is `Held` at its count and `Waiting` above it.
+        assert_eq!(
+            orders.wait_until_still(1, Duration::from_millis(50)),
+            Still::Held
+        );
+        assert_eq!(
+            orders.wait_until_still(2, Duration::from_millis(50)),
+            Still::Waiting,
+            "Held with a thread short of the count"
+        );
+
+        orders.tell(Order::Run);
+        told.recv_timeout(Duration::from_secs(5))
+            .expect("parked thread did not return in 5 s");
+    }
 
     #[test]
     fn test_layout_skips_mmio_hole() {
@@ -896,8 +1030,8 @@ mod tests {
         // `pause` returns once each thread is parked, not before.
         assert_eq!(
             machine.orders.standing.lock().unwrap().parked,
-            usize::from(config.vcpus),
-            "pause returned with vCPU thread not parked yet"
+            machine.threads.len() + machine.device_threads.len(),
+            "pause returned with thread not parked yet"
         );
 
         // Running guest writes thousands of bytes in 100 ms.

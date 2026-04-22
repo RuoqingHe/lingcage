@@ -14,7 +14,7 @@ pub mod boot;
 pub mod devices;
 #[cfg(feature = "hv")]
 pub mod hv;
-#[cfg(all(feature = "machine", target_arch = "x86_64"))]
+#[cfg(all(feature = "machine", target_os = "linux", target_arch = "x86_64"))]
 pub mod machine;
 #[cfg(feature = "mem")]
 pub mod mem;
