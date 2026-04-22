@@ -56,6 +56,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Hypervisor backend a VM is created on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Backend {
     /// KVM on Linux.
     Kvm,
@@ -69,6 +70,7 @@ pub enum Backend {
 
 /// Guest CPU architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Arch {
     /// 64-bit x86.
     X86_64,
@@ -96,6 +98,7 @@ pub enum Cap {
 /// example, as bytes in the layout of the backend which wrote them,
 /// tagged with that backend, the architecture and the layout version.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StateBlob {
     /// Backend which captured `data`.
     pub backend: Backend,

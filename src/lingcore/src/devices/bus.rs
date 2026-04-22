@@ -126,6 +126,11 @@ impl Bus {
         all
     }
 
+    /// Returns the number of placed devices.
+    pub fn count(&self) -> usize {
+        self.placed().count()
+    }
+
     /// Returns state of each device in `placed` order. Stateless device
     /// contributes `None`, so that the list lines up with the bus.
     pub fn capture(&self) -> Result<Vec<Option<Blob>>> {

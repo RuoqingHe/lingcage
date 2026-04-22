@@ -85,7 +85,7 @@ pub trait Device: Send {
 
 /// State captured from a device, bytes in the layout of the device
 /// itself, tagged with device kind and layout version.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Blob {
     /// Kind of device `data` was captured from.
     pub kind: String,

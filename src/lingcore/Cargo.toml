@@ -17,7 +17,9 @@ devices = ["dep:serde", "dep:serde_json", "vcpu"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
 # Guest assembly, RAM, kernel, bus and the run loop.
-machine = ["boot", "devices", "hv", "mem", "vcpu", "virtio"]
+machine = ["boot", "devices", "hv", "mem", "serde", "vcpu", "virtio"]
+# serde derives on the hv state types.
+serde = ["dep:serde"]
 # Guest RAM, held as vm-memory regions.
 mem = ["dep:vm-memory"]
 # vCPU run loop and the bus which it dispatches to.

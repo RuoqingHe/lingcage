@@ -27,11 +27,13 @@ use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
 use crate::hv::vcpu::{Stopper, Vcpu, VmExit};
 use crate::hv::vm::Vm;
+use crate::machine::snapshot::Snapshot;
 use crate::mem::GuestRam;
 use crate::vcpu::VmOps;
 
 mod cpuid;
 mod mptable;
+pub mod snapshot;
 
 /// End of low RAM. Window from here to 4 GiB holds the I/O APIC and the
 /// LAPIC.
@@ -107,6 +109,19 @@ pub enum Error {
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
+    /// Failed to encode or decode the snapshot.
+    #[error("failed to read or write snapshot")]
+    Snapshot,
+    /// Snapshot names a format version not supported by this build.
+    #[error("snapshot format version {version} is not supported")]
+    SnapshotFormat {
+        /// Format version named by the snapshot.
+        version: u32,
+    },
+    /// Shape of the snapshot (RAM size, vCPU count, device count) does not
+    /// match this guest, or its RAM image is too short.
+    #[error("snapshot does not fit shape of the guest")]
+    SnapshotShape,
     /// vCPU or device thread did not park within `HOLD_WITHIN`, or a vCPU
     /// thread still holds its vCPU.
     #[error("vCPU did not stop for pause")]
@@ -379,7 +394,10 @@ pub struct Machine<H: Hypervisor> {
     memory: <H::Vm as Vm>::Memory,
     ram: GuestRam,
     devices: Devices,
-    /// Share of the console UART for input, the bus holds the other one.
+    /// Guest shape from `Config`, checked against a snapshot on restore.
+    memory_size: u64,
+    vcpu_count: u16,
+    /// Share of the console UART for input, the bus owns the other one.
     console: Arc<dyn Receive>,
     /// vCPUs, each one shared with the thread driving it. Thread holds the
     /// lock for the duration of one `run` and releases it before parking,
@@ -514,6 +532,8 @@ impl<H: Hypervisor> Machine<H> {
             device_threads: Vec::new(),
             registry,
             console: Arc::new(uart),
+            memory_size: config.memory,
+            vcpu_count: config.vcpus,
             vcpus,
             stoppers,
             threads: Vec::new(),
@@ -548,6 +568,71 @@ impl<H: Hypervisor> Machine<H> {
             .collect::<Result<Vec<_>>>()?;
         let devices = self.devices.0.lock().unwrap().capture()?;
         Ok((processors, devices))
+    }
+
+    /// Capture the guest state other than RAM, through `read_state`. An
+    /// irqchip or clock the backend can not report is left out.
+    pub fn capture(&self) -> Result<Snapshot> {
+        let (processors, devices) = self.read_state()?;
+        Ok(Snapshot::new(
+            self.memory_size,
+            self.vcpu_count,
+            self.vm.get_irqchip_state().ok(),
+            self.vm.get_clock().ok(),
+            processors,
+            devices,
+        ))
+    }
+
+    /// Write guest RAM to `out`, region by region in layout order and
+    /// without header. Machine state is not checked.
+    pub fn write_memory(&self, out: &mut File) -> Result<()> {
+        for region in self.ram.regions() {
+            self.ram.drain_to(region.gpa, out, region.size as usize)?;
+        }
+        Ok(())
+    }
+
+    /// Read guest RAM from `from` as laid out by `write_memory`, a short
+    /// region is reported as `SnapshotShape`. Machine state is not checked.
+    pub fn read_memory(&mut self, from: &mut File) -> Result<()> {
+        for region in self.ram.regions() {
+            let want = region.size as usize;
+            if self.ram.fill_from(region.gpa, from, want)? != want {
+                return Err(Error::SnapshotShape);
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore `snapshot` onto this guest. `BadTransition` unless the guest
+    /// is `Created`, `SnapshotShape` unless the shape matches.
+    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<()> {
+        if self.state != State::Created {
+            return Err(Error::BadTransition {
+                from: self.state,
+                to: State::Created,
+            });
+        }
+        let devices = self.devices.0.lock().unwrap().count();
+        snapshot.fits(self.memory_size, self.vcpu_count, devices)?;
+
+        if let Some(blob) = snapshot.irqchip() {
+            self.vm.set_irqchip_state(blob)?;
+        }
+        for (vcpu, blob) in self.vcpus.iter().zip(snapshot.processors()) {
+            vcpu.lock().unwrap().set_state(blob)?;
+        }
+        self.devices.0.lock().unwrap().restore(snapshot.devices())?;
+        // Clock goes in last. `set_clock_elapsed` advances it by host time
+        // since capture, and refuses a blob without realtime reading, which
+        // is then set as captured.
+        if let Some(blob) = snapshot.clock()
+            && self.vm.set_clock_elapsed(blob).is_err()
+        {
+            self.vm.set_clock(blob)?;
+        }
+        Ok(())
     }
 
     /// Returns a share of the console, for input from another thread while
