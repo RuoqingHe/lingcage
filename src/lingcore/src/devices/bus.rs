@@ -142,7 +142,7 @@ impl Bus {
     /// Restore the list returned by `capture`, a list of another length is
     /// reported as `State`.
     pub fn restore(&mut self, blobs: &[Option<Blob>]) -> Result<()> {
-        if blobs.len() != self.placed().count() {
+        if blobs.len() != self.count() {
             return Err(Error::State);
         }
         for (placed, blob) in self.placed_mut().zip(blobs) {
