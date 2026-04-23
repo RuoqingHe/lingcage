@@ -10,6 +10,8 @@
 
 use std::io;
 
+use log::warn;
+
 use crate::devices::virtio::Device;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::{Blob, Device as BusDevice, Error as BusError, Result as BusResult};
@@ -206,6 +208,7 @@ impl Transport {
         // `FEATURES_OK` without `VIRTIO_F_VERSION_1` means legacy driver. Fail
         // the handshake here, before it lays out legacy rings.
         if value & STATUS_FEATURES_OK != 0 && self.driver_features & VERSION_1 == 0 {
+            warn!("FEATURES_OK without VIRTIO_F_VERSION_1, status set to FAILED");
             self.status = value | STATUS_FAILED;
             return;
         }
@@ -247,7 +250,10 @@ impl Transport {
                     Ok(queue) => slot.queue = Some(queue),
                     // Ring can not be indexed at that size, so it is not read
                     // and `DEVICE_NEEDS_RESET` is set.
-                    Err(_) => self.status |= STATUS_NEEDS_RESET,
+                    Err(refused) => {
+                        warn!("failed to build queue, DEVICE_NEEDS_RESET set: {refused}");
+                        self.status |= STATUS_NEEDS_RESET;
+                    }
                 }
             }
             _ => {}
@@ -266,7 +272,8 @@ impl Transport {
         };
         // Malformed chain sets `DEVICE_NEEDS_RESET`, it does not end the
         // run.
-        if self.device.notify(index, queue, &self.ram).is_err() {
+        if let Err(refused) = self.device.notify(index, queue, &self.ram) {
+            warn!("queue {index} not served, DEVICE_NEEDS_RESET set: {refused}");
             self.status |= STATUS_NEEDS_RESET;
             return Ok(());
         }
@@ -388,8 +395,11 @@ fn low(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Once};
+
+    use log::{Level, LevelFilter, Log, Metadata, Record};
 
     use crate::devices::virtio::mmio::*;
     use crate::devices::virtio::{Error, Result};
@@ -700,6 +710,95 @@ mod tests {
             "DEVICE_NEEDS_RESET not set after refused chain"
         );
         assert_eq!(line.raises(), 0, "line raised for refused chain");
+    }
+
+    thread_local! {
+        /// Records made on the calling thread. Parallel tests do not share them.
+        static RECORDED: RefCell<Vec<(Level, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Logger which pushes each record onto `RECORDED`.
+    struct Recorder;
+
+    impl Log for Recorder {
+        fn enabled(&self, _asked: &Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &Record) {
+            RECORDED.with_borrow_mut(|kept| kept.push((record.level(), record.args().to_string())));
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Install `Recorder` once per process and clear records of this thread.
+    fn recording() {
+        static RECORDER: Recorder = Recorder;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            log::set_logger(&RECORDER).expect("install the logger");
+            log::set_max_level(LevelFilter::Trace);
+        });
+        RECORDED.with_borrow_mut(Vec::clear);
+    }
+
+    #[test]
+    fn test_refusals_logged() {
+        // Each refusal is logged at `Warn` with its reason: `FEATURES_OK`
+        // without `VIRTIO_F_VERSION_1`, queue size not supported by the
+        // device, and a chain rejected by the backend.
+        recording();
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
+        let mut mmio = Transport::new(
+            Box::new(Filler {
+                refuse: true,
+                served: Arc::new(AtomicUsize::new(0)),
+            }),
+            ram,
+            Box::new(line.clone()),
+        );
+
+        // `FEATURES_OK` without `VIRTIO_F_VERSION_1`.
+        set(&mut mmio, STATUS, STATUS_FEATURES_OK);
+
+        // Queue of 6, which is not a power of two.
+        set(&mut mmio, STATUS, 0);
+        set(&mut mmio, QUEUE_NUM, 6);
+        set(&mut mmio, QUEUE_DESC_LOW, DESC_TABLE as u32);
+        set(&mut mmio, QUEUE_AVAIL_LOW, AVAIL_RING as u32);
+        set(&mut mmio, QUEUE_USED_LOW, USED_RING as u32);
+        set(&mut mmio, QUEUE_READY, 1);
+
+        // Queue of 8, kicked into a `Filler` set to refuse.
+        set(&mut mmio, STATUS, 0);
+        set(&mut mmio, QUEUE_NUM, 8);
+        set(&mut mmio, QUEUE_DESC_LOW, DESC_TABLE as u32);
+        set(&mut mmio, QUEUE_AVAIL_LOW, AVAIL_RING as u32);
+        set(&mut mmio, QUEUE_USED_LOW, USED_RING as u32);
+        set(&mut mmio, QUEUE_READY, 1);
+        set(&mut mmio, QUEUE_NOTIFY, 0);
+
+        let kept = RECORDED.with_borrow(Clone::clone);
+        let said: Vec<&str> = kept.iter().map(|(_, line)| line.as_str()).collect();
+        assert_eq!(kept.len(), 3, "records are {said:?}");
+        assert!(
+            kept.iter().all(|(level, _)| *level == Level::Warn),
+            "record not at Warn level: {kept:?}"
+        );
+        assert!(said[0].contains("VERSION_1"), "record was {:?}", said[0]);
+        // Size written to `QUEUE_NUM` should be in the record.
+        assert!(
+            said[1].contains("queue size 6 is not supported"),
+            "record was {:?}",
+            said[1]
+        );
+        assert!(
+            said[2].contains("indirect descriptors are not supported"),
+            "record was {:?}",
+            said[2]
+        );
     }
 
     #[test]

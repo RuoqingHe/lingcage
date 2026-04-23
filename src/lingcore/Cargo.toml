@@ -44,6 +44,7 @@ workspace = true
 
 [dependencies]
 linux-loader = { workspace = true, optional = true }
+log.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 thiserror.workspace = true

@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use log::error;
 use thiserror::Error;
 
 use crate::boot;
@@ -777,12 +778,17 @@ impl<H: Hypervisor> Machine<H> {
                         // for the next wait.
                         match ioeventfd.wait(DEVICE_TICK) {
                             Ok(Some(_rings)) => {
-                                if transport.with(|t| t.notify(VIRTIO_QUEUE)).is_err() {
+                                if let Err(unanswered) = transport.with(|t| t.notify(VIRTIO_QUEUE))
+                                {
+                                    error!("device thread exits, notify failed: {unanswered}");
                                     break;
                                 }
                             }
                             Ok(None) => {}
-                            Err(_) => break,
+                            Err(unheard) => {
+                                error!("device thread exits, ioeventfd wait failed: {unheard}");
+                                break;
+                            }
                         }
                         match orders.standing() {
                             Order::Run => {}
