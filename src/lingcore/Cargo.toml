@@ -17,11 +17,13 @@ devices = ["dep:serde", "dep:serde_json", "vcpu"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
 # Guest assembly, RAM, kernel, bus and the run loop. x86_64 Linux only.
-machine = ["boot", "devices", "hv", "mem", "serde", "vcpu", "virtio"]
+machine = ["boot", "devices", "hv", "mem", "seccomp", "serde", "vcpu", "virtio"]
 # serde derives on the hv state types.
 serde = ["dep:serde"]
 # Guest RAM, held as vm-memory regions.
 mem = ["dep:libc", "dep:vm-memory"]
+# Per-thread syscall allowlists. x86_64 Linux only.
+seccomp = ["dep:libc", "dep:seccompiler"]
 # vCPU run loop and the bus which it dispatches to.
 vcpu = ["hv"]
 # Virtio devices and the split virtqueue.
@@ -51,4 +53,5 @@ vm-memory = { workspace = true, optional = true }
 kvm-bindings = { workspace = true, optional = true }
 kvm-ioctls = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
+seccompiler = { workspace = true, optional = true }
 vmm-sys-util = { workspace = true, optional = true }

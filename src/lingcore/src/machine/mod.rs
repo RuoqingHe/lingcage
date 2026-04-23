@@ -29,6 +29,7 @@ use crate::hv::vcpu::{Stopper, Vcpu, VmExit};
 use crate::hv::vm::Vm;
 use crate::machine::snapshot::Snapshot;
 use crate::mem::GuestRam;
+use crate::seccomp::{Filter, Refusal, Thread};
 use crate::vcpu::VmOps;
 
 mod cpuid;
@@ -129,9 +130,15 @@ pub enum Error {
     /// Guest stopped while `pause` was waiting.
     #[error("guest stopped during pause")]
     StoppedWhileHeld,
-    /// vCPU or device thread panicked.
+    /// vCPU thread panicked.
     #[error("vCPU thread panicked")]
     VcpuThread,
+    /// Device thread panicked.
+    #[error("device thread panicked")]
+    DeviceThread,
+    /// Failed to assemble or install an allowlist on a thread.
+    #[error("failed to confine guest threads")]
+    Seccomp(#[from] crate::seccomp::Error),
     /// `Config::vcpus` is zero.
     #[error("guest needs at least one vCPU")]
     NoVcpus,
@@ -163,6 +170,9 @@ pub struct Config {
     pub cmdline: String,
     /// File backing the disk of the guest, if any.
     pub disk: Option<PathBuf>,
+    /// Action on a syscall outside allowlist of a thread, `None` installs
+    /// no allowlist.
+    pub confine: Option<Refusal>,
 }
 
 /// Returns the number of virtio devices. Entropy source is always there,
@@ -415,7 +425,8 @@ pub struct Machine<H: Hypervisor> {
     /// Virtio devices, each with the ioeventfd bound on its notify register.
     wired: Vec<Wired>,
     /// One thread per device once started, each waiting on its ioeventfd.
-    device_threads: Vec<JoinHandle<()>>,
+    /// `Err` means an allowlist which failed to install.
+    device_threads: Vec<JoinHandle<Result<()>>>,
     /// Registry the ioeventfds were created from, kept while they are bound.
     #[expect(dead_code, reason = "kept for the bindings")]
     registry: <H::Vm as Vm>::IoeventFdRegistry,
@@ -425,6 +436,8 @@ pub struct Machine<H: Hypervisor> {
     /// One `Stopper` per vCPU, in creation order, used by `ask_out`.
     stoppers: Vec<Box<dyn Stopper>>,
     orders: Arc<Orders>,
+    /// `Config::confine`, read when the threads start.
+    confine: Option<Refusal>,
     state: State,
 }
 
@@ -583,6 +596,7 @@ impl<H: Hypervisor> Machine<H> {
             stoppers,
             threads: Vec::new(),
             orders: Arc::new(Orders::default()),
+            confine: config.confine,
             state: State::Created,
         })
     }
@@ -690,11 +704,18 @@ impl<H: Hypervisor> Machine<H> {
     ///
     /// Each thread holds a clone of `GuestRam`. Host pages are unmapped
     /// together with the last clone instead of the `Machine`.
+    ///
+    /// With `Config::confine` set, allowlists are assembled here and each
+    /// thread installs its own before its first run, so a list which fails
+    /// to assemble is reported by this call.
     pub fn start(&mut self) -> Result<()>
     where
         H: 'static,
     {
         self.state.valid_transition(State::Running)?;
+        let confine = |thread| self.confine.map(|how| Filter::new(thread, how)).transpose();
+        let driving = confine(Thread::Vcpu)?;
+        let working = confine(Thread::Device)?;
         self.threads = self
             .vcpus
             .iter()
@@ -704,9 +725,15 @@ impl<H: Hypervisor> Machine<H> {
                 let ram = self.ram.clone();
                 let orders = Arc::clone(&self.orders);
                 let vcpu = Arc::clone(vcpu);
+                let driving = driving.clone();
                 std::thread::spawn(move || {
                     let _ram = ram;
                     let _signal = SignalOnDrop(Arc::clone(&orders));
+                    // From here on the thread runs the guest and writes the
+                    // console, so the vCPU allowlist goes on now.
+                    if let Some(filter) = driving {
+                        filter.confine()?;
+                    }
                     loop {
                         // Lock is released before the thread parks on a hold.
                         let exit = {
@@ -740,7 +767,11 @@ impl<H: Hypervisor> Machine<H> {
                 let transport = wired.transport.clone();
                 let ioeventfd = Arc::clone(&wired.ioeventfd);
                 let orders = Arc::clone(&self.orders);
+                let working = working.clone();
                 std::thread::spawn(move || {
+                    if let Some(filter) = working {
+                        filter.confine()?;
+                    }
                     loop {
                         // Signal during `notify` or a hold stays counted
                         // for the next wait.
@@ -759,6 +790,7 @@ impl<H: Hypervisor> Machine<H> {
                             Order::Stop => break,
                         }
                     }
+                    Ok(())
                 })
             })
             .collect();
@@ -840,7 +872,7 @@ impl<H: Hypervisor> Machine<H> {
             first = first.or(Some(exit));
         }
         for thread in self.device_threads.drain(..) {
-            thread.join().map_err(|_| Error::VcpuThread)?;
+            thread.join().map_err(|_| Error::DeviceThread)??;
         }
         self.state = State::Shutdown;
         first.unwrap_or(Ok(VmExit::Shutdown))
@@ -956,6 +988,9 @@ mod tests {
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
             disk: None,
+            // With `Trap`, a syscall missed by the allowlists ends the test
+            // with `SIGSYS`.
+            confine: Some(Refusal::Trap),
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1023,6 +1058,7 @@ mod tests {
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
             disk: None,
+            confine: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1069,6 +1105,7 @@ mod tests {
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
             disk: None,
+            confine: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1135,6 +1172,7 @@ mod tests {
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
             disk: None,
+            confine: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1227,6 +1265,7 @@ mod tests {
             initrd: None,
             cmdline: "console=ttyS0".to_string(),
             disk: None,
+            confine: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1265,6 +1304,7 @@ mod tests {
             initrd: None,
             cmdline: String::new(),
             disk: None,
+            confine: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1308,6 +1348,7 @@ mod tests {
             initrd: None,
             cmdline: String::new(),
             disk: None,
+            confine: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1358,6 +1399,7 @@ mod tests {
             initrd: None,
             cmdline: String::new(),
             disk: None,
+            confine: None,
         };
         #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
         {
@@ -1386,6 +1428,7 @@ mod tests {
                 initrd: None,
                 cmdline: String::new(),
                 disk: None,
+                confine: None,
             };
             assert!(matches!(
                 Machine::new(&hv, &config, Vec::new()),
