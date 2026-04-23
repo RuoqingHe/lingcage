@@ -385,7 +385,16 @@ impl VmOps for Devices {
     }
 }
 
-/// Assembled guest, with its vCPU at the kernel entry.
+/// Starting point of an assembled guest.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Entry {
+    /// Kernel loaded into RAM, vCPU 0 at its entry.
+    Boot,
+    /// RAM cloned from a template. vCPUs are written by `restore`.
+    Restored,
+}
+
+/// Assembled guest, RAM, bus and vCPUs, plus the threads driving them.
 pub struct Machine<H: Hypervisor> {
     vm: H::Vm,
     /// Address space the host pages are mapped into. Dropping it unmaps
@@ -422,14 +431,6 @@ pub struct Machine<H: Hypervisor> {
 impl<H: Hypervisor> Machine<H> {
     /// Assemble a guest on `hv` from `config`, with serial console writing
     /// to `console`, and leave vCPU 0 at the kernel entry.
-    ///
-    /// Kernel is loaded before boot parameters are written, since they are
-    /// built from its `setup_header`. CPUID is set before the vCPU runs,
-    /// since a kernel reads its model and feature bits from it.
-    ///
-    /// The irqchip is created before the vCPU, since `KVM_CREATE_IRQCHIP`
-    /// fails once a vCPU exists. With irqchip in the kernel, `hlt` blocks
-    /// inside the run instead of exiting as `Halt`.
     pub fn new<W>(hv: &H, config: &Config, console: W) -> Result<Self>
     where
         W: Write + Send + 'static,
@@ -440,10 +441,43 @@ impl<H: Hypervisor> Machine<H> {
         // `Arc<dyn IoeventFd>`.
         <<H::Vm as Vm>::IoeventFdRegistry as IoeventFdRegistry>::IoeventFd: 'static,
     {
+        let ram = GuestRam::new(&layout(config.memory))?;
+        Machine::assemble(hv, config, console, ram, Entry::Boot)
+    }
+
+    /// Assemble a guest over the RAM image in `template`, mapped private
+    /// and copy on write, so writes of the guest leave the template as it
+    /// was. The image already holds the kernel and tables. Registers and
+    /// device state arrive through `restore`.
+    pub fn cloned<W>(hv: &H, config: &Config, console: W, template: &File) -> Result<Self>
+    where
+        W: Write + Send + 'static,
+        <H::Vm as Vm>::IrqSender: 'static,
+        <<H::Vm as Vm>::IoeventFdRegistry as IoeventFdRegistry>::IoeventFd: 'static,
+    {
+        let ram = GuestRam::cloned_from(&layout(config.memory), template)?;
+        Machine::assemble(hv, config, console, ram, Entry::Restored)
+    }
+
+    /// Wire up a guest over `ram` at `entry`.
+    ///
+    /// On `Boot`, kernel is loaded before boot parameters are written,
+    /// since they are built from its `setup_header`. CPUID is set before
+    /// the vCPU runs, since a kernel reads its model and feature bits from
+    /// it.
+    ///
+    /// The irqchip is created before the vCPU, since `KVM_CREATE_IRQCHIP`
+    /// fails once a vCPU exists. With irqchip in the kernel, `hlt` blocks
+    /// inside the run instead of exiting as `Halt`.
+    fn assemble<W>(hv: &H, config: &Config, console: W, ram: GuestRam, entry: Entry) -> Result<Self>
+    where
+        W: Write + Send + 'static,
+        <H::Vm as Vm>::IrqSender: 'static,
+        <<H::Vm as Vm>::IoeventFdRegistry as IoeventFdRegistry>::IoeventFd: 'static,
+    {
         if config.vcpus == 0 {
             return Err(Error::NoVcpus);
         }
-        let ram = GuestRam::new(&layout(config.memory))?;
         let vm = hv.create_vm()?;
         vm.enable_in_kernel_irqchip()?;
         let memory = vm.create_vm_memory()?;
@@ -451,29 +485,38 @@ impl<H: Hypervisor> Machine<H> {
             memory.mem_map(region.gpa, region.size, region.hva, MemMapOption::default())?;
         }
 
-        let mut image = File::open(&config.kernel).map_err(Error::Image)?;
-        let kernel = boot::load_kernel(&ram, &mut image)?;
-        let initrd = match &config.initrd {
-            Some(path) => {
-                let mut image = File::open(path).map_err(Error::Image)?;
-                Some(boot::load_initrd(&ram, &kernel, &mut image)?)
+        // RAM of a cloned guest already holds the kernel, boot parameters
+        // and tables.
+        let kernel = match entry {
+            Entry::Boot => {
+                let mut image = File::open(&config.kernel).map_err(Error::Image)?;
+                let kernel = boot::load_kernel(&ram, &mut image)?;
+                let initrd = match &config.initrd {
+                    Some(path) => {
+                        let mut image = File::open(path).map_err(Error::Image)?;
+                        Some(boot::load_initrd(&ram, &kernel, &mut image)?)
+                    }
+                    None => None,
+                };
+                // Neither a bus nor a table names a virtio MMIO device on
+                // PC, so the kernel reads size, address and line of each
+                // one from command line, in the order register blocks are
+                // placed below.
+                let mut cmdline = config.cmdline.clone();
+                for slot in 0..virtio_count(config) {
+                    cmdline.push_str(&format!(
+                        " virtio_mmio.device={:#x}@{:#x}:{}",
+                        mmio::SIZE,
+                        virtio_at(slot),
+                        VIRTIO_IRQ + slot
+                    ));
+                }
+                boot::write_boot_params(&ram, &kernel, &cmdline, initrd)?;
+                mptable::write(&ram, config.vcpus)?;
+                Some(kernel)
             }
-            None => None,
+            Entry::Restored => None,
         };
-        // Neither a bus nor a table names a virtio MMIO device on PC, so
-        // the kernel reads size, address and line of each one from command
-        // line, in the order register blocks are placed below.
-        let mut cmdline = config.cmdline.clone();
-        for slot in 0..virtio_count(config) {
-            cmdline.push_str(&format!(
-                " virtio_mmio.device={:#x}@{:#x}:{}",
-                mmio::SIZE,
-                virtio_at(slot),
-                VIRTIO_IRQ + slot
-            ));
-        }
-        boot::write_boot_params(&ram, &kernel, &cmdline, initrd)?;
-        mptable::write(&ram, config.vcpus)?;
 
         let mut bus = Bus::new();
         let line = vm.create_irq_sender(COM1_IRQ)?;
@@ -516,8 +559,10 @@ impl<H: Hypervisor> Machine<H> {
         for index in 0..config.vcpus {
             let mut vcpu = vm.create_vcpu(index)?;
             vcpu.set_cpuid(&cpuid::for_vcpu(&host, index))?;
-            if index == BOOT_VCPU {
-                boot::enter_long_mode(&ram, &mut vcpu, &kernel)?;
+            // vCPU 0 of a cloned guest is written by `restore` instead of
+            // entered at the kernel.
+            if let (Some(kernel), BOOT_VCPU) = (&kernel, index) {
+                boot::enter_long_mode(&ram, &mut vcpu, kernel)?;
             }
             stoppers.push(vcpu.stopper());
             vcpus.push(Arc::new(Mutex::new(vcpu)));

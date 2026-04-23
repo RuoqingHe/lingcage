@@ -14,8 +14,12 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use vm_memory::mmap::FromRangesError;
+#[cfg(target_os = "linux")]
+use vm_memory::mmap::MmapRegion;
 use vm_memory::region::GuestRegionCollectionError;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+#[cfg(target_os = "linux")]
+use vm_memory::{FileOffset, GuestRegionMmap};
 
 /// Errors thrown while laying out or accessing guest RAM.
 #[derive(Debug, Error)]
@@ -85,6 +89,39 @@ impl GuestRam {
             FromRangesError::Collection(GuestRegionCollectionError::MemoryRegionOverlap) => {
                 Error::Overlap
             }
+            _ => Error::Take,
+        })?;
+        Ok(GuestRam {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Map the RAM image in `template` for each `(gpa, size)` region, with
+    /// the regions back to back in given order, as `MAP_PRIVATE`. A page is
+    /// read from the file on first access, and a written page becomes a
+    /// private copy of the guest, so the template is unchanged. The order is
+    /// the same as returned by `regions` and written by
+    /// `Machine::write_memory`.
+    #[cfg(target_os = "linux")]
+    pub fn cloned_from(regions: &[(u64, u64)], template: &File) -> Result<Self> {
+        let mut at = 0u64;
+        let mut mapped = Vec::with_capacity(regions.len());
+        for &(gpa, size) in regions {
+            let size = usize::try_from(size).map_err(|_| Error::Take)?;
+            let offset = FileOffset::new(template.try_clone().map_err(|_| Error::Take)?, at);
+            let region = MmapRegion::build(
+                Some(offset),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_NORESERVE | libc::MAP_PRIVATE,
+            )
+            .map_err(|_| Error::Take)?;
+            mapped.push(GuestRegionMmap::new(region, GuestAddress(gpa)).ok_or(Error::Take)?);
+            at = at.checked_add(size as u64).ok_or(Error::Take)?;
+        }
+        let inner = GuestMemoryMmap::from_regions(mapped).map_err(|err| match err {
+            GuestRegionCollectionError::UnsortedMemoryRegions => Error::Unsorted,
+            GuestRegionCollectionError::MemoryRegionOverlap => Error::Overlap,
             _ => Error::Take,
         })?;
         Ok(GuestRam {
