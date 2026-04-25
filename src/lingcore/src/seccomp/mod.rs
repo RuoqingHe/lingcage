@@ -16,6 +16,8 @@ use seccompiler::{
 };
 use thiserror::Error;
 
+mod report;
+
 /// Errors thrown while assembling an allowlist or installing it on a
 /// thread.
 #[derive(Debug, Error)]
@@ -26,6 +28,9 @@ pub enum Error {
     /// Kernel refused the program.
     #[error("failed to install the syscall allowlist")]
     Install(#[source] seccompiler::Error),
+    /// `sigaction` failed to register the `SIGSYS` handler.
+    #[error("failed to install the SIGSYS handler")]
+    Report(#[source] std::io::Error),
 }
 
 /// Result alias for the seccomp module.
@@ -53,14 +58,15 @@ pub enum Refusal {
 }
 
 /// Syscalls in each allowlist, `brk` and the `mmap` family for the
-/// allocator, `futex` for a hold, `rt_sigreturn` for a kick, `exit`, and
-/// `write`.
+/// allocator, `futex` for a hold, `rt_sigreturn` for a kick, `exit`,
+/// `exit_group` for the `SIGSYS` handler, and `write`.
 ///
 /// Not listed: process creation, sockets, `ptrace`, `openat`, `mount`
 /// and module loading.
 const COMMON: &[libc::c_long] = &[
     libc::SYS_brk,
     libc::SYS_exit,
+    libc::SYS_exit_group,
     libc::SYS_futex,
     libc::SYS_madvise,
     libc::SYS_mmap,
@@ -83,6 +89,14 @@ const IOCTL_REQUEST: u8 = 1;
 const KVM_RUN: u64 = 0xae80;
 
 impl Thread {
+    /// Returns the name of this thread in a `SIGSYS` report.
+    fn tag(self) -> &'static str {
+        match self {
+            Thread::Vcpu => "vcpu",
+            Thread::Device => "device",
+        }
+    }
+
     /// Returns the syscalls needed by this thread beyond `COMMON`, with the
     /// conditions on their arguments. Empty rule list allows the syscall
     /// unconditionally.
@@ -118,7 +132,11 @@ impl Thread {
 /// installing, so that a list which fails to assemble is reported by
 /// the caller starting the threads.
 #[derive(Clone)]
-pub struct Filter(seccompiler::BpfProgram);
+pub struct Filter {
+    program: seccompiler::BpfProgram,
+    thread: Thread,
+    refusal: Refusal,
+}
 
 impl Filter {
     /// Assemble the allowlist for `thread`, with `refusal` as the action on
@@ -133,15 +151,24 @@ impl Filter {
         };
         let filter = SeccompFilter::new(rules, refused, SeccompAction::Allow, TargetArch::x86_64)
             .map_err(Error::Assemble)?;
-        seccompiler::BpfProgram::try_from(filter)
-            .map(Filter)
-            .map_err(Error::Assemble)
+        let program = seccompiler::BpfProgram::try_from(filter).map_err(Error::Assemble)?;
+        Ok(Filter {
+            program,
+            thread,
+            refusal,
+        })
     }
 
     /// Install the allowlist on the calling thread, it stays until the
     /// thread exits. Call it from inside the thread, before the guest runs.
+    ///
+    /// Under `Refusal::Trap` the `SIGSYS` handler is registered first,
+    /// since `rt_sigaction` is on no allowlist.
     pub fn confine(&self) -> Result<()> {
-        seccompiler::apply_filter(&self.0).map_err(Error::Install)
+        if self.refusal == Refusal::Trap {
+            report::arm(self.thread.tag()).map_err(Error::Report)?;
+        }
+        seccompiler::apply_filter(&self.program).map_err(Error::Install)
     }
 }
 
@@ -247,5 +274,41 @@ mod tests {
             "KVM_RUN was allowed on a device thread"
         );
         assert_eq!(seeking, (-1, libc::EBADF), "lseek did not reach the kernel");
+    }
+    #[test]
+    #[ignore = "brings its process down, run by test_sigsys_report"]
+    fn test_helper_trap_on_socket() {
+        // Helper run by `test_sigsys_report` in a child process, confines
+        // the thread under `Refusal::Trap`, then calls `socket`. Handler
+        // ends the process.
+        let filter = Filter::new(Thread::Vcpu, Refusal::Trap).expect("assemble allowlist");
+        filter.confine().expect("install allowlist");
+        // SAFETY: `socket` takes no pointer. Under `Refusal::Trap` the kernel
+        // raises `SIGSYS` instead of returning.
+        let opened = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        panic!("socket returned {opened} under a trapping allowlist");
+    }
+
+    #[test]
+    fn test_sigsys_report() {
+        // Report names the thread and the syscall number. It is read from
+        // a child process, since the handler ends the process which made
+        // it.
+        let ran = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "--ignored",
+                "seccomp::tests::test_helper_trap_on_socket",
+            ])
+            .output()
+            .expect("run helper");
+        let said = String::from_utf8_lossy(&ran.stderr);
+        let owed = format!("the vcpu thread was refused syscall {}", libc::SYS_socket);
+        assert!(said.contains(&owed), "stderr was:\n{said}");
+        assert_eq!(
+            ran.status.code(),
+            Some(128 + libc::SIGSYS),
+            "exit status is not 128 + SIGSYS"
+        );
     }
 }
