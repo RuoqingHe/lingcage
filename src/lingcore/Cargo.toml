@@ -10,6 +10,8 @@ version.workspace = true
 
 [features]
 default = ["hv"]
+# ACPI tables in guest RAM. x86_64 only.
+acpi = ["dep:acpi_tables", "mem"]
 # Kernel loading into guest RAM. x86_64 only.
 boot = ["dep:linux-loader", "hv", "mem"]
 # Guest-facing devices, serde carries their state.
@@ -17,7 +19,17 @@ devices = ["dep:serde", "dep:serde_json", "vcpu"]
 # Hypervisor backends, only KVM is implemented for now.
 hv = []
 # Guest assembly, RAM, kernel, bus and the run loop. x86_64 Linux only.
-machine = ["boot", "devices", "hv", "mem", "seccomp", "serde", "vcpu", "virtio"]
+machine = [
+  "acpi",
+  "boot",
+  "devices",
+  "hv",
+  "mem",
+  "seccomp",
+  "serde",
+  "vcpu",
+  "virtio",
+]
 # serde derives on the hv state types.
 serde = ["dep:serde"]
 # Guest RAM, held as vm-memory regions.
@@ -43,6 +55,7 @@ kvm = [
 workspace = true
 
 [dependencies]
+acpi_tables = { workspace = true, optional = true }
 linux-loader = { workspace = true, optional = true }
 log.workspace = true
 serde = { workspace = true, optional = true }

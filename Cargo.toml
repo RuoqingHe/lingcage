@@ -14,6 +14,7 @@ repository = "https://github.com/RuoqingHe/lingcage"
 version = "0.1.0"
 
 [workspace.dependencies]
+acpi_tables = "0.2.1"
 kvm-bindings = "0.14.0"
 kvm-ioctls = "0.24.0"
 libc = "0.2.180"

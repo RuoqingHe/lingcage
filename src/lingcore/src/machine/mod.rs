@@ -33,6 +33,7 @@ use crate::mem::GuestRam;
 use crate::seccomp::{Filter, Refusal, Thread};
 use crate::vcpu::VmOps;
 
+mod acpi;
 mod cpuid;
 mod mptable;
 pub mod snapshot;
@@ -111,6 +112,9 @@ pub enum Error {
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
+    /// ACPI tables overrun the area below the RSDP.
+    #[error("ACPI tables do not fit below RSDP")]
+    NoRoomForTables,
     /// Failed to encode or decode the snapshot.
     #[error("failed to read or write snapshot")]
     Snapshot,
@@ -512,20 +516,7 @@ impl<H: Hypervisor> Machine<H> {
                     }
                     None => None,
                 };
-                // Neither a bus nor a table names a virtio MMIO device on
-                // PC, so the kernel reads size, address and line of each
-                // one from command line, in the order register blocks are
-                // placed below.
-                let mut cmdline = config.cmdline.clone();
-                for slot in 0..virtio_count(config) {
-                    cmdline.push_str(&format!(
-                        " virtio_mmio.device={:#x}@{:#x}:{}",
-                        mmio::SIZE,
-                        virtio_at(slot),
-                        VIRTIO_IRQ + slot
-                    ));
-                }
-                boot::write_boot_params(&ram, &kernel, &cmdline, initrd)?;
+                boot::write_boot_params(&ram, &kernel, &config.cmdline, initrd)?;
                 mptable::write(&ram, config.vcpus)?;
                 Some(kernel)
             }
@@ -565,8 +556,30 @@ impl<H: Hypervisor> Machine<H> {
             )?);
         }
 
+        // The tables name the console and virtio blocks on the bus, with
+        // their lines, so command line carries no `virtio_mmio.device=`
+        // fragments.
+        acpi::lay(
+            &ram,
+            &acpi::Parts {
+                vcpus: config.vcpus,
+                console: acpi::Named {
+                    at: u64::from(COM1),
+                    room: u64::from(COM1_SIZE),
+                    line: Some(COM1_IRQ),
+                },
+                virtio: (0..virtio_count(config))
+                    .map(|slot| acpi::Named {
+                        at: virtio_at(slot),
+                        room: mmio::SIZE,
+                        line: Some(VIRTIO_IRQ + slot),
+                    })
+                    .collect(),
+            },
+        )?;
+
         // Only vCPU 0 is entered in long mode. The rest wait in reset state
-        // for the INIT sent by kernel once it has read the MP table.
+        // for the INIT sent by kernel once it has read the MADT.
         let host = hv.supported_cpuid()?;
         let mut vcpus = Vec::with_capacity(usize::from(config.vcpus));
         let mut stoppers = Vec::with_capacity(usize::from(config.vcpus));
