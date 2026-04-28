@@ -29,6 +29,7 @@ use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
 use crate::hv::vcpu::{Stopper, Vcpu, VmExit};
 use crate::hv::vm::Vm;
 use crate::machine::snapshot::Snapshot;
+use crate::machine::vmgenid::VmGenId;
 use crate::mem::GuestRam;
 use crate::seccomp::{Filter, Refusal, Thread};
 use crate::vcpu::VmOps;
@@ -37,6 +38,7 @@ mod acpi;
 mod cpuid;
 mod mptable;
 pub mod snapshot;
+pub mod vmgenid;
 
 /// End of low RAM. Window from here to 4 GiB holds the I/O APIC and the
 /// LAPIC.
@@ -61,6 +63,10 @@ const COM1_IRQ: u8 = 4;
 /// MMIO address of the first virtio register block, in the hole below
 /// the APICs. Each device takes the next block.
 const VIRTIO_AT: u64 = 0xd000_0000;
+
+/// IRQ of the GED. No device on the bus takes line 9, which is the SCI
+/// on a PC.
+const EVENTS_IRQ: u8 = 9;
 
 /// IRQ of the first virtio device, an ISA line free on PC. Each device
 /// takes the next line.
@@ -103,7 +109,7 @@ pub enum Error {
     /// Failed to open or read the kernel image.
     #[error("failed to read kernel image")]
     Image(#[source] std::io::Error),
-    /// Failed to open the entropy source file.
+    /// Failed to open or read the entropy source file.
     #[error("failed to open entropy source")]
     Entropy(#[source] std::io::Error),
     /// Failed to open the disk file or read its length.
@@ -112,8 +118,8 @@ pub enum Error {
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
-    /// ACPI tables overrun the area below the RSDP.
-    #[error("ACPI tables do not fit below RSDP")]
+    /// ACPI tables overrun the area below the VM generation ID.
+    #[error("ACPI tables overrun the area below the VM generation ID")]
     NoRoomForTables,
     /// Failed to encode or decode the snapshot.
     #[error("failed to read or write snapshot")]
@@ -441,6 +447,8 @@ pub struct Machine<H: Hypervisor> {
     /// One `Stopper` per vCPU, in creation order, used by `ask_out`.
     stoppers: Vec<Box<dyn Stopper>>,
     orders: Arc<Orders>,
+    /// VM generation ID, renewed by `restore`.
+    genid: VmGenId,
     /// `Config::confine`, read when the threads start.
     confine: Option<Refusal>,
     state: State,
@@ -529,6 +537,13 @@ impl<H: Hypervisor> Machine<H> {
         bus.place_port(COM1, COM1_SIZE, Box::new(uart.clone()))?;
         bus.place_port(I8042_COMMAND, 1, Box::new(I8042))?;
 
+        // The identifier goes into RAM before the tables, which name its
+        // address. A cloned guest gets a fresh one from `restore`.
+        let announce = vm.create_irq_sender(EVENTS_IRQ)?;
+        let drawn = File::open(ENTROPY_SOURCE).map_err(Error::Entropy)?;
+        let mut genid = VmGenId::new(acpi::GENID_AT, Box::new(announce), drawn);
+        genid.lay(&ram)?;
+
         let registry = vm.create_ioeventfd_registry()?;
         let seed = File::open(ENTROPY_SOURCE).map_err(Error::Entropy)?;
         let mut wired = vec![place_virtio(
@@ -563,6 +578,8 @@ impl<H: Hypervisor> Machine<H> {
             &ram,
             &acpi::Parts {
                 vcpus: config.vcpus,
+                genid: genid.at(),
+                events: EVENTS_IRQ,
                 console: acpi::Named {
                     at: u64::from(COM1),
                     room: u64::from(COM1_SIZE),
@@ -610,6 +627,7 @@ impl<H: Hypervisor> Machine<H> {
             stoppers,
             threads: Vec::new(),
             orders: Arc::new(Orders::default()),
+            genid,
             confine: config.confine,
             state: State::Created,
         })
@@ -697,6 +715,10 @@ impl<H: Hypervisor> Machine<H> {
             vcpu.lock().unwrap().set_state(blob)?;
         }
         self.devices.0.lock().unwrap().restore(snapshot.devices())?;
+        // Restored RAM carries identifier and random pool of the template.
+        // A fresh one with notification makes the kernel reseed at once
+        // (`add_vmfork_randomness` in `drivers/char/random.c`).
+        self.genid.renew(&self.ram)?;
         // Clock goes in last. `set_clock_elapsed` advances it by host time
         // since capture, and refuses a blob without realtime reading, which
         // is then set as captured.

@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! ACPI tables of a kernel booted without firmware. The RSDP, an XSDT
-//! listing the FADT and MADT, and a DSDT naming the console and virtio
-//! register blocks with their interrupt lines.
+//! listing the FADT and MADT, and a DSDT naming the VM generation ID,
+//! the GED, the console and virtio register blocks with their lines.
 
 use acpi_tables::fadt::{FADTBuilder, Flags};
 use acpi_tables::madt::{
@@ -29,6 +29,10 @@ const TABLES_AT: u64 = 0x000a_0000;
 /// Alignment of address of each table.
 const ALIGN: u64 = 8;
 
+/// Address of the VM generation ID, `vmgenid::ROOM` bytes below the RSDP.
+/// Table area ends here.
+pub const GENID_AT: u64 = POINTER_AT - crate::machine::vmgenid::ROOM;
+
 /// Length of `DESCRIPTION_HEADER` in bytes (ACPI 6.5, section 5.2.6).
 const HEADER: u32 = 36;
 
@@ -46,6 +50,25 @@ const IO_APIC: u32 = 0xfec0_0000;
 
 /// `I/O APIC ID` field of I/O APIC structure of the MADT.
 const IO_APIC_ID: u8 = 0;
+
+/// `_HID` of the VM generation ID device, the first id listed by
+/// `vmgenid_acpi_ids` (`drivers/virt/vmgenid.c`).
+const GENID_HARDWARE: aml::AmlStr = "VMGENCTR";
+
+/// `_CID` of the same device, `vmgenid_acpi_ids` has it as
+/// `VM_GEN_COUNTER`.
+const GENID_COMPATIBLE: aml::AmlStr = "VM_Gen_Counter";
+
+/// `_HID` of the Generic Event Device, the id matched by
+/// `drivers/acpi/evged.c`.
+const EVENTS_HARDWARE: aml::AmlStr = "ACPI0013";
+
+/// `Notify` value 0x80, the first device specific one. Handler of the
+/// driver is installed for `ACPI_DEVICE_NOTIFY`, the range from 0x80 up.
+const CHANGED: aml::Usize = 0x80;
+
+/// Namespace path of the VM generation ID device.
+const GENID_PATH: &str = "\\_SB_.VGEN";
 
 /// `_HID` of a virtio-mmio device, the id listed by
 /// `virtio_mmio_acpi_match`.
@@ -71,13 +94,17 @@ pub struct Named {
 pub struct Parts {
     /// Number of vCPUs, one `Processor Local APIC` structure for each.
     pub vcpus: u16,
+    /// Address of the VM generation ID, `\_SB_.VGEN`.
+    pub genid: u64,
+    /// Interrupt line of the GED, `\_SB_.GED_`.
+    pub events: u8,
     /// Serial console, `\_SB_.COM1`.
     pub console: Named,
     /// Virtio register blocks, `\_SB_.V000` onward in slot order.
     pub virtio: Vec<Named>,
 }
 
-/// Write cursor over the table area, from `TABLES_AT` up to `POINTER_AT`.
+/// Write cursor over the table area, from `TABLES_AT` up to `GENID_AT`.
 struct Laying<'a> {
     ram: &'a GuestRam,
     next: u64,
@@ -85,11 +112,11 @@ struct Laying<'a> {
 
 impl Laying<'_> {
     /// Write `table` at the cursor and return its address. Table reaching
-    /// `POINTER_AT` is reported as `Error::NoRoomForTables`.
+    /// `GENID_AT` is reported as `Error::NoRoomForTables`.
     fn lay(&mut self, table: &[u8]) -> Result<u64> {
         let at = self.next;
         let past = at + table.len() as u64;
-        if past > POINTER_AT {
+        if past > GENID_AT {
             return Err(Error::NoRoomForTables);
         }
         self.ram.write(at, table)?;
@@ -123,9 +150,45 @@ pub fn lay(ram: &GuestRam, parts: &Parts) -> Result<()> {
     Ok(())
 }
 
-/// Write the DSDT, a `Device` for the console and one per virtio block.
+/// Write the DSDT, a `Device` for the VM generation ID, the GED, the
+/// console and one per virtio block.
 fn lay_namespace(laying: &mut Laying, parts: &Parts) -> Result<u64> {
+    let (genid, line) = (parts.genid, parts.events);
+    let low = genid as u32;
+    let high = (genid >> 32) as u32;
+    let hardware = aml::Name::new(aml::Path::new("_HID"), &GENID_HARDWARE);
+    let compatible = aml::Name::new(aml::Path::new("_CID"), &GENID_COMPATIBLE);
+    let address = aml::Name::new(
+        aml::Path::new("ADDR"),
+        &aml::Package::new(vec![&low, &high]),
+    );
+    let identifier = aml::Device::new(
+        aml::Path::new(GENID_PATH),
+        vec![&hardware, &compatible, &address],
+    );
+
+    // Kernel runs `_EVT` with the GSI as argument on each interrupt
+    // (`acpi_ged_irq_handler` in `drivers/acpi/evged.c`), on a match the
+    // method notifies `\_SB_.VGEN`.
+    let kind = aml::Name::new(aml::Path::new("_HID"), &EVENTS_HARDWARE);
+    let raised = aml::Interrupt::new(true, true, false, false, u32::from(line));
+    let resources = aml::Name::new(
+        aml::Path::new("_CRS"),
+        &aml::ResourceTemplate::new(vec![&raised]),
+    );
+    let asked = aml::Equal::new(&aml::Arg(0), &line);
+    let named = aml::Path::new(GENID_PATH);
+    let told = aml::Notify::new(&named, &CHANGED);
+    let when = aml::If::new(&asked, vec![&told]);
+    let handler = aml::Method::new(aml::Path::new("_EVT"), 1, true, vec![&when]);
+    let events = aml::Device::new(
+        aml::Path::new("\\_SB_.GED_"),
+        vec![&kind, &resources, &handler],
+    );
+
     let mut namespace = Vec::new();
+    identifier.to_aml_bytes(&mut namespace);
+    events.to_aml_bytes(&mut namespace);
     name_console(&mut namespace, &parts.console);
     for (slot, block) in parts.virtio.iter().enumerate() {
         name_virtio(&mut namespace, slot, block);
@@ -230,11 +293,13 @@ fn line(part: &Named) -> Option<aml::Interrupt> {
 mod tests {
     use crate::machine::acpi::*;
 
-    /// Two vCPUs, console at `COM1` and two virtio blocks, the shape
-    /// assembled by `machine::Machine`.
+    /// Two vCPUs, the VM generation ID, console at `COM1` and two virtio
+    /// blocks, the shape assembled by `machine::Machine`.
     fn parts() -> Parts {
         Parts {
             vcpus: 2,
+            genid: GENID_AT,
+            events: 9,
             console: Named {
                 at: 0x3f8,
                 room: 8,
