@@ -13,6 +13,7 @@ pub mod block;
 pub mod entropy;
 pub mod mmio;
 pub mod queue;
+pub mod vsock;
 
 use crate::devices::virtio::queue::Queue;
 use crate::mem::GuestRam;
