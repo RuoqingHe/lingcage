@@ -8,4 +8,5 @@
 //! Protocol on those bytes is decided by the program assembling the
 //! machine.
 
+pub mod connection;
 pub mod packet;
