@@ -1,0 +1,506 @@
+// SPDX-FileCopyrightText: 2026 LingCage <opensource@lingcage.com>
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Vsock device, with open connections and the two rings they are
+//! served over. Packet from transmit ring goes to the connection it
+//! addresses, bytes read from a host end fill buffers of receive ring.
+
+use std::collections::HashMap;
+
+use crate::devices::virtio::queue::{Chain, Queue};
+use crate::devices::virtio::vsock::connection::{Answer, Connection};
+use crate::devices::virtio::vsock::host::{self, Endpoint, Stream};
+use crate::devices::virtio::vsock::packet::{HOST_CID, Header, Op, ROOM, STREAM};
+use crate::devices::virtio::{Device, Error, Result};
+use crate::mem::GuestRam;
+
+// TODO: `VIRTIO_VSOCK_F_SEQPACKET` is not yet offered.
+/// Device ID of socket device, `VIRTIO_ID_VSOCK` in
+/// `include/uapi/linux/virtio_ids.h`.
+const VSOCK: u32 = 19;
+
+/// Queue indices, `VSOCK_VQ_RX`, `VSOCK_VQ_TX` and `VSOCK_VQ_MAX` in
+/// `include/linux/virtio_vsock.h`. Event queue is offered but left
+/// empty.
+const RX: u16 = 0;
+const TX: u16 = 1;
+const QUEUES: u16 = 3;
+
+/// Largest payload of one packet, `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE`.
+const PACKET: usize = 64 * 1024;
+
+/// Vsock device, with context id of the guest, the endpoint its
+/// connections are opened on, and the open connections.
+pub struct Vsock {
+    guest_cid: u64,
+    endpoint: Box<dyn Endpoint>,
+    /// Open connections keyed by guest port and host port, each with its
+    /// host stream.
+    open: HashMap<(u32, u32), (Connection, Box<dyn Stream>)>,
+    /// Packets for receive ring, held until the guest offers a buffer. Their
+    /// bytes are already read from the host end.
+    waiting: Vec<(Header, Vec<u8>)>,
+}
+
+impl Vsock {
+    /// Create the device for the guest at `guest_cid`, connections are
+    /// opened on `endpoint`.
+    pub fn new(guest_cid: u64, endpoint: Box<dyn Endpoint>) -> Self {
+        Vsock {
+            guest_cid,
+            endpoint,
+            open: HashMap::new(),
+            waiting: Vec::new(),
+        }
+    }
+
+    /// Queue a packet for the receive ring.
+    fn owe(&mut self, header: Header, payload: Vec<u8>) {
+        self.waiting.push((header, payload));
+    }
+
+    /// Handle one packet from the transmit ring.
+    fn took(&mut self, header: &Header, payload: &[u8]) {
+        // Packet for another CID or of another kind is reset, not dropped.
+        if header.dst_cid != HOST_CID || header.kind != STREAM {
+            self.owe(header.answer(Op::Reset), Vec::new());
+            return;
+        }
+        let ports = (header.src_port, header.dst_port);
+        if let Some((connection, stream)) = self.open.get_mut(&ports) {
+            let answer = connection.guest_sent(header, payload);
+            let done = connection.done();
+            match answer {
+                Answer::Reply(reply) => self.owe(reply, Vec::new()),
+                Answer::Deliver(note) => {
+                    // Write refused by the host end closes the connection.
+                    let carried = std::io::Write::write_all(stream, payload);
+                    if carried.is_err() {
+                        let last = connection.host_done();
+                        self.open.remove(&ports);
+                        self.owe(last, Vec::new());
+                        return;
+                    }
+                    if let Some(note) = note {
+                        self.owe(note, Vec::new());
+                    }
+                }
+                Answer::Drop => {}
+                Answer::Nothing => {}
+            }
+            if done {
+                self.open.remove(&ports);
+            }
+            return;
+        }
+        // No connection on these ports. Request opens one, any other packet
+        // is reset, so that a stale connection in the guest gets closed.
+        if header.op != Op::Request {
+            self.owe(header.answer(Op::Reset), Vec::new());
+            return;
+        }
+        match self.endpoint.connect(header.dst_port) {
+            Some(stream) => {
+                let connection = Connection::new(self.guest_cid, header);
+                let opened = connection.opened();
+                self.open.insert(ports, (connection, stream));
+                self.owe(opened, Vec::new());
+            }
+            None => self.owe(header.answer(Op::Reset), Vec::new()),
+        }
+    }
+
+    /// Read each host stream up to the credit of its connection and queue
+    /// the bytes for receive ring. Stream which failed is closed with a
+    /// reset.
+    pub fn pump(&mut self) {
+        let mut gone = Vec::new();
+        let mut owed = Vec::new();
+        for (ports, (connection, stream)) in &mut self.open {
+            let room = connection.room().min(PACKET as u32);
+            if room == 0 {
+                continue;
+            }
+            let mut taken = vec![0u8; room as usize];
+            match host::read(stream.as_mut(), &mut taken) {
+                // Zero is `WouldBlock` mapped by `host::read`, stream stays
+                // open.
+                Ok(0) => {}
+                Ok(count) => {
+                    taken.truncate(count);
+                    owed.push((connection.host_sent(count as u32), taken));
+                }
+                Err(_) => gone.push(*ports),
+            }
+        }
+        for ports in gone {
+            if let Some((mut connection, _)) = self.open.remove(&ports) {
+                owed.push((connection.host_done(), Vec::new()));
+            }
+        }
+        for (header, payload) in owed {
+            self.owe(header, payload);
+        }
+    }
+
+    /// Write held packets into receive ring, one per chain, until packets
+    /// or chains run out.
+    fn give(&mut self, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
+        while !self.waiting.is_empty() {
+            let Some(chain) = queue.pop(ram)? else {
+                // No buffer offered, the rest stays in `waiting`.
+                return Ok(());
+            };
+            let (header, payload) = self.waiting.remove(0);
+            let written = write_packet(&chain, ram, &header, &payload)?;
+            queue.add_used(ram, chain.head, written)?;
+        }
+        Ok(())
+    }
+
+    /// Read each chain of transmit ring and handle its packet.
+    fn take(&mut self, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
+        while let Some(chain) = queue.pop(ram)? {
+            // Chain too short for a header is reported used and ignored.
+            if let Some((header, payload)) = read_packet(&chain, ram)? {
+                self.took(&header, &payload);
+            }
+            queue.add_used(ram, chain.head, 0)?;
+        }
+        Ok(())
+    }
+}
+
+impl Device for Vsock {
+    fn device_id(&self) -> u32 {
+        VSOCK
+    }
+
+    fn queue_count(&self) -> u16 {
+        QUEUES
+    }
+
+    /// Returns bytes of `guest_cid`, the only field of configuration space
+    /// (`struct virtio_vsock_config`). Read past it returns zero.
+    fn read_config(&mut self, offset: u64, size: u8) -> u64 {
+        let bytes = self.guest_cid.to_le_bytes();
+        let mut read = 0u64;
+        for step in 0..u64::from(size) {
+            let at = offset + step;
+            let byte = bytes.get(at as usize).copied().unwrap_or(0);
+            read |= u64::from(byte) << (step * 8);
+        }
+        read
+    }
+
+    fn notify(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
+        match index {
+            TX => {
+                self.take(queue, ram)?;
+                self.pump();
+            }
+            RX => self.give(queue, ram)?,
+            // Event queue is left empty.
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Read header and payload from readable descriptors of `chain`. Returns
+/// `None` when `Header::read` refuses the bytes.
+fn read_packet(chain: &Chain, ram: &GuestRam) -> Result<Option<(Header, Vec<u8>)>> {
+    let mut whole = Vec::new();
+    for descriptor in &chain.descriptors {
+        if descriptor.writable() {
+            continue;
+        }
+        // `descriptor.len` decides a host allocation, so total is capped at a
+        // header plus the largest payload.
+        if whole.len() + descriptor.len as usize > ROOM + PACKET {
+            return Err(Error::Request);
+        }
+        let mut part = vec![0u8; descriptor.len as usize];
+        ram.read(descriptor.addr, &mut part)
+            .map_err(|_| Error::Ring {
+                gpa: descriptor.addr,
+            })?;
+        whole.extend_from_slice(&part);
+    }
+    let Some(header) = Header::read(&whole) else {
+        return Ok(None);
+    };
+    let payload = whole.get(ROOM..).unwrap_or(&[]).to_vec();
+    Ok(Some((header, payload)))
+}
+
+/// Write the packet into writable descriptors of `chain`. Returns bytes
+/// written.
+fn write_packet(chain: &Chain, ram: &GuestRam, header: &Header, payload: &[u8]) -> Result<u32> {
+    let mut whole = vec![0u8; ROOM + payload.len()];
+    header.write(&mut whole);
+    whole[ROOM..].copy_from_slice(payload);
+
+    let mut written = 0usize;
+    for descriptor in &chain.descriptors {
+        if !descriptor.writable() || written == whole.len() {
+            continue;
+        }
+        let room = (descriptor.len as usize).min(whole.len() - written);
+        ram.write(descriptor.addr, &whole[written..written + room])
+            .map_err(|_| Error::Ring {
+                gpa: descriptor.addr,
+            })?;
+        written += room;
+    }
+    // Partial write would leave `len` of the header past the bytes present.
+    if written != whole.len() {
+        return Err(Error::Request);
+    }
+    Ok(written as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use crate::devices::virtio::vsock::connection::WINDOW;
+    use crate::devices::virtio::vsock::device::*;
+
+    const GUEST_CID: u64 = 3;
+    const GUEST_PORT: u32 = 1024;
+    const OPEN_PORT: u32 = 5555;
+    const SHUT_PORT: u32 = 5556;
+
+    /// `VIRTQ_DESC_F_WRITE`, buffer is device-writable.
+    const WRITE: u16 = 0x2;
+
+    const SIZE: u16 = 8;
+    /// Descriptor table of each ring. `queue` puts available and used rings
+    /// at `0x1000` and `0x2000` past it.
+    const TX_RING: u64 = 0x1000;
+    const RX_RING: u64 = 0x5000;
+    const BUFFER: u64 = 0x9000;
+    const RAM_SIZE: u64 = 0x20000;
+
+    /// Host stream with separate buffer per direction.
+    #[derive(Clone, Default)]
+    struct Landed {
+        /// Bytes written by the guest.
+        taken: Arc<Mutex<Vec<u8>>>,
+        /// Bytes for the guest to read.
+        ready: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for Landed {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.taken.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl io::Read for Landed {
+        fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+            let mut held = self.ready.lock().unwrap();
+            let taken = held.len().min(into.len());
+            into[..taken].copy_from_slice(&held[..taken]);
+            held.drain(..taken);
+            Ok(taken)
+        }
+    }
+
+    /// Endpoint serving `OPEN_PORT` only.
+    struct OnePort(Landed);
+
+    impl Endpoint for OnePort {
+        fn connect(&self, port: u32) -> Option<Box<dyn Stream>> {
+            (port == OPEN_PORT).then(|| Box::new(self.0.clone()) as Box<dyn Stream>)
+        }
+    }
+
+    fn ram() -> GuestRam {
+        GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages")
+    }
+
+    fn queue(base: u64) -> Queue {
+        Queue::new(SIZE, base, base + 0x1000, base + 0x2000).expect("ring")
+    }
+
+    fn describe(ram: &GuestRam, base: u64, index: u16, addr: u64, len: u32, flags: u16) {
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&addr.to_le_bytes());
+        bytes[8..12].copy_from_slice(&len.to_le_bytes());
+        bytes[12..14].copy_from_slice(&flags.to_le_bytes());
+        ram.write(base + u64::from(index) * 16, &bytes)
+            .expect("write a descriptor");
+    }
+
+    fn publish(ram: &GuestRam, base: u64, slot: u16, head: u16, count: u16) {
+        ram.write(base + 0x1000 + 4 + u64::from(slot) * 2, &head.to_le_bytes())
+            .expect("publish a head");
+        ram.write(base + 0x1000 + 2, &count.to_le_bytes())
+            .expect("bump the index");
+    }
+
+    /// Post a packet for `port` as available entry `slot` of transmit ring.
+    fn guest_sends(ram: &GuestRam, slot: u16, op: Op, port: u32, payload: &[u8]) {
+        let header = Header {
+            src_cid: GUEST_CID,
+            dst_cid: HOST_CID,
+            src_port: GUEST_PORT,
+            dst_port: port,
+            len: payload.len() as u32,
+            kind: STREAM,
+            op,
+            flags: 0,
+            buf_alloc: WINDOW,
+            fwd_cnt: 0,
+        };
+        let mut whole = vec![0u8; ROOM + payload.len()];
+        header.write(&mut whole);
+        whole[ROOM..].copy_from_slice(payload);
+        let at = BUFFER + u64::from(slot) * 0x400;
+        ram.write(at, &whole).expect("write the packet");
+        describe(ram, TX_RING, slot, at, whole.len() as u32, 0);
+        publish(ram, TX_RING, slot, slot, slot + 1);
+    }
+
+    /// Post one writable buffer of `0x400` bytes as available entry `slot`
+    /// of receive ring.
+    fn guest_offers(ram: &GuestRam, slot: u16) {
+        let at = BUFFER + 0x8000 + u64::from(slot) * 0x400;
+        describe(ram, RX_RING, slot, at, 0x400, WRITE);
+        publish(ram, RX_RING, slot, slot, slot + 1);
+    }
+
+    /// Returns the header written into buffer of receive entry `slot`.
+    fn guest_given(ram: &GuestRam, slot: u16) -> Header {
+        let at = BUFFER + 0x8000 + u64::from(slot) * 0x400;
+        let mut bytes = [0u8; ROOM];
+        ram.read(at, &mut bytes).expect("read the buffer");
+        Header::read(&bytes).expect("header")
+    }
+
+    fn device(landed: &Landed) -> Vsock {
+        Vsock::new(GUEST_CID, Box::new(OnePort(landed.clone())))
+    }
+
+    #[test]
+    fn test_device_id_and_config() {
+        let mut vsock = device(&Landed::default());
+        assert_eq!(vsock.device_id(), VSOCK);
+        // Three queues, event queue included.
+        assert_eq!(vsock.queue_count(), QUEUES);
+        assert_eq!(vsock.read_config(0, 8), GUEST_CID);
+    }
+
+    #[test]
+    fn test_connect_and_send_to_host() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        assert_eq!(
+            guest_given(&ram, 0).op,
+            Op::Response,
+            "no response to request"
+        );
+
+        guest_sends(&ram, 1, Op::Data, OPEN_PORT, b"hello");
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        assert_eq!(&*landed.taken.lock().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_reject_closed_port() {
+        let mut vsock = device(&Landed::default());
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, SHUT_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        assert_eq!(guest_given(&ram, 0).op, Op::Reset, "closed port accepted");
+    }
+
+    #[test]
+    fn test_reject_packet_without_connection() {
+        let mut vsock = device(&Landed::default());
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        // Data without a request before it.
+        guest_sends(&ram, 0, Op::Data, OPEN_PORT, b"hi");
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        assert_eq!(guest_given(&ram, 0).op, Op::Reset);
+    }
+
+    #[test]
+    fn test_receive_from_host() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+
+        // Bytes ready on the host stream.
+        landed.ready.lock().unwrap().extend_from_slice(b"world");
+        vsock.pump();
+        guest_offers(&ram, 1);
+        vsock
+            .notify(RX, &mut rx, &ram)
+            .expect("notify rx with a buffer");
+
+        let given = guest_given(&ram, 1);
+        assert_eq!(given.op, Op::Data);
+        assert_eq!(given.len, 5);
+        let mut payload = [0u8; 5];
+        ram.read(BUFFER + 0x8000 + 0x400 + ROOM as u64, &mut payload)
+            .expect("read the payload");
+        assert_eq!(&payload, b"world");
+    }
+
+    #[test]
+    fn test_hold_packet_until_buffer_offered() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        // No buffer offered yet.
+        vsock
+            .notify(RX, &mut rx, &ram)
+            .expect("notify rx with no buffer");
+        assert_eq!(vsock.waiting.len(), 1, "reply dropped");
+
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        assert_eq!(guest_given(&ram, 0).op, Op::Response);
+        assert!(vsock.waiting.is_empty(), "reply still held");
+    }
+}

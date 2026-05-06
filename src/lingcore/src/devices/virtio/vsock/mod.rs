@@ -9,5 +9,6 @@
 //! machine.
 
 pub mod connection;
+pub mod device;
 pub mod host;
 pub mod packet;
