@@ -260,8 +260,8 @@ impl Transport {
         }
     }
 
-    /// Handle a `QUEUE_NOTIFY` write for queue `index` and raise the line
-    /// once the device has processed it. Signal on the ioeventfd reaches
+    /// Handle a `QUEUE_NOTIFY` write for queue `index` and raise the line if
+    /// the device reported a chain used. Signal on the ioeventfd reaches
     /// here from the device thread.
     pub fn notify(&mut self, index: u16) -> io::Result<()> {
         let Some(slot) = self.queues.get_mut(usize::from(index)) else {
@@ -270,11 +270,17 @@ impl Transport {
         let Some(queue) = slot.queue.as_mut() else {
             return Ok(());
         };
+        let (_, answered) = queue.cursors();
         // Malformed chain sets `DEVICE_NEEDS_RESET`, it does not end the
         // run.
         if let Err(refused) = self.device.notify(index, queue, &self.ram) {
             warn!("queue {index} not served, DEVICE_NEEDS_RESET set: {refused}");
             self.status |= STATUS_NEEDS_RESET;
+            return Ok(());
+        }
+        // Used index did not move, no chain for the guest to read, so the line
+        // stays down. Device served on a timer meets empty rings.
+        if queue.cursors().1 == answered {
             return Ok(());
         }
         self.interrupt_status |= INTERRUPT_VRING;
@@ -798,6 +804,26 @@ mod tests {
             said[2].contains("indirect descriptors are not supported"),
             "record was {:?}",
             said[2]
+        );
+    }
+
+    #[test]
+    fn test_empty_queue_no_interrupt() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut mmio = transport(&line);
+
+        set(&mut mmio, QUEUE_NUM, 8);
+        set(&mut mmio, QUEUE_DESC_LOW, DESC_TABLE as u32);
+        set(&mut mmio, QUEUE_AVAIL_LOW, AVAIL_RING as u32);
+        set(&mut mmio, QUEUE_USED_LOW, USED_RING as u32);
+        set(&mut mmio, QUEUE_READY, 1);
+
+        set(&mut mmio, QUEUE_NOTIFY, 0);
+        assert_eq!(line.raises(), 0, "empty queue woke the guest");
+        assert_eq!(
+            reg(&mut mmio, STATUS) & STATUS_NEEDS_RESET,
+            0,
+            "an empty queue set DEVICE_NEEDS_RESET"
         );
     }
 
