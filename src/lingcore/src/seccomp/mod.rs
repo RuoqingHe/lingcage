@@ -88,6 +88,10 @@ const IOCTL_REQUEST: u8 = 1;
 /// `include/uapi/linux/kvm.h`.
 const KVM_RUN: u64 = 0xae80;
 
+/// `FIONBIO`, the request issued by `set_nonblocking` on a socket, from
+/// `include/uapi/asm-generic/ioctls.h`.
+const FIONBIO: u64 = 0x5421;
+
 impl Thread {
     /// Returns the name of this thread in a `SIGSYS` report.
     fn tag(self) -> &'static str {
@@ -101,6 +105,32 @@ impl Thread {
     /// conditions on their arguments. Empty rule list allows the syscall
     /// unconditionally.
     fn extras(self) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
+        // `socket` for `AF_UNIX` only and `ioctl` for `FIONBIO` only, other
+        // family or request is refused.
+        let unix_only = vec![
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    libc::AF_UNIX as u64,
+                )
+                .map_err(Error::Assemble)?,
+            ])
+            .map_err(Error::Assemble)?,
+        ];
+        let nonblocking_only = vec![
+            SeccompRule::new(vec![
+                SeccompCondition::new(
+                    IOCTL_REQUEST,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    FIONBIO,
+                )
+                .map_err(Error::Assemble)?,
+            ])
+            .map_err(Error::Assemble)?,
+        ];
         match self {
             // `ioctl` for `KVM_RUN` only, other request is refused.
             Thread::Vcpu => {
@@ -117,12 +147,20 @@ impl Thread {
                 Ok(BTreeMap::from([(libc::SYS_ioctl, vec![enter])]))
             }
             // The ioeventfd is polled and read, the disk is sought, read,
-            // written and flushed.
+            // written and flushed, the channel opens, connects, sends on,
+            // receives on and closes a host socket per connection.
             Thread::Device => Ok(BTreeMap::from([
+                (libc::SYS_close, Vec::new()),
+                (libc::SYS_connect, Vec::new()),
+                (libc::SYS_fcntl, Vec::new()),
                 (libc::SYS_fdatasync, Vec::new()),
                 (libc::SYS_lseek, Vec::new()),
                 (libc::SYS_poll, Vec::new()),
                 (libc::SYS_read, Vec::new()),
+                (libc::SYS_recvfrom, Vec::new()),
+                (libc::SYS_sendto, Vec::new()),
+                (libc::SYS_ioctl, nonblocking_only),
+                (libc::SYS_socket, unix_only),
             ])),
         }
     }

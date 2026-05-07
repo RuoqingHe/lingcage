@@ -22,6 +22,8 @@ use crate::devices::serial::Serial;
 use crate::devices::virtio::block::Block;
 use crate::devices::virtio::entropy::Entropy;
 use crate::devices::virtio::mmio::{self, Transport};
+use crate::devices::virtio::vsock::device::Vsock;
+use crate::devices::virtio::vsock::host::Sockets;
 use crate::devices::{Blob, Receive, Shared};
 use crate::hv::hypervisor::Hypervisor;
 use crate::hv::memory::{MemMapOption, VmMemory};
@@ -163,6 +165,16 @@ pub enum Error {
 /// Result alias for assembling a guest.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Vsock channel through which a guest is reached. Context id comes
+/// from the caller, one per guest it runs.
+#[derive(Debug, Clone)]
+pub struct Channel {
+    /// Context id of the guest.
+    pub cid: u64,
+    /// Prefix of host socket paths. A port connects to `<prefix>_<port>`.
+    pub at: PathBuf,
+}
+
 /// Guest configuration which a `Machine` is assembled from.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -178,15 +190,17 @@ pub struct Config {
     pub cmdline: String,
     /// File backing the disk of the guest, if any.
     pub disk: Option<PathBuf>,
+    /// Vsock channel to the guest, if any.
+    pub channel: Option<Channel>,
     /// Action on a syscall outside allowlist of a thread, `None` installs
     /// no allowlist.
     pub confine: Option<Refusal>,
 }
 
 /// Returns the number of virtio devices. Entropy source is always there,
-/// disk comes with `Config::disk`.
+/// disk comes with `Config::disk`, channel with `Config::channel`.
 fn virtio_count(config: &Config) -> u8 {
-    1 + u8::from(config.disk.is_some())
+    1 + u8::from(config.disk.is_some()) + u8::from(config.channel.is_some())
 }
 
 /// Returns MMIO address of virtio register block `slot`.
@@ -575,6 +589,17 @@ impl<H: Hypervisor> Machine<H> {
                 &ram,
                 1,
                 Box::new(disk),
+            )?);
+        }
+        if let Some(channel) = &config.channel {
+            let reached = Vsock::new(channel.cid, Box::new(Sockets::new(&channel.at)));
+            wired.push(place_virtio(
+                &mut bus,
+                &vm,
+                &registry,
+                &ram,
+                virtio_count(config) - 1,
+                Box::new(reached),
             )?);
         }
 
@@ -1062,6 +1087,7 @@ mod tests {
             // With `Trap`, a syscall missed by the allowlists ends the test
             // with `SIGSYS`.
             confine: Some(Refusal::Trap),
+            channel: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1130,6 +1156,7 @@ mod tests {
             cmdline: "console=ttyS0".to_string(),
             disk: None,
             confine: None,
+            channel: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1177,6 +1204,7 @@ mod tests {
             cmdline: "console=ttyS0".to_string(),
             disk: None,
             confine: None,
+            channel: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1244,6 +1272,7 @@ mod tests {
             cmdline: "console=ttyS0".to_string(),
             disk: None,
             confine: None,
+            channel: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1337,6 +1366,7 @@ mod tests {
             cmdline: "console=ttyS0".to_string(),
             disk: None,
             confine: None,
+            channel: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1376,6 +1406,7 @@ mod tests {
             cmdline: String::new(),
             disk: None,
             confine: None,
+            channel: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1420,6 +1451,7 @@ mod tests {
             cmdline: String::new(),
             disk: None,
             confine: None,
+            channel: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1471,6 +1503,7 @@ mod tests {
             cmdline: String::new(),
             disk: None,
             confine: None,
+            channel: None,
         };
         #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
         {
@@ -1500,6 +1533,7 @@ mod tests {
                 cmdline: String::new(),
                 disk: None,
                 confine: None,
+                channel: None,
             };
             assert!(matches!(
                 Machine::new(&hv, &config, Vec::new()),
