@@ -5,13 +5,15 @@
 //! Kernel-side ioeventfds. An eventfd is bound to a guest address
 //! through `KVM_IOEVENTFD`.
 
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use crate::hv::Result;
 
 /// eventfd signalled by the kernel on a guest write to the address it
-/// is bound to. The write does not exit to VMM.
-pub trait IoeventFd: Send + Sync {
+/// is bound to. The write does not exit to VMM. `AsRawFd` lends the
+/// descriptor to a `Waiting`.
+pub trait IoeventFd: Send + Sync + AsRawFd {
     /// Wait at most `within` for a signal. Returns the accumulated count
     /// cleared by the read, or `None` once `within` elapses.
     fn wait(&self, within: Duration) -> Result<Option<u64>>;

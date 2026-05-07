@@ -50,6 +50,14 @@ pub struct KvmIoeventFd {
     bound: Mutex<Option<(u64, Datamatch)>>,
 }
 
+impl AsRawFd for KvmIoeventFd {
+    /// Raw fd of the eventfd, for a `Waiting` to poll. Ownership stays
+    /// here.
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.eventfd.as_raw_fd()
+    }
+}
+
 impl IoeventFd for KvmIoeventFd {
     fn wait(&self, within: Duration) -> Result<Option<u64>> {
         let mut waiting = libc::pollfd {

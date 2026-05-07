@@ -16,8 +16,8 @@ acpi = ["dep:acpi_tables", "mem"]
 boot = ["dep:linux-loader", "hv", "mem"]
 # Guest-facing devices, serde carries their state.
 devices = ["dep:serde", "dep:serde_json", "vcpu"]
-# Hypervisor backends, only KVM is implemented for now.
-hv = []
+# Hypervisor backends and the Linux mechanisms under them, libc for poll(2).
+hv = ["dep:libc"]
 # Guest assembly, RAM, kernel, bus and the run loop. x86_64 Linux only.
 machine = [
   "acpi",
