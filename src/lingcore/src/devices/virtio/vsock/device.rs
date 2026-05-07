@@ -68,24 +68,13 @@ impl Vsock {
             return;
         }
         let ports = (header.src_port, header.dst_port);
-        if let Some((connection, stream)) = self.open.get_mut(&ports) {
+        if let Some((connection, _)) = self.open.get_mut(&ports) {
             let answer = connection.guest_sent(header, payload);
             let done = connection.done();
             match answer {
                 Answer::Reply(reply) => self.owe(reply, Vec::new()),
-                Answer::Deliver(note) => {
-                    // Write refused by the host end closes the connection.
-                    let carried = std::io::Write::write_all(stream, payload);
-                    if carried.is_err() {
-                        let last = connection.host_done();
-                        self.open.remove(&ports);
-                        self.owe(last, Vec::new());
-                        return;
-                    }
-                    if let Some(note) = note {
-                        self.owe(note, Vec::new());
-                    }
-                }
+                // Bytes stay in the connection until `carry` writes them.
+                Answer::Took => {}
                 Answer::Drop => {}
                 Answer::Nothing => {}
             }
@@ -108,6 +97,34 @@ impl Vsock {
                 self.owe(opened, Vec::new());
             }
             None => self.owe(header.answer(Op::Reset), Vec::new()),
+        }
+    }
+
+    /// Write waiting bytes of each connection to its host end as far as it
+    /// takes them, and queue `CreditUpdate` for bytes written. Host end
+    /// taking zero bytes keeps its connection, failed host end is closed
+    /// with a reset.
+    fn carry(&mut self) {
+        let mut gone = Vec::new();
+        let mut owed = Vec::new();
+        for (ports, (connection, stream)) in &mut self.open {
+            let waiting = connection.waiting();
+            if waiting.is_empty() {
+                continue;
+            }
+            match host::write(stream.as_mut(), waiting) {
+                Ok(0) => {}
+                Ok(count) => owed.push(connection.forwarded(count)),
+                Err(_) => gone.push(*ports),
+            }
+        }
+        for ports in gone {
+            if let Some((mut connection, _)) = self.open.remove(&ports) {
+                owed.push(connection.host_done());
+            }
+        }
+        for header in owed {
+            self.owe(header, Vec::new());
         }
     }
 
@@ -198,9 +215,15 @@ impl Device for Vsock {
         match index {
             TX => {
                 self.take(queue, ram)?;
+                self.carry();
                 self.pump();
             }
-            RX => self.give(queue, ram)?,
+            RX => {
+                // Host end full at the last `carry` may take bytes now.
+                self.carry();
+                self.pump();
+                self.give(queue, ram)?;
+            }
             // Event queue is left empty.
             _ => {}
         }
@@ -312,6 +335,42 @@ mod tests {
             into[..taken].copy_from_slice(&held[..taken]);
             held.drain(..taken);
             Ok(taken)
+        }
+    }
+
+    /// Host end refusing each write with `WouldBlock` while `full` is set.
+    #[derive(Clone, Default)]
+    struct Backed {
+        taken: Arc<Mutex<Vec<u8>>>,
+        full: Arc<Mutex<bool>>,
+    }
+
+    impl io::Write for Backed {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if *self.full.lock().unwrap() {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            self.taken.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl io::Read for Backed {
+        fn read(&mut self, _into: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    /// Endpoint serving `OPEN_PORT` with a `Backed`.
+    struct Backs(Backed);
+
+    impl Endpoint for Backs {
+        fn connect(&self, port: u32) -> Option<Box<dyn Stream>> {
+            (port == OPEN_PORT).then(|| Box::new(self.0.clone()) as Box<dyn Stream>)
         }
     }
 
@@ -480,6 +539,56 @@ mod tests {
         ram.read(BUFFER + 0x8000 + 0x400 + ROOM as u64, &mut payload)
             .expect("read the payload");
         assert_eq!(&payload, b"world");
+    }
+
+    #[test]
+    fn test_hold_bytes_for_full_host_end() {
+        // Host end returning `WouldBlock` keeps its connection. Bytes wait
+        // and are written once it takes them.
+        let backed = Backed::default();
+        *backed.full.lock().unwrap() = true;
+        let mut vsock = Vsock::new(GUEST_CID, Box::new(Backs(backed.clone())));
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("take the request");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("answer the request");
+        assert_eq!(guest_given(&ram, 0).op, Op::Response);
+
+        // Host end takes no bytes, connection stays open.
+        guest_sends(&ram, 1, Op::Data, OPEN_PORT, b"hello");
+        vsock.notify(TX, &mut tx, &ram).expect("take the data");
+        assert!(
+            backed.taken.lock().unwrap().is_empty(),
+            "full host end took bytes"
+        );
+        guest_offers(&ram, 1);
+        vsock.notify(RX, &mut rx, &ram).expect("answer");
+        // No byte moved, so neither `CreditUpdate` nor reset is queued.
+        assert!(
+            vsock.waiting.is_empty(),
+            "full host end queued packet for guest"
+        );
+        assert!(
+            vsock.open.contains_key(&(GUEST_PORT, OPEN_PORT)),
+            "full host end closed the connection"
+        );
+
+        // Host end takes the bytes, `CreditUpdate` lands in the buffer
+        // offered above.
+        *backed.full.lock().unwrap() = false;
+        vsock.notify(RX, &mut rx, &ram).expect("carry and answer");
+        assert_eq!(
+            &*backed.taken.lock().unwrap(),
+            b"hello",
+            "bytes did not reach host end"
+        );
+        let note = guest_given(&ram, 1);
+        assert_eq!(note.op, Op::CreditUpdate);
+        assert_eq!(note.fwd_cnt, 5, "guest got wrong count");
     }
 
     #[test]

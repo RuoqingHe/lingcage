@@ -60,6 +60,16 @@ impl Endpoint for Closed {
     }
 }
 
+/// Write `bytes` to `stream`. Returns count written, zero on
+/// `WouldBlock`.
+pub fn write(stream: &mut dyn Stream, bytes: &[u8]) -> io::Result<usize> {
+    match stream.write(bytes) {
+        Ok(taken) => Ok(taken),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(0),
+        Err(err) => Err(err),
+    }
+}
+
 /// Read from `stream` into `into`. Returns zero on `WouldBlock`.
 pub fn read(stream: &mut dyn Stream, into: &mut [u8]) -> io::Result<usize> {
     match stream.read(into) {

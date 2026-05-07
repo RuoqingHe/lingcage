@@ -10,8 +10,8 @@
 
 use crate::devices::virtio::vsock::packet::{HOST_CID, Header, Op, STREAM};
 
-/// Bytes held per connection from the host end, sent to the guest as
-/// `buf_alloc`.
+/// Bytes held per connection from the guest until the host end takes
+/// them, sent to the guest as `buf_alloc`.
 pub const WINDOW: u32 = 64 * 1024;
 
 /// Shutdown directions, `VIRTIO_VSOCK_SHUTDOWN_RCV` and `_SEND`.
@@ -33,9 +33,9 @@ enum Stage {
 pub enum Answer {
     /// Send the header to the guest without payload.
     Reply(Header),
-    /// Write the payload to the host end, then send the header (if any) to
-    /// the guest, its `fwd_cnt` counts the payload.
-    Deliver(Option<Header>),
+    /// Payload is held in `Connection::waiting` until the host end takes it.
+    /// `forwarded` then sends the `fwd_cnt` which counts it.
+    Took,
     /// Drop the connection without reply.
     Drop,
     /// No action.
@@ -57,6 +57,9 @@ pub struct Connection {
     /// Bytes from the guest already written to the host end, sent as
     /// `fwd_cnt`.
     taken: u32,
+    /// Bytes from the guest not yet written to the host end. At most
+    /// `WINDOW`, which is the `buf_alloc` sent to the guest.
+    pending: Vec<u8>,
 }
 
 impl Connection {
@@ -71,6 +74,7 @@ impl Connection {
             peer_taken: asked.fwd_cnt,
             sent: 0,
             taken: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -140,8 +144,13 @@ impl Connection {
                     self.stage = Stage::Closed;
                     return Answer::Reply(self.to_guest(Op::Reset));
                 }
-                self.taken = self.taken.wrapping_add(header.len);
-                Answer::Deliver(Some(self.to_guest(Op::CreditUpdate)))
+                // Data beyond the `buf_alloc` sent to the guest is refused.
+                if self.pending.len() + payload.len() > WINDOW as usize {
+                    self.stage = Stage::Closed;
+                    return Answer::Reply(self.to_guest(Op::Reset));
+                }
+                self.pending.extend_from_slice(payload);
+                Answer::Took
             }
             Op::CreditRequest => Answer::Reply(self.to_guest(Op::CreditUpdate)),
             Op::CreditUpdate => Answer::Nothing,
@@ -149,6 +158,20 @@ impl Connection {
             // the guest to answer.
             Op::Response => Answer::Reply(self.to_guest(Op::Reset)),
         }
+    }
+
+    /// Returns bytes not yet written to the host end.
+    pub fn waiting(&self) -> &[u8] {
+        &self.pending
+    }
+
+    /// Count the first `count` waiting bytes as written to the host end and
+    /// return the `CreditUpdate` carrying the advanced `fwd_cnt`.
+    pub fn forwarded(&mut self, count: usize) -> Header {
+        let count = count.min(self.pending.len());
+        self.pending.drain(..count);
+        self.taken = self.taken.wrapping_add(count as u32);
+        self.to_guest(Op::CreditUpdate)
     }
 
     /// Returns bytes the guest can take, which is its `buf_alloc` minus the
@@ -206,7 +229,7 @@ mod tests {
     /// Header of `answer`. Panics on `Drop` and `Nothing`.
     fn replied(answer: &Answer) -> Header {
         match answer {
-            Answer::Reply(header) | Answer::Deliver(Some(header)) => *header,
+            Answer::Reply(header) => *header,
             other => panic!("expected a header, got {other:?}"),
         }
     }
@@ -225,17 +248,20 @@ mod tests {
     #[test]
     fn test_data_forwarded_and_counted() {
         let mut open = opened();
-        let answer = open.guest_sent(&from_guest(Op::Data, 5), b"hello");
-        let note = replied(&answer);
-        assert!(
-            matches!(answer, Answer::Deliver(_)),
-            "payload not delivered"
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, 5), b"hello"),
+            Answer::Took
         );
-        assert_eq!(note.op, Op::CreditUpdate);
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, 3), b"abc"),
+            Answer::Took
+        );
+        assert_eq!(open.waiting(), b"helloabc", "bytes not kept");
+
         // `fwd_cnt` counts bytes instead of packets.
-        assert_eq!(note.fwd_cnt, 5);
-        let more = replied(&open.guest_sent(&from_guest(Op::Data, 3), b"abc"));
-        assert_eq!(more.fwd_cnt, 8);
+        assert_eq!(open.forwarded(5).fwd_cnt, 5);
+        assert_eq!(open.forwarded(3).fwd_cnt, 8);
+        assert!(open.waiting().is_empty());
     }
 
     #[test]
@@ -246,6 +272,47 @@ mod tests {
             assert_eq!(replied(&answer).op, Op::Reset, "claimed {claimed}");
             assert!(open.done(), "refused connection left open");
         }
+    }
+
+    #[test]
+    fn test_fwd_cnt_advances_on_forward() {
+        // `fwd_cnt` advances when bytes are written to the host end, not
+        // when they arrive from the guest.
+        let mut open = opened();
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, 5), b"hello"),
+            Answer::Took
+        );
+        assert_eq!(open.waiting(), b"hello", "bytes not kept");
+
+        // No byte written yet, so `fwd_cnt` is zero.
+        let asked = replied(&open.guest_sent(&from_guest(Op::CreditRequest, 0), &[]));
+        assert_eq!(asked.fwd_cnt, 0, "bytes were credited before they moved");
+
+        // Host end took three out of the five.
+        let note = open.forwarded(3);
+        assert_eq!(note.op, Op::CreditUpdate);
+        assert_eq!(note.fwd_cnt, 3);
+        assert_eq!(open.waiting(), b"lo", "bytes moved were not dropped");
+    }
+
+    #[test]
+    fn test_reject_data_past_window() {
+        // Data beyond `WINDOW` outstanding is reset, so `pending` is
+        // bounded.
+        let mut open = opened();
+        let whole = vec![0u8; WINDOW as usize];
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, WINDOW), &whole),
+            Answer::Took
+        );
+        let over = replied(&open.guest_sent(&from_guest(Op::Data, 1), b"x"));
+        assert_eq!(
+            over.op,
+            Op::Reset,
+            "guest sent past its window but got served"
+        );
+        assert!(open.done());
     }
 
     #[test]
