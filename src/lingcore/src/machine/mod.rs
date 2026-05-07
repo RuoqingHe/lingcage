@@ -26,6 +26,7 @@ use crate::devices::{Blob, Receive, Shared};
 use crate::hv::hypervisor::Hypervisor;
 use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
+use crate::hv::os::linux::waiting::Waiting;
 use crate::hv::vcpu::{Stopper, Vcpu, VmExit};
 use crate::hv::vm::Vm;
 use crate::machine::snapshot::Snapshot;
@@ -75,12 +76,8 @@ const VIRTIO_IRQ: u8 = 5;
 /// Host file read by the entropy source.
 const ENTROPY_SOURCE: &str = "/dev/urandom";
 
-/// Queue index an ioeventfd is bound on. Each device here has one queue,
-/// kick naming another one exits as MMIO.
-const VIRTIO_QUEUE: u16 = 0;
-
-/// Maximum time a device thread waits on its ioeventfd before reading
-/// the order.
+/// Maximum time the device thread waits on the ioeventfds before
+/// reading the order.
 const DEVICE_TICK: Duration = Duration::from_millis(200);
 
 /// Maximum time `pause` waits for vCPU and device threads to park. The
@@ -197,16 +194,19 @@ fn virtio_at(slot: u8) -> u64 {
     VIRTIO_AT + u64::from(slot) * mmio::SIZE
 }
 
-/// Virtio device as placed, the transport on the bus and the ioeventfd
-/// bound on its notify register. Device thread waits on the ioeventfd
-/// with the transport unlocked.
+/// Virtio device as placed. Transport is on the bus and an ioeventfd
+/// per queue is bound on its notify register. Device thread waits on
+/// the ioeventfds with the transport unlocked.
 struct Wired {
     transport: Shared<Transport>,
-    ioeventfd: Arc<dyn IoeventFd>,
+    /// One ioeventfd per queue, matched by the queue index written to
+    /// `QUEUE_NOTIFY`.
+    ioeventfds: Vec<Arc<dyn IoeventFd>>,
 }
 
 /// Place `device` on `bus` in virtio register block `slot`, on line
-/// `VIRTIO_IRQ + slot`, with an ioeventfd bound on its `QUEUE_NOTIFY`.
+/// `VIRTIO_IRQ + slot`, with one ioeventfd per queue bound on its
+/// `QUEUE_NOTIFY`.
 fn place_virtio<V: Vm>(
     bus: &mut Bus,
     vm: &V,
@@ -220,20 +220,26 @@ where
     <V::IoeventFdRegistry as IoeventFdRegistry>::IoeventFd: 'static,
 {
     let line = vm.create_irq_sender(VIRTIO_IRQ + slot)?;
+    let queues = device.queue_count();
     let transport = Shared::new(Transport::new(device, ram.clone(), Box::new(line)));
     bus.place_mmio(virtio_at(slot), mmio::SIZE, Box::new(transport.clone()))?;
 
-    let ioeventfd = registry.create()?;
-    // Only a 4-byte write of `VIRTIO_QUEUE` signals it, other kicks exit.
-    registry.register(
-        &ioeventfd,
-        virtio_at(slot) + mmio::QUEUE_NOTIFY,
-        4,
-        Some(u64::from(VIRTIO_QUEUE)),
-    )?;
+    // One ioeventfd per queue. Kick without ioeventfd exits as MMIO and
+    // is served by the vCPU thread.
+    let mut ioeventfds: Vec<Arc<dyn IoeventFd>> = Vec::with_capacity(usize::from(queues));
+    for index in 0..queues {
+        let ioeventfd = registry.create()?;
+        registry.register(
+            &ioeventfd,
+            virtio_at(slot) + mmio::QUEUE_NOTIFY,
+            4,
+            Some(u64::from(index)),
+        )?;
+        ioeventfds.push(Arc::new(ioeventfd));
+    }
     Ok(Wired {
         transport,
-        ioeventfd: Arc::new(ioeventfd),
+        ioeventfds,
     })
 }
 
@@ -433,9 +439,10 @@ pub struct Machine<H: Hypervisor> {
     /// lock for the duration of one `run` and releases it before parking,
     /// so vCPUs of a paused guest can be locked from outside.
     vcpus: Vec<Arc<Mutex<<H::Vm as Vm>::Vcpu>>>,
-    /// Virtio devices, each with the ioeventfd bound on its notify register.
+    /// Virtio devices, each with one ioeventfd per queue on its notify
+    /// register.
     wired: Vec<Wired>,
-    /// One thread per device once started, each waiting on its ioeventfd.
+    /// The device thread once started, waiting on ioeventfds of each device.
     /// `Err` means an allowlist which failed to install.
     device_threads: Vec<JoinHandle<Result<()>>>,
     /// Registry the ioeventfds were created from, kept while they are bound.
@@ -736,7 +743,7 @@ impl<H: Hypervisor> Machine<H> {
         Arc::clone(&self.console)
     }
 
-    /// Start each vCPU and each device on its own thread.
+    /// Start each vCPU on its own thread and all devices on one thread.
     ///
     /// Each thread holds a clone of `GuestRam`. Host pages are unmapped
     /// together with the last clone instead of the `Machine`.
@@ -792,49 +799,70 @@ impl<H: Hypervisor> Machine<H> {
             })
             .collect();
 
-        // One thread per device, waiting on its ioeventfd. It reads the same
-        // order as vCPU threads, so a paused guest is not captured with a
-        // chain half served. On error the thread exits and machine state is
-        // unchanged.
-        self.device_threads = self
+        // One thread per machine, waiting on ioeventfds of each device.
+        // Fewer threads per guest, at the price that a device blocked in
+        // host I/O holds up the rest. Chains are served here instead of on
+        // vCPU threads. It reads the same order as vCPU threads, so a paused
+        // guest is not captured with a chain half served. On error the
+        // thread logs and exits, machine state is unchanged.
+        let rings: Vec<(Shared<Transport>, Arc<dyn IoeventFd>, u16)> = self
             .wired
             .iter()
-            .map(|wired| {
-                let transport = wired.transport.clone();
-                let ioeventfd = Arc::clone(&wired.ioeventfd);
-                let orders = Arc::clone(&self.orders);
-                let working = working.clone();
-                std::thread::spawn(move || {
-                    if let Some(filter) = working {
-                        filter.confine()?;
-                    }
-                    loop {
-                        // Signal during `notify` or a hold stays counted
-                        // for the next wait.
-                        match ioeventfd.wait(DEVICE_TICK) {
-                            Ok(Some(_rings)) => {
-                                if let Err(unanswered) = transport.with(|t| t.notify(VIRTIO_QUEUE))
-                                {
-                                    error!("device thread exits, notify failed: {unanswered}");
-                                    break;
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(unheard) => {
-                                error!("device thread exits, ioeventfd wait failed: {unheard}");
-                                break;
-                            }
-                        }
-                        match orders.standing() {
-                            Order::Run => {}
-                            Order::Hold => orders.wait_out_a_hold(),
-                            Order::Stop => break,
-                        }
-                    }
-                    Ok(())
-                })
+            .flat_map(|wired| {
+                wired
+                    .ioeventfds
+                    .iter()
+                    .enumerate()
+                    .map(|(ring, ioeventfd)| {
+                        (wired.transport.clone(), Arc::clone(ioeventfd), ring as u16)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
+        let orders = Arc::clone(&self.orders);
+        let filter = working.clone();
+        self.device_threads = vec![std::thread::spawn(move || {
+            if let Some(filter) = filter {
+                filter.confine()?;
+            }
+            let mut waiting = Waiting::new();
+            for (token, (_, ioeventfd, _)) in rings.iter().enumerate() {
+                waiting.add(ioeventfd.as_raw_fd(), token as u64);
+            }
+            let mut signalled = Vec::with_capacity(rings.len());
+            loop {
+                // Signal during `notify` or a hold stays counted for the next
+                // wait.
+                if waiting.ready(DEVICE_TICK, &mut signalled).is_err() {
+                    error!("device thread exits, ioeventfd wait failed");
+                    break;
+                }
+                // The read clears the count, ioeventfd left unread stays ready.
+                let taken = signalled.iter().try_for_each(|token| {
+                    rings[*token as usize].1.wait(Duration::ZERO).map(|_| ())
+                });
+                if taken.is_err() {
+                    error!("device thread exits, ioeventfd read failed");
+                    break;
+                }
+                // Each queue is served no matter it signalled or not. Device
+                // fed from host side has work without a kick, and `notify`
+                // over an empty queue raises no line.
+                let worked = rings
+                    .iter()
+                    .try_for_each(|(transport, _, ring)| transport.with(|t| t.notify(*ring)));
+                if let Err(unanswered) = worked {
+                    error!("device thread exits, notify failed: {unanswered}");
+                    break;
+                }
+                match orders.standing() {
+                    Order::Run => {}
+                    Order::Hold => orders.wait_out_a_hold(),
+                    Order::Stop => break,
+                }
+            }
+            Ok(())
+        })];
 
         self.state = State::Running;
         Ok(())
@@ -890,9 +918,11 @@ impl<H: Hypervisor> Machine<H> {
         for (index, thread) in self.threads.iter().enumerate() {
             self.vm.stop_vcpu(index as u16, thread)?;
         }
-        // Signal wakes each device thread now instead of at the next tick.
+        // Signal wakes the device thread now instead of at the next tick.
         for wired in &self.wired {
-            wired.ioeventfd.signal()?;
+            for ioeventfd in &wired.ioeventfds {
+                ioeventfd.signal()?;
+            }
         }
         Ok(())
     }
