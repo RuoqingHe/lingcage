@@ -372,6 +372,10 @@ mod tests {
         fn connect(&self, port: u32) -> Option<Box<dyn Stream>> {
             (port == OPEN_PORT).then(|| Box::new(self.0.clone()) as Box<dyn Stream>)
         }
+
+        fn incoming(&mut self) -> Option<(u32, Box<dyn Stream>)> {
+            None
+        }
     }
 
     /// Endpoint serving `OPEN_PORT` only.
@@ -380,6 +384,10 @@ mod tests {
     impl Endpoint for OnePort {
         fn connect(&self, port: u32) -> Option<Box<dyn Stream>> {
             (port == OPEN_PORT).then(|| Box::new(self.0.clone()) as Box<dyn Stream>)
+        }
+
+        fn incoming(&mut self) -> Option<(u32, Box<dyn Stream>)> {
+            None
         }
     }
 
