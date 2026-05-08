@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 
+use log::warn;
+
 use crate::devices::virtio::queue::{Chain, Queue};
 use crate::devices::virtio::vsock::connection::{Answer, Connection};
 use crate::devices::virtio::vsock::host::{self, Endpoint, Stream};
@@ -68,15 +70,32 @@ impl Vsock {
             return;
         }
         let ports = (header.src_port, header.dst_port);
-        if let Some((connection, _)) = self.open.get_mut(&ports) {
+        if let Some((connection, stream)) = self.open.get_mut(&ports) {
             let answer = connection.guest_sent(header, payload);
-            let done = connection.done();
+            let mut done = connection.done();
+            let mut reply = None;
             match answer {
-                Answer::Reply(reply) => self.owe(reply, Vec::new()),
+                Answer::Reply(header) => reply = Some(header),
+                // `OK <port>` is written before bytes of the guest are carried,
+                // host end refusing it is closed.
+                Answer::Opened => {
+                    let host_port = connection.ports().1;
+                    if let Err(refused) = host::acknowledge(stream.as_mut(), host_port) {
+                        warn!(
+                            "acknowledging an incoming connection failed, connection closed: \
+                             {refused}"
+                        );
+                        reply = Some(connection.host_done());
+                        done = true;
+                    }
+                }
                 // Bytes stay in the connection until `carry` writes them.
                 Answer::Took => {}
                 Answer::Drop => {}
                 Answer::Nothing => {}
+            }
+            if let Some(reply) = reply {
+                self.owe(reply, Vec::new());
             }
             if done {
                 self.open.remove(&ports);
@@ -502,6 +521,32 @@ mod tests {
         guest_offers(&ram, 0);
         vsock.notify(RX, &mut rx, &ram).expect("notify rx");
         assert_eq!(guest_given(&ram, 0).op, Op::Reset, "closed port accepted");
+    }
+
+    #[test]
+    fn test_incoming_acknowledged_with_port() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+
+        // Inserted directly, since the test endpoint serves `incoming`
+        // with `None`.
+        vsock.open.insert(
+            (GUEST_PORT, OPEN_PORT),
+            (
+                Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
+                Box::new(landed.clone()),
+            ),
+        );
+
+        guest_sends(&ram, 0, Op::Response, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("take the response");
+        assert_eq!(
+            landed.taken.lock().unwrap().as_slice(),
+            format!("OK {OPEN_PORT}\n").as_bytes(),
+            "no acknowledgement on host end"
+        );
     }
 
     #[test]

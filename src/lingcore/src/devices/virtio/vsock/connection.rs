@@ -20,7 +20,9 @@ const SHUTDOWN_SEND: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
-    /// Opened on request of the guest.
+    /// Requested by this end, no `Response` from the guest yet.
+    Asking,
+    /// Open at both ends, data is taken.
     Open,
     /// Shut down by the guest in one direction, data is refused.
     Closing,
@@ -36,6 +38,9 @@ pub enum Answer {
     /// Payload is held in `Connection::waiting` until the host end takes it.
     /// `forwarded` then sends the `fwd_cnt` which counts it.
     Took,
+    /// `Response` from the guest to the request sent by `Connection::asks`.
+    /// Device acknowledges the incoming connection on the host end.
+    Opened,
     /// Drop the connection without reply.
     Drop,
     /// No action.
@@ -78,9 +83,32 @@ impl Connection {
         }
     }
 
+    /// Create the connection which a host process connected to `guest_port`.
+    /// It is opened by `Response` of the guest to `Connection::asks`.
+    pub fn asking(guest_cid: u64, guest_port: u32, host_port: u32) -> Self {
+        Connection {
+            guest_port,
+            host_port,
+            guest_cid,
+            stage: Stage::Asking,
+            // `buf_alloc` of the guest arrives with its `Response`, `room`
+            // is zero until then.
+            peer_window: 0,
+            peer_taken: 0,
+            sent: 0,
+            taken: 0,
+            pending: Vec::new(),
+        }
+    }
+
     /// Returns the response to the request, the first header sent.
     pub fn opened(&self) -> Header {
         self.to_guest(Op::Response)
+    }
+
+    /// Returns the request for an incoming connection, the first header sent.
+    pub fn asks(&self) -> Header {
+        self.to_guest(Op::Request)
     }
 
     /// Returns guest port and host port, the pair the device looks up a
@@ -154,9 +182,15 @@ impl Connection {
             }
             Op::CreditRequest => Answer::Reply(self.to_guest(Op::CreditUpdate)),
             Op::CreditUpdate => Answer::Nothing,
-            // Connections are initiated by guest, so there is no request for
-            // the guest to answer.
-            Op::Response => Answer::Reply(self.to_guest(Op::Reset)),
+            Op::Response => {
+                // Only an incoming connection has a request out, `Response`
+                // on any other is reset.
+                if self.stage != Stage::Asking {
+                    return Answer::Reply(self.to_guest(Op::Reset));
+                }
+                self.stage = Stage::Open;
+                Answer::Opened
+            }
         }
     }
 
@@ -360,6 +394,63 @@ mod tests {
         taken.fwd_cnt = WINDOW;
         assert_eq!(open.guest_sent(&taken, &[]), Answer::Nothing);
         assert_eq!(open.room(), WINDOW, "reading did not give the room back");
+    }
+
+    /// Connection from the host end, before `Response` of the guest.
+    fn incoming() -> Connection {
+        Connection::asking(GUEST_CID, GUEST_PORT, HOST_PORT)
+    }
+
+    #[test]
+    fn test_incoming_request_addressing() {
+        let asks = incoming().asks();
+        assert_eq!(asks.op, Op::Request);
+        assert_eq!(asks.src_cid, HOST_CID);
+        assert_eq!(asks.dst_cid, GUEST_CID);
+        assert_eq!(asks.src_port, HOST_PORT);
+        assert_eq!(asks.dst_port, GUEST_PORT);
+    }
+
+    #[test]
+    fn test_room_zero_before_response() {
+        let mut asking = incoming();
+        assert_eq!(asking.room(), 0, "room is not zero before the response");
+        assert_eq!(
+            asking.guest_sent(&from_guest(Op::Response, 0), &[]),
+            Answer::Opened
+        );
+        assert_eq!(asking.room(), WINDOW, "room after the response was lost");
+    }
+
+    #[test]
+    fn test_data_only_after_response() {
+        let mut asking = incoming();
+        // Data before the `Response` is refused, connection is not open yet.
+        assert_eq!(
+            replied(&asking.guest_sent(&from_guest(Op::Data, 2), b"hi")).op,
+            Op::Reset
+        );
+
+        let mut open = incoming();
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Response, 0), &[]),
+            Answer::Opened
+        );
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, 2), b"hi"),
+            Answer::Took
+        );
+        assert_eq!(open.waiting(), b"hi");
+    }
+
+    #[test]
+    fn test_drop_refused_incoming() {
+        let mut asking = incoming();
+        assert_eq!(
+            asking.guest_sent(&from_guest(Op::Reset, 0), &[]),
+            Answer::Drop
+        );
+        assert!(asking.done());
     }
 
     #[test]
