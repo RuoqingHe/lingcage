@@ -114,6 +114,9 @@ pub enum Error {
     /// Failed to open the disk file or read its length.
     #[error("failed to open disk file")]
     Disk(#[source] std::io::Error),
+    /// Failed to bind the channel socket.
+    #[error("failed to bind channel socket")]
+    Channel(#[source] std::io::Error),
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
@@ -592,7 +595,8 @@ impl<H: Hypervisor> Machine<H> {
             )?);
         }
         if let Some(channel) = &config.channel {
-            let reached = Vsock::new(channel.cid, Box::new(Sockets::new(&channel.at)));
+            let sockets = Sockets::listening(&channel.at).map_err(Error::Channel)?;
+            let reached = Vsock::new(channel.cid, Box::new(sockets));
             wired.push(place_virtio(
                 &mut bus,
                 &vm,

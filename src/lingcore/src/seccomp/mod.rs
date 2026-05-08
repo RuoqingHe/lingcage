@@ -147,9 +147,11 @@ impl Thread {
                 Ok(BTreeMap::from([(libc::SYS_ioctl, vec![enter])]))
             }
             // The ioeventfd is polled and read, the disk is sought, read,
-            // written and flushed, the channel opens, connects, sends on,
-            // receives on and closes a host socket per connection.
+            // written and flushed, the channel accepts incoming connections and
+            // opens, connects, sends on, receives on and closes a host socket
+            // per connection.
             Thread::Device => Ok(BTreeMap::from([
+                (libc::SYS_accept4, Vec::new()),
                 (libc::SYS_close, Vec::new()),
                 (libc::SYS_connect, Vec::new()),
                 (libc::SYS_fcntl, Vec::new()),
