@@ -7,6 +7,7 @@
 //! addresses, bytes read from a host end fill buffers of receive ring.
 
 use std::collections::HashMap;
+use std::io::{self, Read};
 
 use log::warn;
 
@@ -198,8 +199,8 @@ impl Vsock {
     }
 
     /// Read each host stream up to the credit of its connection and queue
-    /// the bytes for receive ring. Stream which failed is closed with a
-    /// reset.
+    /// the bytes for receive ring. Stream at end of stream or failed is
+    /// closed with a reset.
     pub fn pump(&mut self) {
         let mut gone = Vec::new();
         let mut owed = Vec::new();
@@ -209,14 +210,15 @@ impl Vsock {
                 continue;
             }
             let mut taken = vec![0u8; room as usize];
-            match host::read(stream.as_mut(), &mut taken) {
-                // Zero is `WouldBlock` mapped by `host::read`, stream stays
-                // open.
-                Ok(0) => {}
+            match stream.read(&mut taken) {
+                // Zero means end of stream, host end has closed.
+                Ok(0) => gone.push(*ports),
                 Ok(count) => {
                     taken.truncate(count);
                     owed.push((connection.host_sent(count as u32), taken));
                 }
+                // No bytes ready, stream stays open.
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => gone.push(*ports),
             }
         }
@@ -386,6 +388,8 @@ mod tests {
         taken: Arc<Mutex<Vec<u8>>>,
         /// Bytes for the guest to read.
         ready: Arc<Mutex<Vec<u8>>>,
+        /// Set once the far end has closed.
+        gone: Arc<Mutex<bool>>,
     }
 
     impl io::Write for Landed {
@@ -402,6 +406,15 @@ mod tests {
     impl io::Read for Landed {
         fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
             let mut held = self.ready.lock().unwrap();
+            if held.is_empty() {
+                // Read like a socket does, `WouldBlock` with no bytes ready
+                // and zero once the other end has closed.
+                return if *self.gone.lock().unwrap() {
+                    Ok(0)
+                } else {
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                };
+            }
             let taken = held.len().min(into.len());
             into[..taken].copy_from_slice(&held[..taken]);
             held.drain(..taken);
@@ -432,7 +445,7 @@ mod tests {
 
     impl io::Read for Backed {
         fn read(&mut self, _into: &mut [u8]) -> io::Result<usize> {
-            Ok(0)
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
         }
     }
 
@@ -675,6 +688,36 @@ mod tests {
             0,
             "incoming connection taken past the limit"
         );
+    }
+
+    #[test]
+    fn test_host_close_resets_connection() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("take the request");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("answer it");
+        assert_eq!(guest_given(&ram, 0).op, Op::Response);
+        assert_eq!(vsock.open.len(), 1);
+
+        // Far end closes without any write from the guest, so the read in
+        // `pump` is the only place it shows up.
+        *landed.gone.lock().unwrap() = true;
+        guest_offers(&ram, 1);
+        vsock
+            .notify(RX, &mut rx, &ram)
+            .expect("read from the host end");
+        assert_eq!(
+            guest_given(&ram, 1).op,
+            Op::Reset,
+            "no reset after host end closed"
+        );
+        assert!(vsock.open.is_empty(), "connection still open");
     }
 
     #[test]

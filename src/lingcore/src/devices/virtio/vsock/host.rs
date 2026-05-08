@@ -28,8 +28,7 @@ const LINE: usize = 32;
 /// count.
 const ARRIVALS: usize = 64;
 
-/// Host stream of one connection, read without blocking through
-/// [`read`].
+/// Host stream of one connection, read and written without blocking.
 pub trait Stream: Read + Write + Send {}
 
 impl<S: Read + Write + Send> Stream for S {}
@@ -222,15 +221,6 @@ pub fn write(stream: &mut dyn Stream, bytes: &[u8]) -> io::Result<usize> {
     }
 }
 
-/// Read from `stream` into `into`. Returns zero on `WouldBlock`.
-pub fn read(stream: &mut dyn Stream, into: &mut [u8]) -> io::Result<usize> {
-    match stream.read(into) {
-        Ok(taken) => Ok(taken),
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(0),
-        Err(err) => Err(err),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::devices::virtio::vsock::host::*;
@@ -302,10 +292,7 @@ mod tests {
         let (port, mut stream) = sockets.incoming().expect("port named");
         assert_eq!(port, 9);
         let mut said = [0u8; 5];
-        assert_eq!(
-            read(stream.as_mut(), &mut said).expect("read what follows"),
-            5
-        );
+        assert_eq!(stream.read(&mut said).expect("read what follows"), 5);
         assert_eq!(&said, b"hello");
         std::fs::remove_file(&path).expect("remove the socket");
     }
