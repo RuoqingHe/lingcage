@@ -32,6 +32,14 @@ const QUEUES: u16 = 3;
 /// Largest payload of one packet, `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE`.
 const PACKET: usize = 64 * 1024;
 
+/// Bit set in each host port assigned to an incoming connection, to keep
+/// it out of the range a guest connects to.
+const HOST_SIDE: u32 = 1 << 30;
+
+/// Maximum connections open at once. Guest request beyond it is reset,
+/// incoming connections wait at the endpoint.
+const CONNECTIONS: usize = 1024;
+
 /// Vsock device, with context id of the guest, the endpoint its
 /// connections are opened on, and the open connections.
 pub struct Vsock {
@@ -43,6 +51,8 @@ pub struct Vsock {
     /// Packets for receive ring, held until the guest offers a buffer. Their
     /// bytes are already read from the host end.
     waiting: Vec<(Header, Vec<u8>)>,
+    /// Host port assigned to the last incoming connection.
+    last_port: u32,
 }
 
 impl Vsock {
@@ -54,6 +64,37 @@ impl Vsock {
             endpoint,
             open: HashMap::new(),
             waiting: Vec::new(),
+            last_port: 0,
+        }
+    }
+
+    /// Returns a host port without connection to `guest_port`. Up to
+    /// `CONNECTIONS` ports are tried, which is more than can be open at
+    /// once.
+    fn free_port(&mut self, guest_port: u32) -> u32 {
+        for _ in 0..CONNECTIONS {
+            self.last_port = (self.last_port.wrapping_add(1) & !(1 << 31)) | HOST_SIDE;
+            if !self.open.contains_key(&(guest_port, self.last_port)) {
+                break;
+            }
+        }
+        self.last_port
+    }
+
+    /// Open a connection for each incoming connection at the endpoint and
+    /// queue its request to the guest. At `CONNECTIONS` open, incoming
+    /// connections are left at the endpoint.
+    fn take_incoming(&mut self) {
+        while self.open.len() < CONNECTIONS {
+            let Some((guest_port, stream)) = self.endpoint.incoming() else {
+                return;
+            };
+            let host_port = self.free_port(guest_port);
+            let connection = Connection::asking(self.guest_cid, guest_port, host_port);
+            let asks = connection.asks();
+            self.open
+                .insert((guest_port, host_port), (connection, stream));
+            self.owe(asks, Vec::new());
         }
     }
 
@@ -105,6 +146,15 @@ impl Vsock {
         // No connection on these ports. Request opens one, any other packet
         // is reset, so that a stale connection in the guest gets closed.
         if header.op != Op::Request {
+            self.owe(header.answer(Op::Reset), Vec::new());
+            return;
+        }
+        // The limit counts connections of both ends.
+        if self.open.len() >= CONNECTIONS {
+            warn!(
+                "guest request for port {} reset, connection limit reached",
+                header.dst_port
+            );
             self.owe(header.answer(Op::Reset), Vec::new());
             return;
         }
@@ -234,10 +284,12 @@ impl Device for Vsock {
         match index {
             TX => {
                 self.take(queue, ram)?;
+                self.take_incoming();
                 self.carry();
                 self.pump();
             }
             RX => {
+                self.take_incoming();
                 // Host end full at the last `carry` may take bytes now.
                 self.carry();
                 self.pump();
@@ -397,6 +449,25 @@ mod tests {
         }
     }
 
+    /// Endpoint with incoming connections waiting, counts the calls to
+    /// `incoming`.
+    struct Incoming {
+        waiting: Vec<(u32, Landed)>,
+        asked: Arc<Mutex<usize>>,
+    }
+
+    impl Endpoint for Incoming {
+        fn connect(&self, _port: u32) -> Option<Box<dyn Stream>> {
+            None
+        }
+
+        fn incoming(&mut self) -> Option<(u32, Box<dyn Stream>)> {
+            *self.asked.lock().unwrap() += 1;
+            let (port, landed) = self.waiting.pop()?;
+            Some((port, Box::new(landed)))
+        }
+    }
+
     /// Endpoint serving `OPEN_PORT` only.
     struct OnePort(Landed);
 
@@ -521,6 +592,116 @@ mod tests {
         guest_offers(&ram, 0);
         vsock.notify(RX, &mut rx, &ram).expect("notify rx");
         assert_eq!(guest_given(&ram, 0).op, Op::Reset, "closed port accepted");
+    }
+
+    #[test]
+    fn test_incoming_request_sent_to_guest() {
+        let landed = Landed::default();
+        let mut vsock = Vsock::new(
+            GUEST_CID,
+            Box::new(Incoming {
+                waiting: vec![(GUEST_PORT, landed.clone())],
+                asked: Arc::new(Mutex::new(0)),
+            }),
+        );
+        let ram = ram();
+        let mut rx = queue(RX_RING);
+
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        let asked = guest_given(&ram, 0);
+        assert_eq!(asked.op, Op::Request, "no request queued for guest");
+        assert_eq!(asked.dst_cid, GUEST_CID);
+        assert_eq!(asked.dst_port, GUEST_PORT, "guest port connected is lost");
+        assert_eq!(
+            asked.src_port & HOST_SIDE,
+            HOST_SIDE,
+            "host port lacks HOST_SIDE"
+        );
+    }
+
+    #[test]
+    fn test_incoming_gets_unique_host_port() {
+        let mut vsock = Vsock::new(
+            GUEST_CID,
+            Box::new(Incoming {
+                waiting: vec![
+                    (GUEST_PORT, Landed::default()),
+                    (GUEST_PORT, Landed::default()),
+                ],
+                asked: Arc::new(Mutex::new(0)),
+            }),
+        );
+        let ram = ram();
+        let mut rx = queue(RX_RING);
+
+        guest_offers(&ram, 0);
+        guest_offers(&ram, 1);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        let (first, second) = (guest_given(&ram, 0), guest_given(&ram, 1));
+        assert_ne!(
+            first.src_port, second.src_port,
+            "two incoming connections got the same host port"
+        );
+        assert_eq!(vsock.open.len(), 2);
+    }
+
+    #[test]
+    fn test_incoming_left_at_connection_limit() {
+        let asked = Arc::new(Mutex::new(0));
+        let mut vsock = Vsock::new(
+            GUEST_CID,
+            Box::new(Incoming {
+                waiting: vec![(GUEST_PORT, Landed::default())],
+                asked: Arc::clone(&asked),
+            }),
+        );
+        // At `CONNECTIONS` open, incoming connection stays at the endpoint.
+        for port in 0..CONNECTIONS as u32 {
+            vsock.open.insert(
+                (port, OPEN_PORT),
+                (
+                    Connection::asking(GUEST_CID, port, OPEN_PORT),
+                    Box::new(Landed::default()),
+                ),
+            );
+        }
+        let ram = ram();
+        let mut rx = queue(RX_RING);
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            0,
+            "incoming connection taken past the limit"
+        );
+    }
+
+    #[test]
+    fn test_reject_request_at_connection_limit() {
+        let mut vsock = device(&Landed::default());
+        for port in 0..CONNECTIONS as u32 {
+            vsock.open.insert(
+                (port, OPEN_PORT),
+                (
+                    Connection::asking(GUEST_CID, port, OPEN_PORT),
+                    Box::new(Landed::default()),
+                ),
+            );
+        }
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        assert_eq!(
+            guest_given(&ram, 0).op,
+            Op::Reset,
+            "request past the limit not reset"
+        );
     }
 
     #[test]
