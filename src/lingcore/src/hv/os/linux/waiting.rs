@@ -16,6 +16,9 @@ use crate::hv::{Error, Result};
 ///
 /// Descriptors are borrowed instead of owned, caller keeps them open
 /// while a wait is running.
+///
+/// The set is passed to `poll(2)` on each wait, so cost of a wait is
+/// linear to the number of descriptors.
 #[derive(Default)]
 pub struct Waiting {
     waited: Vec<(RawFd, u64)>,
