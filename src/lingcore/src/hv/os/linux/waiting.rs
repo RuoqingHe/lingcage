@@ -10,7 +10,7 @@
 use std::os::fd::RawFd;
 use std::time::Duration;
 
-use crate::hv::{Error, Result};
+use crate::hv::{Error, Interest, Result};
 
 /// Descriptors to wait on, each with the token `ready` reports it with.
 ///
@@ -21,7 +21,7 @@ use crate::hv::{Error, Result};
 /// linear to the number of descriptors.
 #[derive(Default)]
 pub struct Waiting {
-    waited: Vec<(RawFd, u64)>,
+    waited: Vec<(RawFd, u64, Interest)>,
 }
 
 impl Waiting {
@@ -30,9 +30,13 @@ impl Waiting {
         Waiting::default()
     }
 
-    /// Add `fd`, reported as `token` once ready.
-    pub fn add(&mut self, fd: RawFd, token: u64) {
-        self.waited.push((fd, token));
+    /// Add `fd`, reported as `token` once ready for `interest`.
+    pub fn add(&mut self, fd: RawFd, token: u64, interest: Interest) {
+        self.waited.push((fd, token, interest));
+    }
+
+    pub fn clear(&mut self) {
+        self.waited.clear();
     }
 
     /// Number of descriptors.
@@ -57,9 +61,13 @@ impl Waiting {
         let mut waiting: Vec<libc::pollfd> = self
             .waited
             .iter()
-            .map(|(fd, _)| libc::pollfd {
+            .map(|(fd, _, interest)| libc::pollfd {
                 fd: *fd,
-                events: libc::POLLIN,
+                events: match interest {
+                    Interest::Read => libc::POLLIN,
+                    Interest::Write => libc::POLLOUT,
+                    Interest::Both => libc::POLLIN | libc::POLLOUT,
+                },
                 revents: 0,
             })
             .collect();
@@ -79,7 +87,8 @@ impl Waiting {
         for (slot, polled) in waiting.iter().enumerate() {
             // Hung up descriptor is reported ready. poll(2) sets `POLLHUP`
             // and `POLLERR` even if they are not in `events`.
-            if polled.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let told = libc::POLLIN | libc::POLLOUT | libc::POLLHUP | libc::POLLERR;
+            if polled.revents & told != 0 {
                 ready.push(self.waited[slot].1);
             }
         }
@@ -129,7 +138,7 @@ mod tests {
     fn test_quiet_descriptor_times_out() {
         let quiet = Eventfd::new();
         let mut waiting = Waiting::new();
-        waiting.add(quiet.fd(), 7);
+        waiting.add(quiet.fd(), 7, Interest::Read);
         let mut ready = vec![99];
         waiting
             .ready(Duration::from_millis(20), &mut ready)
@@ -143,8 +152,8 @@ mod tests {
         let first = Eventfd::new();
         let second = Eventfd::new();
         let mut waiting = Waiting::new();
-        waiting.add(first.fd(), 10);
-        waiting.add(second.fd(), 20);
+        waiting.add(first.fd(), 10, Interest::Read);
+        waiting.add(second.fd(), 20, Interest::Read);
 
         second.signal();
         let mut ready = Vec::new();
@@ -166,8 +175,8 @@ mod tests {
         let first = Eventfd::new();
         let second = Eventfd::new();
         let mut waiting = Waiting::new();
-        waiting.add(first.fd(), 10);
-        waiting.add(second.fd(), 20);
+        waiting.add(first.fd(), 10, Interest::Read);
+        waiting.add(second.fd(), 20, Interest::Read);
         assert_eq!(waiting.len(), 2);
 
         first.signal();

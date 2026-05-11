@@ -94,6 +94,18 @@ pub enum Cap {
     DirtyLog,
 }
 
+/// Readiness to wait on a descriptor for. Descriptor waited on for a
+/// readiness the caller does not act on is reported ready on each wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interest {
+    /// Bytes are ready to read.
+    Read,
+    /// Write would not block.
+    Write,
+    /// Readable or writable.
+    Both,
+}
+
 /// State captured from a guest, a vCPU, an irqchip or the clock for
 /// example, as bytes in the layout of the backend which wrote them,
 /// tagged with that backend, the architecture and the layout version.

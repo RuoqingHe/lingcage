@@ -25,6 +25,7 @@ use crate::devices::virtio::mmio::{self, Transport};
 use crate::devices::virtio::vsock::device::Vsock;
 use crate::devices::virtio::vsock::host::Sockets;
 use crate::devices::{Blob, Receive, Shared};
+use crate::hv::Interest;
 use crate::hv::hypervisor::Hypervisor;
 use crate::hv::memory::{MemMapOption, VmMemory};
 use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
@@ -856,7 +857,7 @@ impl<H: Hypervisor> Machine<H> {
             }
             let mut waiting = Waiting::new();
             for (token, (_, ioeventfd, _)) in rings.iter().enumerate() {
-                waiting.add(ioeventfd.as_raw_fd(), token as u64);
+                waiting.add(ioeventfd.as_raw_fd(), token as u64, Interest::Read);
             }
             let mut signalled = Vec::with_capacity(rings.len());
             loop {
