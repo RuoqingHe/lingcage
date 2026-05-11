@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::os::fd::RawFd;
+use std::time::{Duration, Instant};
 
 use log::warn;
 
@@ -39,18 +40,30 @@ const PACKET: usize = 64 * 1024;
 /// it out of the range a guest connects to.
 const HOST_SIDE: u32 = 1 << 30;
 
+/// Longest time a connection waits for a packet from the guest before
+/// it is reset.
+const PATIENCE: Duration = Duration::from_secs(2);
+
 /// Maximum connections open at once. Guest request beyond it is reset,
 /// incoming connections wait at the endpoint.
 const CONNECTIONS: usize = 1024;
+
+/// Open connection with its host stream.
+struct Held {
+    connection: Connection,
+    stream: Box<dyn Stream>,
+    /// Moment the connection was first found waiting on the guest. `None`
+    /// while it is not waiting.
+    since: Option<Instant>,
+}
 
 /// Vsock device, with context id of the guest, the endpoint its
 /// connections are opened on, and the open connections.
 pub struct Vsock {
     guest_cid: u64,
     endpoint: Box<dyn Endpoint>,
-    /// Open connections keyed by guest port and host port, each with its
-    /// host stream.
-    open: HashMap<(u32, u32), (Connection, Box<dyn Stream>)>,
+    /// Open connections keyed by guest port and host port.
+    open: HashMap<(u32, u32), Held>,
     /// Packets for receive ring, held until the guest offers a buffer. Their
     /// bytes are already read from the host end.
     waiting: Vec<(Header, Vec<u8>)>,
@@ -95,9 +108,45 @@ impl Vsock {
             let host_port = self.free_port(guest_port);
             let connection = Connection::asking(self.guest_cid, guest_port, host_port);
             let asks = connection.asks();
-            self.open
-                .insert((guest_port, host_port), (connection, stream));
+            self.open.insert(
+                (guest_port, host_port),
+                Held {
+                    connection,
+                    stream,
+                    since: None,
+                },
+            );
             self.owe(asks, Vec::new());
+        }
+    }
+
+    /// Reset each connection which has waited on the guest for `PATIENCE`,
+    /// counted from the first call which found it waiting. `now` is the
+    /// clock of the caller.
+    fn expire(&mut self, now: Instant) {
+        let mut over = Vec::new();
+        for (ports, held) in &mut self.open {
+            if !held.connection.waiting_on_guest() {
+                held.since = None;
+                continue;
+            }
+            let since = *held.since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= PATIENCE {
+                over.push(*ports);
+            }
+        }
+        let mut owed = Vec::new();
+        for ports in over {
+            if let Some(mut held) = self.open.remove(&ports) {
+                warn!(
+                    "connection on port {} reset, guest did not answer in time",
+                    ports.1
+                );
+                owed.push(held.connection.host_done());
+            }
+        }
+        for header in owed {
+            self.owe(header, Vec::new());
         }
     }
 
@@ -114,7 +163,10 @@ impl Vsock {
             return;
         }
         let ports = (header.src_port, header.dst_port);
-        if let Some((connection, stream)) = self.open.get_mut(&ports) {
+        if let Some(Held {
+            connection, stream, ..
+        }) = self.open.get_mut(&ports)
+        {
             let answer = connection.guest_sent(header, payload);
             let mut done = connection.done();
             let mut reply = None;
@@ -165,7 +217,14 @@ impl Vsock {
             Some(stream) => {
                 let connection = Connection::new(self.guest_cid, header);
                 let opened = connection.opened();
-                self.open.insert(ports, (connection, stream));
+                self.open.insert(
+                    ports,
+                    Held {
+                        connection,
+                        stream,
+                        since: None,
+                    },
+                );
                 self.owe(opened, Vec::new());
             }
             None => self.owe(header.answer(Op::Reset), Vec::new()),
@@ -179,7 +238,8 @@ impl Vsock {
     fn carry(&mut self) {
         let mut gone = Vec::new();
         let mut owed = Vec::new();
-        for (ports, (connection, stream)) in &mut self.open {
+        for (ports, held) in &mut self.open {
+            let (connection, stream) = (&mut held.connection, &mut held.stream);
             let waiting = connection.waiting();
             if waiting.is_empty() {
                 continue;
@@ -191,8 +251,8 @@ impl Vsock {
             }
         }
         for ports in gone {
-            if let Some((mut connection, _)) = self.open.remove(&ports) {
-                owed.push(connection.host_done());
+            if let Some(mut held) = self.open.remove(&ports) {
+                owed.push(held.connection.host_done());
             }
         }
         for header in owed {
@@ -206,7 +266,8 @@ impl Vsock {
     pub fn pump(&mut self) {
         let mut gone = Vec::new();
         let mut owed = Vec::new();
-        for (ports, (connection, stream)) in &mut self.open {
+        for (ports, held) in &mut self.open {
+            let (connection, stream) = (&mut held.connection, &mut held.stream);
             let room = connection.room().min(PACKET as u32);
             if room == 0 {
                 continue;
@@ -225,8 +286,8 @@ impl Vsock {
             }
         }
         for ports in gone {
-            if let Some((mut connection, _)) = self.open.remove(&ports) {
-                owed.push((connection.host_done(), Vec::new()));
+            if let Some(mut held) = self.open.remove(&ports) {
+                owed.push((held.connection.host_done(), Vec::new()));
             }
         }
         for (header, payload) in owed {
@@ -296,11 +357,14 @@ impl Device for Vsock {
         } else {
             Vec::new()
         };
-        for (connection, stream) in self.open.values() {
-            let Some(fd) = stream.descriptor() else {
+        for held in self.open.values() {
+            let Some(fd) = held.stream.descriptor() else {
                 continue;
             };
-            let interest = match (connection.room() > 0, !connection.waiting().is_empty()) {
+            let interest = match (
+                held.connection.room() > 0,
+                !held.connection.waiting().is_empty(),
+            ) {
                 (true, true) => Interest::Both,
                 (true, false) => Interest::Read,
                 (false, true) => Interest::Write,
@@ -318,12 +382,14 @@ impl Device for Vsock {
                 self.take_incoming();
                 self.carry();
                 self.pump();
+                self.expire(Instant::now());
             }
             RX => {
                 self.take_incoming();
                 // Host end full at the last `carry` may take bytes now.
                 self.carry();
                 self.pump();
+                self.expire(Instant::now());
                 self.give(queue, ram)?;
             }
             // Event queue is left empty.
@@ -734,10 +800,11 @@ mod tests {
         for port in 0..CONNECTIONS as u32 {
             vsock.open.insert(
                 (port, OPEN_PORT),
-                (
-                    Connection::asking(GUEST_CID, port, OPEN_PORT),
-                    Box::new(Landed::default()),
-                ),
+                Held {
+                    connection: Connection::asking(GUEST_CID, port, OPEN_PORT),
+                    stream: Box::new(Landed::default()),
+                    since: None,
+                },
             );
         }
         let ram = ram();
@@ -798,10 +865,11 @@ mod tests {
         // No `Response` yet, so the guest has no room, fd is not waited on.
         vsock.open.insert(
             (GUEST_PORT, OPEN_PORT),
-            (
-                Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
-                Box::new(ours),
-            ),
+            Held {
+                connection: Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
+                stream: Box::new(ours),
+                since: None,
+            },
         );
         assert_eq!(
             waited(&vsock),
@@ -823,12 +891,67 @@ mod tests {
             .open
             .get_mut(&(GUEST_PORT, OPEN_PORT))
             .expect("connection")
-            .0
+            .connection
             .forwarded(2);
         assert_eq!(
             waited(&vsock),
             None,
             "host end with no room and no bytes waited on"
+        );
+    }
+
+    /// Insert an incoming connection not answered by the guest yet.
+    fn incoming_and_waiting(vsock: &mut Vsock) {
+        vsock.open.insert(
+            (GUEST_PORT, OPEN_PORT),
+            Held {
+                connection: Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
+                stream: Box::new(Landed::default()),
+                since: None,
+            },
+        );
+    }
+
+    #[test]
+    fn test_expire_unanswered_incoming() {
+        let mut vsock = device(&Landed::default());
+        let start = std::time::Instant::now();
+        incoming_and_waiting(&mut vsock);
+
+        // First call starts the wait, later ones do not restart it.
+        vsock.expire(start);
+        vsock.expire(start + PATIENCE / 2);
+        assert_eq!(
+            vsock.open.len(),
+            1,
+            "incoming connection reset before `PATIENCE`"
+        );
+
+        vsock.expire(start + PATIENCE);
+        assert!(
+            vsock.open.is_empty(),
+            "unanswered connect kept past `PATIENCE`"
+        );
+        assert_eq!(
+            vsock.waiting.first().map(|(header, _)| header.op),
+            Some(Op::Reset),
+            "no reset queued for expired connect"
+        );
+    }
+
+    #[test]
+    fn test_keep_answered_incoming() {
+        let mut vsock = device(&Landed::default());
+        let start = std::time::Instant::now();
+        incoming_and_waiting(&mut vsock);
+        vsock.expire(start);
+
+        vsock.took(&from_guest(Op::Response, 0, WINDOW), &[]);
+        vsock.expire(start + PATIENCE * 10);
+        assert_eq!(
+            vsock.open.len(),
+            1,
+            "answered connect reset together with unanswered ones"
         );
     }
 
@@ -868,10 +991,11 @@ mod tests {
         for port in 0..CONNECTIONS as u32 {
             vsock.open.insert(
                 (port, OPEN_PORT),
-                (
-                    Connection::asking(GUEST_CID, port, OPEN_PORT),
-                    Box::new(Landed::default()),
-                ),
+                Held {
+                    connection: Connection::asking(GUEST_CID, port, OPEN_PORT),
+                    stream: Box::new(Landed::default()),
+                    since: None,
+                },
             );
         }
         let ram = ram();
@@ -900,10 +1024,11 @@ mod tests {
         // with `None`.
         vsock.open.insert(
             (GUEST_PORT, OPEN_PORT),
-            (
-                Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
-                Box::new(landed.clone()),
-            ),
+            Held {
+                connection: Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
+                stream: Box::new(landed.clone()),
+                since: None,
+            },
         );
 
         guest_sends(&ram, 0, Op::Response, OPEN_PORT, &[]);

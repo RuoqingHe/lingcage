@@ -122,6 +122,12 @@ impl Connection {
         self.stage == Stage::Closed
     }
 
+    /// Returns whether the connection is waiting for a packet from the
+    /// guest, either the `Response` to a request or the rest of a shutdown.
+    pub fn waiting_on_guest(&self) -> bool {
+        matches!(self.stage, Stage::Asking | Stage::Closing)
+    }
+
     /// Returns a header for `op` addressed to the guest, with the credit
     /// carried.
     fn to_guest(&self, op: Op) -> Header {
@@ -441,6 +447,34 @@ mod tests {
             Answer::Took
         );
         assert_eq!(open.waiting(), b"hi");
+    }
+
+    #[test]
+    fn test_waiting_on_guest() {
+        assert!(
+            incoming().waiting_on_guest(),
+            "incoming connection waits for response"
+        );
+        assert!(
+            !opened().waiting_on_guest(),
+            "open connection is not waiting"
+        );
+
+        let mut half = opened();
+        let mut shutdown = from_guest(Op::Shutdown, 0);
+        shutdown.flags = SHUTDOWN_SEND;
+        assert_eq!(half.guest_sent(&shutdown, &[]), Answer::Nothing);
+        assert!(half.waiting_on_guest(), "half shutdown is still waiting");
+
+        let mut answered = incoming();
+        assert_eq!(
+            answered.guest_sent(&from_guest(Op::Response, 0), &[]),
+            Answer::Opened
+        );
+        assert!(
+            !answered.waiting_on_guest(),
+            "answered connect is still waiting"
+        );
     }
 
     #[test]
