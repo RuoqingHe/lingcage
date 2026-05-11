@@ -79,9 +79,13 @@ const VIRTIO_IRQ: u8 = 5;
 /// Host file read by the entropy source.
 const ENTROPY_SOURCE: &str = "/dev/urandom";
 
-/// Maximum time the device thread waits on the ioeventfds before
-/// reading the order.
+/// Maximum time the device thread waits on the ioeventfds and host
+/// descriptors before reading the order.
 const DEVICE_TICK: Duration = Duration::from_millis(200);
+
+/// Token a host descriptor is reported with, token of an ioeventfd is
+/// its ring index.
+const OUTSIDE: u64 = u64::MAX;
 
 /// Maximum time `pause` waits for vCPU and device threads to park. The
 /// stop lands as a signal plus a flag read on entry to `run`, so a vCPU
@@ -849,6 +853,13 @@ impl<H: Hypervisor> Machine<H> {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // Each transport once, for its host descriptors. `rings` lists a
+        // device once per queue.
+        let outsides: Vec<Shared<Transport>> = self
+            .wired
+            .iter()
+            .map(|wired| wired.transport.clone())
+            .collect();
         let orders = Arc::clone(&self.orders);
         let filter = working.clone();
         self.device_threads = vec![std::thread::spawn(move || {
@@ -856,28 +867,41 @@ impl<H: Hypervisor> Machine<H> {
                 filter.confine()?;
             }
             let mut waiting = Waiting::new();
-            for (token, (_, ioeventfd, _)) in rings.iter().enumerate() {
-                waiting.add(ioeventfd.as_raw_fd(), token as u64, Interest::Read);
-            }
             let mut signalled = Vec::with_capacity(rings.len());
             loop {
+                // The set is rebuilt in each round. Descriptors of a device
+                // change with its connections, and interest of each changes
+                // with credit of the guest.
+                waiting.clear();
+                for (token, (_, ioeventfd, _)) in rings.iter().enumerate() {
+                    waiting.add(ioeventfd.as_raw_fd(), token as u64, Interest::Read);
+                }
+                for transport in &outsides {
+                    for (fd, interest) in transport.with(|t| t.outside()) {
+                        waiting.add(fd, OUTSIDE, interest);
+                    }
+                }
                 // Signal during `notify` or a hold stays counted for the next
                 // wait.
                 if waiting.ready(DEVICE_TICK, &mut signalled).is_err() {
                     error!("device thread exits, ioeventfd wait failed");
                     break;
                 }
-                // The read clears the count, ioeventfd left unread stays ready.
-                let taken = signalled.iter().try_for_each(|token| {
-                    rings[*token as usize].1.wait(Duration::ZERO).map(|_| ())
-                });
+                // The read clears the count, ioeventfd left unread stays
+                // ready. Host descriptor has no count to clear.
+                let taken = signalled
+                    .iter()
+                    .filter(|token| **token != OUTSIDE)
+                    .try_for_each(|token| {
+                        rings[*token as usize].1.wait(Duration::ZERO).map(|_| ())
+                    });
                 if taken.is_err() {
                     error!("device thread exits, ioeventfd read failed");
                     break;
                 }
-                // Each queue is served no matter it signalled or not. Device
-                // fed from host side has work without a kick, and `notify`
-                // over an empty queue raises no line.
+                // Each queue is served no matter it signalled or not. Host
+                // descriptor is reported with `OUTSIDE` instead of against a
+                // queue, and `notify` over an empty queue raises no line.
                 let worked = rings
                     .iter()
                     .try_for_each(|(transport, _, ring)| transport.with(|t| t.notify(*ring)));
