@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read};
+use std::os::fd::RawFd;
 
 use log::warn;
 
@@ -16,6 +17,7 @@ use crate::devices::virtio::vsock::connection::{Answer, Connection};
 use crate::devices::virtio::vsock::host::{self, Endpoint, Stream};
 use crate::devices::virtio::vsock::packet::{HOST_CID, Header, Op, ROOM, STREAM};
 use crate::devices::virtio::{Device, Error, Result};
+use crate::hv::Interest;
 use crate::mem::GuestRam;
 
 // TODO: `VIRTIO_VSOCK_F_SEQPACKET` is not yet offered.
@@ -282,6 +284,33 @@ impl Device for Vsock {
         read
     }
 
+    /// Returns descriptors of the endpoint while below `CONNECTIONS` open,
+    /// plus host end of each open connection, with `Read` while the guest
+    /// has room, `Write` while bytes wait for the host end, and `Both` for
+    /// both. One with neither is left out until credit of the guest arrives
+    /// on the ring.
+    fn outside(&self) -> Vec<(RawFd, Interest)> {
+        // At `CONNECTIONS` open, endpoint is not waited on.
+        let mut waited = if self.open.len() < CONNECTIONS {
+            self.endpoint.outside()
+        } else {
+            Vec::new()
+        };
+        for (connection, stream) in self.open.values() {
+            let Some(fd) = stream.descriptor() else {
+                continue;
+            };
+            let interest = match (connection.room() > 0, !connection.waiting().is_empty()) {
+                (true, true) => Interest::Both,
+                (true, false) => Interest::Read,
+                (false, true) => Interest::Write,
+                (false, false) => continue,
+            };
+            waited.push((fd, interest));
+        }
+        waited
+    }
+
     fn notify(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
         match index {
             TX => {
@@ -360,6 +389,7 @@ fn write_packet(chain: &Chain, ram: &GuestRam, header: &Header, payload: &[u8]) 
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::os::fd::AsRawFd;
     use std::sync::{Arc, Mutex};
 
     use crate::devices::virtio::vsock::connection::WINDOW;
@@ -400,6 +430,19 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    impl Stream for Landed {
+        /// In memory, no descriptor to wait on.
+        fn descriptor(&self) -> Option<RawFd> {
+            None
+        }
+    }
+
+    impl Stream for Backed {
+        fn descriptor(&self) -> Option<RawFd> {
+            None
         }
     }
 
@@ -460,6 +503,10 @@ mod tests {
         fn incoming(&mut self) -> Option<(u32, Box<dyn Stream>)> {
             None
         }
+
+        fn outside(&self) -> Vec<(RawFd, Interest)> {
+            Vec::new()
+        }
     }
 
     /// Endpoint with incoming connections waiting, counts the calls to
@@ -467,6 +514,8 @@ mod tests {
     struct Incoming {
         waiting: Vec<(u32, Landed)>,
         asked: Arc<Mutex<usize>>,
+        /// Stands in for the socket incoming connections arrive on.
+        arrives_on: Arc<std::os::unix::net::UnixStream>,
     }
 
     impl Endpoint for Incoming {
@@ -478,6 +527,10 @@ mod tests {
             *self.asked.lock().unwrap() += 1;
             let (port, landed) = self.waiting.pop()?;
             Some((port, Box::new(landed)))
+        }
+
+        fn outside(&self) -> Vec<(RawFd, Interest)> {
+            vec![(self.arrives_on.as_raw_fd(), Interest::Read)]
         }
     }
 
@@ -491,6 +544,10 @@ mod tests {
 
         fn incoming(&mut self) -> Option<(u32, Box<dyn Stream>)> {
             None
+        }
+
+        fn outside(&self) -> Vec<(RawFd, Interest)> {
+            Vec::new()
         }
     }
 
@@ -615,6 +672,7 @@ mod tests {
             Box::new(Incoming {
                 waiting: vec![(GUEST_PORT, landed.clone())],
                 asked: Arc::new(Mutex::new(0)),
+                arrives_on: Arc::new(paired()),
             }),
         );
         let ram = ram();
@@ -643,6 +701,7 @@ mod tests {
                     (GUEST_PORT, Landed::default()),
                 ],
                 asked: Arc::new(Mutex::new(0)),
+                arrives_on: Arc::new(paired()),
             }),
         );
         let ram = ram();
@@ -662,11 +721,13 @@ mod tests {
     #[test]
     fn test_incoming_left_at_connection_limit() {
         let asked = Arc::new(Mutex::new(0));
+        let arrives_on = Arc::new(paired());
         let mut vsock = Vsock::new(
             GUEST_CID,
             Box::new(Incoming {
                 waiting: vec![(GUEST_PORT, Landed::default())],
                 asked: Arc::clone(&asked),
+                arrives_on: Arc::clone(&arrives_on),
             }),
         );
         // At `CONNECTIONS` open, incoming connection stays at the endpoint.
@@ -687,6 +748,87 @@ mod tests {
             *asked.lock().unwrap(),
             0,
             "incoming connection taken past the limit"
+        );
+        assert!(
+            !vsock
+                .outside()
+                .iter()
+                .any(|(fd, _)| *fd == arrives_on.as_raw_fd()),
+            "endpoint waited on at connection limit"
+        );
+    }
+
+    /// Returns one end of a socket pair, a descriptor for test double.
+    fn paired() -> std::os::unix::net::UnixStream {
+        std::os::unix::net::UnixStream::pair()
+            .expect("socket pair")
+            .0
+    }
+
+    /// Returns header of a packet from `GUEST_PORT` to `OPEN_PORT`.
+    fn from_guest(op: Op, len: u32, payload_window: u32) -> Header {
+        Header {
+            src_cid: GUEST_CID,
+            dst_cid: HOST_CID,
+            src_port: GUEST_PORT,
+            dst_port: OPEN_PORT,
+            len,
+            kind: STREAM,
+            op,
+            flags: 0,
+            buf_alloc: payload_window,
+            fwd_cnt: 0,
+        }
+    }
+
+    #[test]
+    fn test_wait_only_on_movable_host_ends() {
+        // outside() drops host ends the guest has no room for.
+        let mut vsock = device(&Landed::default());
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let fd = ours.as_raw_fd();
+        let waited = |vsock: &Vsock| {
+            vsock
+                .outside()
+                .into_iter()
+                .find(|(each, _)| *each == fd)
+                .map(|(_, interest)| interest)
+        };
+
+        // No `Response` yet, so the guest has no room, fd is not waited on.
+        vsock.open.insert(
+            (GUEST_PORT, OPEN_PORT),
+            (
+                Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
+                Box::new(ours),
+            ),
+        );
+        assert_eq!(
+            waited(&vsock),
+            None,
+            "host end waited on while guest has no room"
+        );
+
+        // `Response` carries `buf_alloc` of the guest.
+        vsock.took(&from_guest(Op::Response, 0, WINDOW), &[]);
+        assert_eq!(waited(&vsock), Some(Interest::Read));
+
+        // Bytes waiting for the host end.
+        vsock.took(&from_guest(Op::Data, 2, WINDOW), b"hi");
+        assert_eq!(waited(&vsock), Some(Interest::Both));
+
+        // Room is zero and bytes forwarded. No interest, so not waited on.
+        vsock.took(&from_guest(Op::CreditUpdate, 0, 0), &[]);
+        vsock
+            .open
+            .get_mut(&(GUEST_PORT, OPEN_PORT))
+            .expect("connection")
+            .0
+            .forwarded(2);
+        assert_eq!(
+            waited(&vsock),
+            None,
+            "host end with no room and no bytes waited on"
         );
     }
 

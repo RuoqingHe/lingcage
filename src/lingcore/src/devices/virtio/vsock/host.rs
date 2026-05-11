@@ -9,10 +9,13 @@
 //! replies `OK <port>` once the connection is open.
 
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 use log::warn;
+
+use crate::hv::Interest;
 
 /// First word of an incoming connection line, matched case insensitive.
 const CONNECT: &str = "connect";
@@ -29,9 +32,17 @@ const LINE: usize = 32;
 const ARRIVALS: usize = 64;
 
 /// Host stream of one connection, read and written without blocking.
-pub trait Stream: Read + Write + Send {}
+pub trait Stream: Read + Write + Send {
+    /// Returns the descriptor which the connection is carried over. Stream
+    /// not carried over a descriptor returns `None`.
+    fn descriptor(&self) -> Option<RawFd>;
+}
 
-impl<S: Read + Write + Send> Stream for S {}
+impl Stream for UnixStream {
+    fn descriptor(&self) -> Option<RawFd> {
+        Some(self.as_raw_fd())
+    }
+}
 
 /// Host side which a guest port connects to, also the source of incoming
 /// connections.
@@ -43,6 +54,10 @@ pub trait Endpoint: Send {
     /// its stream, or `None` while no incoming connection has finished its
     /// line.
     fn incoming(&mut self) -> Option<(u32, Box<dyn Stream>)>;
+
+    /// Returns descriptors which incoming connections arrive on, each with
+    /// the interest to wait on it for.
+    fn outside(&self) -> Vec<(RawFd, Interest)>;
 }
 
 /// Endpoint which connects each port to Unix socket `<prefix>_<port>`.
@@ -154,6 +169,24 @@ impl Endpoint for Sockets {
         let (port, stream) = self.spoken()?;
         Some((port, Box::new(stream)))
     }
+
+    /// Returns the listener while `arriving` is under `ARRIVALS`, plus each
+    /// arriving incoming connection. Beyond `ARRIVALS` the listener is left
+    /// out, and incoming connections behind it stay in the kernel backlog.
+    fn outside(&self) -> Vec<(RawFd, Interest)> {
+        let mut waited = Vec::new();
+        if let Some(listener) = &self.listener
+            && self.arriving.len() < ARRIVALS
+        {
+            waited.push((listener.as_raw_fd(), Interest::Read));
+        }
+        waited.extend(
+            self.arriving
+                .iter()
+                .map(|(stream, _)| (stream.as_raw_fd(), Interest::Read)),
+        );
+        waited
+    }
 }
 
 /// Endpoint which serves no port.
@@ -166,6 +199,10 @@ impl Endpoint for Closed {
 
     fn incoming(&mut self) -> Option<(u32, Box<dyn Stream>)> {
         None
+    }
+
+    fn outside(&self) -> Vec<(RawFd, Interest)> {
+        Vec::new()
     }
 }
 

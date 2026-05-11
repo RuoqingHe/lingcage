@@ -104,6 +104,13 @@ pub trait Device: Send {
     /// Default drops it.
     fn write_config(&mut self, _offset: u64, _size: u8, _value: u64) {}
 
+    /// Returns host descriptors on which work arrives for the device, each
+    /// with the interest to wait for. Default returns none, such a device is
+    /// only reached through its ioeventfd.
+    fn outside(&self) -> Vec<(std::os::fd::RawFd, crate::hv::Interest)> {
+        Vec::new()
+    }
+
     /// Handle a notification on queue `index`. Pop chains from `queue` and
     /// report each of them as used.
     fn notify(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()>;

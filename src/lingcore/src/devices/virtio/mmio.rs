@@ -289,6 +289,11 @@ impl Transport {
 }
 
 impl Transport {
+    /// Returns host descriptors of the device, see `Device::outside`.
+    pub fn outside(&self) -> Vec<(std::os::fd::RawFd, crate::hv::Interest)> {
+        self.device.outside()
+    }
+
     fn state(&self) -> TransportState {
         TransportState {
             status: self.status,
