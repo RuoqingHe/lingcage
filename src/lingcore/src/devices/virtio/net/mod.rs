@@ -1,0 +1,11 @@
+// SPDX-FileCopyrightText: 2026 LingCage <opensource@lingcage.com>
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! Virtio network device, section 5.1 of virtio 1.2.
+//!
+//! The device carries Ethernet frames between the guest and a host
+//! stream. Address, host stack and its reach are decided by the program
+//! assembling the machine.
+
+pub mod frame;

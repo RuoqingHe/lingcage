@@ -12,6 +12,7 @@ use thiserror::Error;
 pub mod block;
 pub mod entropy;
 pub mod mmio;
+pub mod net;
 pub mod queue;
 pub mod vsock;
 
