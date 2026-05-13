@@ -8,4 +8,5 @@
 //! stream. Address, host stack and its reach are decided by the program
 //! assembling the machine.
 
+pub mod carrier;
 pub mod frame;
