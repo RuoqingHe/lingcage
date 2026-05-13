@@ -108,6 +108,12 @@ impl Queue {
         self.walk(ram, head).map(Some)
     }
 
+    /// Put back the chain returned by the last [`Queue::pop`], so that the
+    /// next pop returns it again. Used ring is not written.
+    pub fn undo_pop(&mut self) {
+        self.next_avail -= Wrapping(1);
+    }
+
     /// Report the chain at `head` as used, with `len` bytes written into it.
     pub fn add_used(&mut self, ram: &GuestRam, head: u16, len: u32) -> Result<()> {
         // used: le16 flags, le16 idx, { le32 id, le32 len } ring[size].
@@ -232,6 +238,27 @@ mod tests {
             .expect("publish a head");
         ram.write(AVAIL_RING + 2, &count.to_le_bytes())
             .expect("bump the index");
+    }
+
+    #[test]
+    fn test_undo_pop() {
+        let ram = ram();
+        let mut queue = queue();
+        describe(&ram, 0, BUFFER, 16, 0, 0);
+        publish(&ram, 0, 0, 1);
+
+        let first = queue.pop(&ram).expect("pop").expect("chain");
+        queue.undo_pop();
+        let again = queue.pop(&ram).expect("pop again").expect("same chain");
+        assert_eq!(
+            first.head, again.head,
+            "chain put back came out as another one"
+        );
+        assert_eq!(
+            queue.cursors().1,
+            0,
+            "putting chain back moved the used ring"
+        );
     }
 
     #[test]
