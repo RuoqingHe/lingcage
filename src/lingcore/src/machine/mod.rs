@@ -22,6 +22,8 @@ use crate::devices::serial::Serial;
 use crate::devices::virtio::block::Block;
 use crate::devices::virtio::entropy::Entropy;
 use crate::devices::virtio::mmio::{self, Transport};
+use crate::devices::virtio::net::carrier::Framed;
+use crate::devices::virtio::net::device::Net;
 use crate::devices::virtio::vsock::device::Vsock;
 use crate::devices::virtio::vsock::host::Sockets;
 use crate::devices::{Blob, Receive, Shared};
@@ -119,6 +121,9 @@ pub enum Error {
     /// Failed to open the disk file or read its length.
     #[error("failed to open disk file")]
     Disk(#[source] std::io::Error),
+    /// Failed to connect the network socket.
+    #[error("failed to connect network socket")]
+    Network(#[source] std::io::Error),
     /// Failed to bind the channel socket.
     #[error("failed to bind channel socket")]
     Channel(#[source] std::io::Error),
@@ -183,6 +188,18 @@ pub struct Channel {
     pub at: PathBuf,
 }
 
+/// Network link of a guest, Ethernet frames over a host stream socket.
+/// The stack behind the socket belongs to the caller.
+#[derive(Debug, Clone)]
+pub struct Network {
+    /// Path of the host socket. A listener is on it before the machine is
+    /// assembled.
+    pub at: PathBuf,
+    /// MAC address in configuration space. `None` offers no `F_MAC` and the
+    /// driver assigns a random one.
+    pub mac: Option<[u8; 6]>,
+}
+
 /// Guest configuration which a `Machine` is assembled from.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -200,15 +217,20 @@ pub struct Config {
     pub disk: Option<PathBuf>,
     /// Vsock channel to the guest, if any.
     pub channel: Option<Channel>,
-    /// Action on a syscall outside allowlist of a thread, `None` installs
+    /// Network link of the guest, if any.
+    pub network: Option<Network>,
+    /// Action on a syscall outside allowlist of a thread. `None` installs
     /// no allowlist.
     pub confine: Option<Refusal>,
 }
 
-/// Returns the number of virtio devices. Entropy source is always there,
-/// disk comes with `Config::disk`, channel with `Config::channel`.
+/// Returns the number of virtio devices, the entropy source, plus the
+/// disk, the channel and the network link, each one if named in
+/// `Config`.
 fn virtio_count(config: &Config) -> u8 {
-    1 + u8::from(config.disk.is_some()) + u8::from(config.channel.is_some())
+    1 + u8::from(config.disk.is_some())
+        + u8::from(config.channel.is_some())
+        + u8::from(config.network.is_some())
 }
 
 /// Returns MMIO address of virtio register block `slot`.
@@ -575,40 +597,30 @@ impl<H: Hypervisor> Machine<H> {
 
         let registry = vm.create_ioeventfd_registry()?;
         let seed = File::open(ENTROPY_SOURCE).map_err(Error::Entropy)?;
-        let mut wired = vec![place_virtio(
-            &mut bus,
-            &vm,
-            &registry,
-            &ram,
-            0,
-            Box::new(Entropy::new(seed)),
-        )?];
+        // Each device takes the slot at its index here, ACPI tables name
+        // `virtio_count(config)` slots in the same order.
+        let mut devices: Vec<Box<dyn crate::devices::virtio::Device>> =
+            vec![Box::new(Entropy::new(seed))];
         if let Some(path) = &config.disk {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(path)
                 .map_err(Error::Disk)?;
-            let disk = Block::new(file).map_err(Error::Disk)?;
-            wired.push(place_virtio(
-                &mut bus,
-                &vm,
-                &registry,
-                &ram,
-                1,
-                Box::new(disk),
-            )?);
+            devices.push(Box::new(Block::new(file).map_err(Error::Disk)?));
         }
         if let Some(channel) = &config.channel {
             let sockets = Sockets::listening(&channel.at).map_err(Error::Channel)?;
-            let reached = Vsock::new(channel.cid, Box::new(sockets));
+            devices.push(Box::new(Vsock::new(channel.cid, Box::new(sockets))));
+        }
+        if let Some(network) = &config.network {
+            let carrier = Framed::connect(&network.at).map_err(Error::Network)?;
+            devices.push(Box::new(Net::new(network.mac, Box::new(carrier))));
+        }
+        let mut wired = Vec::with_capacity(devices.len());
+        for (slot, device) in devices.into_iter().enumerate() {
             wired.push(place_virtio(
-                &mut bus,
-                &vm,
-                &registry,
-                &ram,
-                virtio_count(config) - 1,
-                Box::new(reached),
+                &mut bus, &vm, &registry, &ram, slot as u8, device,
             )?);
         }
 
@@ -1117,6 +1129,7 @@ mod tests {
             // with `SIGSYS`.
             confine: Some(Refusal::Trap),
             channel: None,
+            network: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1186,6 +1199,7 @@ mod tests {
             disk: None,
             confine: None,
             channel: None,
+            network: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1234,6 +1248,7 @@ mod tests {
             disk: None,
             confine: None,
             channel: None,
+            network: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1302,6 +1317,7 @@ mod tests {
             disk: None,
             confine: None,
             channel: None,
+            network: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1396,6 +1412,7 @@ mod tests {
             disk: None,
             confine: None,
             channel: None,
+            network: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1436,6 +1453,7 @@ mod tests {
             disk: None,
             confine: None,
             channel: None,
+            network: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1481,6 +1499,7 @@ mod tests {
             disk: None,
             confine: None,
             channel: None,
+            network: None,
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1533,6 +1552,7 @@ mod tests {
             disk: None,
             confine: None,
             channel: None,
+            network: None,
         };
         #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
         {
@@ -1563,6 +1583,7 @@ mod tests {
                 disk: None,
                 confine: None,
                 channel: None,
+                network: None,
             };
             assert!(matches!(
                 Machine::new(&hv, &config, Vec::new()),
