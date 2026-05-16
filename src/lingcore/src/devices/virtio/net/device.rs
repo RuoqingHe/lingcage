@@ -93,7 +93,7 @@ impl Net {
 
     /// Write each frame from the carrier into a receive buffer, header
     /// first. Frame without a buffer yet is held in `receiving`, and the
-    /// carrier is not read again until it is written.
+    /// carrier is not read again until it is written or dropped.
     fn receive(&mut self, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
         loop {
             if self.waiting.is_none() {
@@ -108,8 +108,16 @@ impl Net {
             let Some(chain) = queue.pop(ram)? else {
                 return Ok(());
             };
-            let written = frame_into(&chain, ram, &self.receiving[..len])?;
-            queue.add_used(ram, chain.head, written)?;
+            match frame_into(&chain, ram, &self.receiving[..len])? {
+                Some(written) => queue.add_used(ram, chain.head, written)?,
+                None => {
+                    // Frame longer than the offered buffer is dropped, same
+                    // as the driver would do. Buffer is put back for the
+                    // next frame.
+                    warn!("frame of {len} bytes dropped, longer than receive buffer");
+                    queue.undo_pop();
+                }
+            }
             self.waiting = None;
         }
     }
@@ -196,8 +204,19 @@ fn frame_from(chain: &Chain, ram: &GuestRam, into: &mut [u8]) -> Result<Option<u
 }
 
 /// Write `frame` after a header into writable buffers of `chain`.
-/// Returns bytes written.
-fn frame_into(chain: &Chain, ram: &GuestRam, frame: &[u8]) -> Result<u32> {
+/// Returns bytes written, or `None` for a chain shorter than header plus
+/// frame.
+fn frame_into(chain: &Chain, ram: &GuestRam, frame: &[u8]) -> Result<Option<u32>> {
+    let room: usize = chain
+        .descriptors
+        .iter()
+        .filter(|descriptor| descriptor.writable())
+        .map(|descriptor| descriptor.len as usize)
+        .sum();
+    if room < ROOM + frame.len() {
+        return Ok(None);
+    }
+
     // `num_buffers` is 1, a frame fills one chain and none is merged.
     let header = Header {
         num_buffers: 1,
@@ -219,12 +238,7 @@ fn frame_into(chain: &Chain, ram: &GuestRam, frame: &[u8]) -> Result<u32> {
             })?;
         written += room;
     }
-    // Chain shorter than header plus frame is refused, otherwise the
-    // header would name a length the chain does not hold.
-    if written != whole.len() {
-        return Err(Error::Request);
-    }
-    Ok(written as u32)
+    Ok(Some(written as u32))
 }
 
 #[cfg(test)]
@@ -480,6 +494,31 @@ mod tests {
             net.outside().len(),
             1,
             "Read left out with no frame waiting"
+        );
+    }
+
+    #[test]
+    fn test_drop_frame_larger_than_buffer() {
+        let wired = Wired::new(0);
+        let mut net = device(&wired);
+        let ram = ram();
+        let mut rx = queue(RX_RING);
+        // Longer than the `0x400` buffer posted by `guest_offers`.
+        wired.bringing.lock().unwrap().push(vec![0xa5u8; 0x800]);
+        wired
+            .bringing
+            .lock()
+            .unwrap()
+            .push(b"the one behind it".to_vec());
+
+        guest_offers(&ram, 0);
+        net.notify(RX, &mut rx, &ram)
+            .expect("notify rx with outsized frame");
+        assert_eq!(rx.cursors().1, 1, "buffer used up by the dropped frame");
+        assert_eq!(
+            &guest_given(&ram, 0, ROOM + 17)[ROOM..],
+            b"the one behind it",
+            "buffer went to the frame which fits"
         );
     }
 
