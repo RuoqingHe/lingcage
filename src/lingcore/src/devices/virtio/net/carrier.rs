@@ -163,9 +163,9 @@ impl Carrier for Framed {
     }
 
     fn outside(&self) -> Vec<(RawFd, Interest)> {
-        // `Read` is kept no matter the guest has room or not, a readable
-        // descriptor left unread is reported ready on each wait, and `take`
-        // drops the frame if the guest has no room for it.
+        // `arriving` has room for a frame, so `Read` is reported no matter
+        // there is a buffer in the guest or not. `Net::outside` drops it
+        // while a frame waits for a buffer.
         let interest = if self.leaving.is_empty() {
             Interest::Read
         } else {

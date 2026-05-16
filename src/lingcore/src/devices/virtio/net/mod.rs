@@ -9,4 +9,5 @@
 //! assembling the machine.
 
 pub mod carrier;
+pub mod device;
 pub mod frame;
