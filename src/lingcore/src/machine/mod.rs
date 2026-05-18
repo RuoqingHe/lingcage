@@ -78,6 +78,9 @@ const EVENTS_IRQ: u8 = 9;
 /// takes the next line.
 const VIRTIO_IRQ: u8 = 5;
 
+/// Bytes of RAM given to a guest by `Config::default`.
+pub const DEFAULT_MEMORY: u64 = 128 << 20;
+
 /// Host file read by the entropy source.
 const ENTROPY_SOURCE: &str = "/dev/urandom";
 
@@ -127,6 +130,9 @@ pub enum Error {
     /// Failed to bind the channel socket.
     #[error("failed to bind channel socket")]
     Channel(#[source] std::io::Error),
+    /// `Config::kernel` is empty.
+    #[error("guest needs a kernel")]
+    NoKernel,
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
@@ -201,6 +207,20 @@ pub struct Network {
 }
 
 /// Guest configuration which a `Machine` is assembled from.
+///
+/// `kernel` has no default and an empty path is refused. Other fields
+/// can be taken from `Default::default()`:
+///
+/// ```no_run
+/// # use lingcore::machine::Config;
+/// let config = Config {
+///     kernel: "bzImage".into(),
+///     memory: 256 << 20,
+///     vcpus: 2,
+///     cmdline: "console=ttyS0".to_string(),
+///     ..Default::default()
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Guest RAM size in bytes.
@@ -222,6 +242,22 @@ pub struct Config {
     /// Action on a syscall outside allowlist of a thread. `None` installs
     /// no allowlist.
     pub confine: Option<Refusal>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            memory: DEFAULT_MEMORY,
+            vcpus: 1,
+            kernel: PathBuf::new(),
+            initrd: None,
+            cmdline: String::new(),
+            disk: None,
+            channel: None,
+            network: None,
+            confine: None,
+        }
+    }
 }
 
 /// Returns the number of virtio devices, the entropy source, plus the
@@ -554,6 +590,9 @@ impl<H: Hypervisor> Machine<H> {
     {
         if config.vcpus == 0 {
             return Err(Error::NoVcpus);
+        }
+        if config.kernel.as_os_str().is_empty() {
+            return Err(Error::NoKernel);
         }
         let vm = hv.create_vm()?;
         vm.enable_in_kernel_irqchip()?;
@@ -1119,17 +1158,14 @@ mod tests {
 
         let console = Tap(Arc::new(Mutex::new(Vec::new())));
         let config = Config {
-            memory: 16 << 20,
             vcpus: 1,
-            kernel: image.clone(),
-            initrd: None,
             cmdline: "console=ttyS0".to_string(),
-            disk: None,
             // With `Trap`, a syscall missed by the allowlists ends the test
             // with `SIGSYS`.
             confine: Some(Refusal::Trap),
-            channel: None,
-            network: None,
+            kernel: image.clone(),
+            memory: 16 << 20,
+            ..Default::default()
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1191,15 +1227,12 @@ mod tests {
 
         let console = Tap(Arc::new(Mutex::new(Vec::new())));
         let config = Config {
-            memory: 16 << 20,
             vcpus: 1,
-            kernel: image.clone(),
-            initrd: None,
             cmdline: "console=ttyS0".to_string(),
-            disk: None,
             confine: None,
-            channel: None,
-            network: None,
+            kernel: image.clone(),
+            memory: 16 << 20,
+            ..Default::default()
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1240,15 +1273,12 @@ mod tests {
         std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
 
         let config = Config {
-            memory: 16 << 20,
             vcpus: 1,
-            kernel: image.clone(),
-            initrd: None,
             cmdline: "console=ttyS0".to_string(),
-            disk: None,
             confine: None,
-            channel: None,
-            network: None,
+            kernel: image.clone(),
+            memory: 16 << 20,
+            ..Default::default()
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1309,15 +1339,12 @@ mod tests {
 
         let console = Counter(Arc::new(Mutex::new(0)));
         let config = Config {
-            memory: 16 << 20,
             vcpus: 1,
-            kernel: image.clone(),
-            initrd: None,
             cmdline: "console=ttyS0".to_string(),
-            disk: None,
             confine: None,
-            channel: None,
-            network: None,
+            kernel: image.clone(),
+            memory: 16 << 20,
+            ..Default::default()
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, console.clone()).expect("assemble the guest");
@@ -1404,15 +1431,12 @@ mod tests {
         std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
 
         let config = Config {
-            memory: 16 << 20,
             vcpus: 1,
-            kernel: image.clone(),
-            initrd: None,
             cmdline: "console=ttyS0".to_string(),
-            disk: None,
             confine: None,
-            channel: None,
-            network: None,
+            kernel: image.clone(),
+            memory: 16 << 20,
+            ..Default::default()
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1445,15 +1469,12 @@ mod tests {
         std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
 
         let config = Config {
-            memory: 16 << 20,
             vcpus: 1,
-            kernel: image.clone(),
-            initrd: None,
             cmdline: String::new(),
-            disk: None,
             confine: None,
-            channel: None,
-            network: None,
+            kernel: image.clone(),
+            memory: 16 << 20,
+            ..Default::default()
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1491,15 +1512,12 @@ mod tests {
         std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
 
         let config = Config {
-            memory: 16 << 20,
             vcpus: VCPUS,
-            kernel: image.clone(),
-            initrd: None,
             cmdline: String::new(),
-            disk: None,
             confine: None,
-            channel: None,
-            network: None,
+            kernel: image.clone(),
+            memory: 16 << 20,
+            ..Default::default()
         };
         let hv = KvmHv::new().expect("open /dev/kvm");
         let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
@@ -1544,15 +1562,12 @@ mod tests {
     #[test]
     fn test_reject_zero_vcpus() {
         let config = Config {
-            memory: 16 << 20,
             vcpus: 0,
-            kernel: PathBuf::from("/nonexistent/kernel"),
-            initrd: None,
             cmdline: String::new(),
-            disk: None,
             confine: None,
-            channel: None,
-            network: None,
+            kernel: PathBuf::from("/nonexistent/kernel"),
+            memory: 16 << 20,
+            ..Default::default()
         };
         #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
         {
@@ -1575,15 +1590,12 @@ mod tests {
 
             let hv = KvmHv::new().expect("open /dev/kvm");
             let config = Config {
-                memory: 16 << 20,
                 vcpus: 1,
-                kernel: PathBuf::from("/nonexistent/kernel"),
-                initrd: None,
                 cmdline: String::new(),
-                disk: None,
                 confine: None,
-                channel: None,
-                network: None,
+                kernel: PathBuf::from("/nonexistent/kernel"),
+                memory: 16 << 20,
+                ..Default::default()
             };
             assert!(matches!(
                 Machine::new(&hv, &config, Vec::new()),
