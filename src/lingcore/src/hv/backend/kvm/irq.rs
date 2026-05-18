@@ -154,8 +154,9 @@ impl Routing {
             };
             entries.push(entry);
         }
-        let table = KvmIrqRouting::from_entries(&entries)
-            .map_err(|_| Error::Other("guest holds more routes than KVM accepts"))?;
+        let table = KvmIrqRouting::from_entries(&entries).map_err(|_| Error::Overfull {
+            of: "interrupt routes",
+        })?;
         vm.set_gsi_routing(&table)
             .map_err(kvm_err("KVM_SET_GSI_ROUTING"))
     }
@@ -220,10 +221,9 @@ impl KvmIrqFd {
     /// Apply `change` to the route and rewrite the table.
     fn update(&self, change: impl FnOnce(&mut MsiRoute)) -> Result<()> {
         let mut routing = self.routing.lock().unwrap();
-        let route = routing
-            .msi
-            .get_mut(&self.gsi)
-            .ok_or(Error::Other("irqfd has no route"))?;
+        let route = routing.msi.get_mut(&self.gsi).ok_or(Error::Unregistered {
+            at: "for that irqfd",
+        })?;
         change(route);
         routing.apply(&self.vm)
     }
@@ -252,10 +252,9 @@ impl IrqFd for KvmIrqFd {
     /// a80ced6ea514.
     fn set_masked(&self, masked: bool) -> Result<()> {
         let mut routing = self.routing.lock().unwrap();
-        let route = routing
-            .msi
-            .get_mut(&self.gsi)
-            .ok_or(Error::Other("irqfd has no route"))?;
+        let route = routing.msi.get_mut(&self.gsi).ok_or(Error::Unregistered {
+            at: "for that irqfd",
+        })?;
         if route.masked == masked {
             return Ok(());
         }

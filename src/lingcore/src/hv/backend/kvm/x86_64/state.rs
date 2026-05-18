@@ -288,8 +288,9 @@ fn capture_msrs(fd: &VcpuFd, indices: &[u32]) -> Result<BTreeMap<u32, u64>> {
                 ..Default::default()
             })
             .collect::<Vec<_>>();
-        let mut msrs = kvm_bindings::Msrs::from_entries(&entries)
-            .map_err(|_| Error::Other("MSR batch does not fit"))?;
+        let mut msrs = kvm_bindings::Msrs::from_entries(&entries).map_err(|_| Error::Overfull {
+            of: "model-specific registers",
+        })?;
         let read = fd.get_msrs(&mut msrs).map_err(kvm_err("KVM_GET_MSRS"))?;
         captured.extend(
             msrs.as_slice()[..read]
@@ -321,8 +322,10 @@ fn restore_msrs(fd: &VcpuFd, msrs: &BTreeMap<u32, u64>) -> Result<()> {
     let mut rest = &entries[..];
     while !rest.is_empty() {
         let batch = rest.len().min(MSR_BATCH);
-        let msrs = kvm_bindings::Msrs::from_entries(&rest[..batch])
-            .map_err(|_| Error::Other("MSR batch does not fit"))?;
+        let msrs =
+            kvm_bindings::Msrs::from_entries(&rest[..batch]).map_err(|_| Error::Overfull {
+                of: "model-specific registers",
+            })?;
         let written = fd.set_msrs(&msrs).map_err(kvm_err("KVM_SET_MSRS"))?;
         if written < batch && rest[written].data != 0 {
             return Err(Error::Partial {
@@ -424,8 +427,7 @@ impl VcpuState {
             msrs,
             cpuid: cpuid.as_slice().iter().map(CpuidState::from_kvm).collect(),
         };
-        let data =
-            serde_json::to_vec(&state).map_err(|_| Error::Other("failed to encode vCPU state"))?;
+        let data = serde_json::to_vec(&state).map_err(|_| Error::Capture { part: "vCPU" })?;
         Ok(StateBlob {
             backend: Backend::Kvm,
             arch: Arch::X86_64,
@@ -442,16 +444,16 @@ impl VcpuState {
         blob: &StateBlob,
     ) -> Result<()> {
         if blob.backend != Backend::Kvm || blob.arch != Arch::X86_64 {
-            return Err(Error::Other("state blob from another backend or arch"));
+            return Err(Error::Restore { part: "vCPU" });
         }
         if blob.version != STATE_VERSION {
-            return Err(Error::Other("state blob version not supported"));
+            return Err(Error::Restore { part: "vCPU" });
         }
         if xsave_size > size_of::<kvm_bindings::kvm_xsave>() {
             return Err(Error::Unsupported("XSAVE areas past 4096 bytes"));
         }
-        let state: VcpuState = serde_json::from_slice(&blob.data)
-            .map_err(|_| Error::Other("failed to decode vCPU state"))?;
+        let state: VcpuState =
+            serde_json::from_slice(&blob.data).map_err(|_| Error::Restore { part: "vCPU" })?;
 
         // Leaves go in before the registers, since leaf 0xD bounds the XCR0
         // accepted by `KVM_SET_XCRS`. Empty list keeps the current table.
@@ -461,8 +463,10 @@ impl VcpuState {
                 .iter()
                 .map(CpuidState::to_kvm)
                 .collect::<Vec<_>>();
-            let cpuid = kvm_bindings::CpuId::from_entries(&entries)
-                .map_err(|_| Error::Other("CPUID does not fit"))?;
+            let cpuid =
+                kvm_bindings::CpuId::from_entries(&entries).map_err(|_| Error::Overfull {
+                    of: "CPUID entries",
+                })?;
             fd.set_cpuid2(&cpuid).map_err(kvm_err("KVM_SET_CPUID2"))?;
         }
 

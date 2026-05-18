@@ -37,7 +37,7 @@ impl Datamatch {
             (Some(d), 2) => Ok(Datamatch::Word(d as u16)),
             (Some(d), 4) => Ok(Datamatch::Long(d as u32)),
             (Some(d), 8) => Ok(Datamatch::Quad(d)),
-            (Some(_), _) => Err(Error::Other("datamatch should be 1, 2, 4 or 8 bytes wide")),
+            (Some(_), _) => Err(Error::Unsupported("datamatch of that width")),
         }
     }
 }
@@ -128,12 +128,9 @@ impl IoeventFdRegistry for KvmIoeventFdRegistry {
     }
 
     fn deregister(&self, fd: &KvmIoeventFd) -> Result<()> {
-        let (gpa, datamatch) = fd
-            .bound
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or(Error::Other("ioeventfd is not bound"))?;
+        let (gpa, datamatch) = fd.bound.lock().unwrap().take().ok_or(Error::Unregistered {
+            at: "for that ioeventfd",
+        })?;
         let addr = IoEventAddress::Mmio(gpa);
         match datamatch {
             Datamatch::Any => self.vm.unregister_ioevent(&fd.eventfd, &addr, NoDatamatch),

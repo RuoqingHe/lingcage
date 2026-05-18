@@ -37,8 +37,7 @@ impl ClockState {
             realtime: clock.realtime,
             host_tsc: clock.host_tsc,
         };
-        let data =
-            serde_json::to_vec(&state).map_err(|_| Error::Other("failed to encode clock state"))?;
+        let data = serde_json::to_vec(&state).map_err(|_| Error::Capture { part: "clock" })?;
         Ok(StateBlob {
             backend: Backend::Kvm,
             arch: Arch::X86_64,
@@ -51,12 +50,12 @@ impl ClockState {
     /// refused.
     fn decode(blob: &StateBlob) -> Result<Self> {
         if blob.backend != Backend::Kvm || blob.arch != Arch::X86_64 {
-            return Err(Error::Other("state blob from another backend or arch"));
+            return Err(Error::Restore { part: "clock" });
         }
         if blob.version != STATE_VERSION {
-            return Err(Error::Other("state blob version not supported"));
+            return Err(Error::Restore { part: "clock" });
         }
-        serde_json::from_slice(&blob.data).map_err(|_| Error::Other("failed to decode clock state"))
+        serde_json::from_slice(&blob.data).map_err(|_| Error::Restore { part: "clock" })
     }
 
     /// Restore the clock behind `fd` to the captured value. `flags` is zero,

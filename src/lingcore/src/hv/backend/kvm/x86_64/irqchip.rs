@@ -244,8 +244,7 @@ impl IrqChipState {
                 flags: pit.flags,
             },
         };
-        let data = serde_json::to_vec(&state)
-            .map_err(|_| Error::Other("failed to encode controller state"))?;
+        let data = serde_json::to_vec(&state).map_err(|_| Error::Capture { part: "controller" })?;
         Ok(StateBlob {
             backend: Backend::Kvm,
             arch: Arch::X86_64,
@@ -258,13 +257,13 @@ impl IrqChipState {
     /// backend, arch or layout version is refused.
     pub(in crate::hv::backend::kvm) fn restore(fd: &VmFd, blob: &StateBlob) -> Result<()> {
         if blob.backend != Backend::Kvm || blob.arch != Arch::X86_64 {
-            return Err(Error::Other("state blob from another backend or arch"));
+            return Err(Error::Restore { part: "controller" });
         }
         if blob.version != STATE_VERSION {
-            return Err(Error::Other("state blob version not supported"));
+            return Err(Error::Restore { part: "controller" });
         }
         let state: IrqChipState = serde_json::from_slice(&blob.data)
-            .map_err(|_| Error::Other("failed to decode controller state"))?;
+            .map_err(|_| Error::Restore { part: "controller" })?;
 
         let mut pit = kvm_bindings::kvm_pit_state2 {
             flags: state.pit.flags,

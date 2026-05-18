@@ -47,9 +47,34 @@ pub enum Error {
     /// `KVM_API_VERSION`.
     #[error("Unsupported KVM API version: {0}")]
     ApiVersion(i32),
-    /// Other failure, described by a message.
-    #[error("{0}")]
-    Other(&'static str),
+    /// Failed to encode state of `part` into a blob.
+    #[error("failed to capture {part} state")]
+    Capture {
+        /// Part of the guest being captured.
+        part: &'static str,
+    },
+    /// Failed to decode blob for `part`, or the blob names another backend,
+    /// arch or format version.
+    #[error("failed to restore {part} state")]
+    Restore {
+        /// Part of the guest the blob is for.
+        part: &'static str,
+    },
+    /// No registration at the place named by `at`.
+    #[error("no registration {at}")]
+    Unregistered {
+        /// Place looked up, as named by the caller.
+        at: &'static str,
+    },
+    /// More entries than one call to the host takes.
+    #[error("too many {of} in one call")]
+    Overfull {
+        /// Kind of entry there are too many of.
+        of: &'static str,
+    },
+    /// Console sink refused a write.
+    #[error("console sink write failed")]
+    Console,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

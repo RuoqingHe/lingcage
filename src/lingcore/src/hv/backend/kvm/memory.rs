@@ -80,7 +80,9 @@ impl VmMemory for KvmMemory {
             .lock()
             .unwrap()
             .get(&gpa)
-            .ok_or(Error::Other("dirty log: no region at given guest address"))?;
+            .ok_or(Error::Unregistered {
+                at: "at that guest address",
+            })?;
         self.vm
             .get_dirty_log(slot.index, slot.size as usize)
             .map_err(kvm_err("KVM_GET_DIRTY_LOG"))
@@ -92,7 +94,9 @@ impl VmMemory for KvmMemory {
             .lock()
             .unwrap()
             .remove(&gpa)
-            .ok_or(Error::Other("unmap: no region at given guest address"))?;
+            .ok_or(Error::Unregistered {
+                at: "at that guest address",
+            })?;
         let region = kvm_userspace_memory_region {
             slot: slot.index,
             flags: 0,

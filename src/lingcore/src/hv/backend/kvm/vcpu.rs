@@ -364,8 +364,9 @@ impl Vcpu for KvmVcpu {
     #[cfg(target_arch = "x86_64")]
     fn set_cpuid(&mut self, entries: &[CpuidEntry]) -> Result<()> {
         let entries = entries.iter().map(to_kvm).collect::<Vec<_>>();
-        let cpuid = kvm_bindings::CpuId::from_entries(&entries)
-            .map_err(|_| Error::Other("too many CPUID entries"))?;
+        let cpuid = kvm_bindings::CpuId::from_entries(&entries).map_err(|_| Error::Overfull {
+            of: "CPUID entries",
+        })?;
         self.fd
             .set_cpuid2(&cpuid)
             .map_err(kvm_err("KVM_SET_CPUID2"))
@@ -382,8 +383,9 @@ impl Vcpu for KvmVcpu {
             })
             .collect::<Vec<_>>();
         for batch in entries.chunks(MSR_BATCH) {
-            let msrs = kvm_bindings::Msrs::from_entries(batch)
-                .map_err(|_| Error::Other("MSR batch does not fit"))?;
+            let msrs = kvm_bindings::Msrs::from_entries(batch).map_err(|_| Error::Overfull {
+                of: "model-specific registers",
+            })?;
             let written = self.fd.set_msrs(&msrs).map_err(kvm_err("KVM_SET_MSRS"))?;
             // Refused register is reported with its index. Only a capture
             // steps over one.

@@ -7,6 +7,7 @@
 //! One thread serves a device with several rings, or a socket besides
 //! its rings, by waiting on all the descriptors together.
 
+use std::io;
 use std::os::fd::RawFd;
 use std::time::Duration;
 
@@ -82,7 +83,10 @@ impl Waiting {
             )
         };
         if count < 0 {
-            return Err(Error::Other("failed to wait on several descriptors"));
+            return Err(Error::Os {
+                op: "poll",
+                errno: io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            });
         }
         for (slot, polled) in waiting.iter().enumerate() {
             // Hung up descriptor is reported ready. poll(2) sets `POLLHUP`

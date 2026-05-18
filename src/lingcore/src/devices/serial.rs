@@ -610,7 +610,7 @@ mod tests {
             fn read_port(&mut self, port: u16, _size: u8) -> Result<u32> {
                 match port.checked_sub(COM1) {
                     Some(offset) if offset < 8 => Ok(u32::from(self.0.read(u64::from(offset)))),
-                    _ => Err(Error::Other("no device at that port")),
+                    _ => Err(Error::Unregistered { at: "on that port" }),
                 }
             }
 
@@ -620,17 +620,21 @@ mod tests {
                         .0
                         .write(u64::from(offset), value as u8)
                         .map(|()| None)
-                        .map_err(|_| Error::Other("console sink write failed")),
-                    _ => Err(Error::Other("no device at that port")),
+                        .map_err(|_| Error::Console),
+                    _ => Err(Error::Unregistered { at: "on that port" }),
                 }
             }
 
             fn read_mmio(&mut self, _addr: u64, _size: u8) -> Result<u64> {
-                Err(Error::Other("no device at this address"))
+                Err(Error::Unregistered {
+                    at: "at that address",
+                })
             }
 
             fn write_mmio(&mut self, _addr: u64, _size: u8, _value: u64) -> Result<Option<VmExit>> {
-                Err(Error::Other("no device at this address"))
+                Err(Error::Unregistered {
+                    at: "at that address",
+                })
             }
         }
 

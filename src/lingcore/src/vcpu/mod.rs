@@ -131,7 +131,9 @@ mod tests {
         fn read_mmio(&mut self, addr: u64, size: u8) -> Result<u64> {
             self.seen.push(Access::MmioRead(addr, size));
             if self.refuse {
-                return Err(Error::Other("no device at this address"));
+                return Err(Error::Unregistered {
+                    at: "at that address",
+                });
             }
             Ok(self.mmio_answer)
         }
