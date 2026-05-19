@@ -211,6 +211,14 @@ impl<W: Write> Serial<W> {
             }
             IER => {
                 self.ier = value;
+                // Drop reasons which `IER` no longer enables, so that enabling
+                // one again raises the line again.
+                if value & IER_DATA_READY == 0 {
+                    self.asking &= !IIR_DATA_READY;
+                }
+                if value & IER_TRANSMIT_EMPTY == 0 {
+                    self.asking &= !IIR_TRANSMIT_EMPTY;
+                }
                 self.ask_about_transmit()?;
                 self.ask_about_input()?;
             }
@@ -378,6 +386,41 @@ mod tests {
         uart.write(IER, 0).expect("disable");
         uart.write(DATA, b'y').expect("send a byte");
         assert_eq!(line.raises(), 2, "line raised after IER cleared");
+    }
+
+    #[test]
+    fn test_reenable_raises_line_again() {
+        // Re-enabling a reason in IER raises the line again.
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut uart = Serial::new(Vec::new()).on_line(Box::new(line.clone()));
+
+        // Input queued before the driver probes the port.
+        uart.receive(b"uname -a\n").expect("receive a line");
+        uart.write(IER, 0x0f).expect("enable while probing");
+        assert_eq!(line.raises(), 2, "no raise for input and transmit");
+        uart.write(IER, 0).expect("disable after probing");
+
+        // THRI test of the driver.
+        uart.write(IER, IER_TRANSMIT_EMPTY)
+            .expect("enable transmit");
+        assert_eq!(line.raises(), 3, "no raise for transmit enabled again");
+        assert_eq!(uart.read(IIR) & 0x0f, IIR_TRANSMIT_EMPTY);
+        uart.write(IER, 0).expect("disable again");
+
+        // Opening the port.
+        uart.write(IER, IER_DATA_READY).expect("enable input");
+        assert_eq!(line.raises(), 4, "no raise for input enabled again");
+        assert_eq!(uart.read(IIR) & 0x0f, IIR_DATA_READY);
+        while uart.read(LSR) & LSR_DATA_READY != 0 {
+            uart.read(DATA);
+        }
+        assert_eq!(uart.read(IIR) & 0x0f, IIR_NO_INTERRUPT);
+
+        // A tty write.
+        uart.write(IER, IER_DATA_READY | IER_TRANSMIT_EMPTY)
+            .expect("enable transmit for tty");
+        assert_eq!(line.raises(), 5, "no raise for tty write");
+        assert_eq!(uart.read(IIR) & 0x0f, IIR_TRANSMIT_EMPTY);
     }
 
     #[test]
