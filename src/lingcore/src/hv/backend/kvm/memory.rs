@@ -120,8 +120,11 @@ mod tests {
 
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     use crate::hv::backend::kvm::memory::*;
+    #[cfg(target_arch = "x86_64")]
+    use crate::hv::backend::kvm::vcpu::KvmVcpu;
     use crate::hv::hypervisor::Hypervisor;
-    use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
+    #[cfg(target_arch = "x86_64")]
+    use crate::hv::vcpu::{Vcpu, VmEntry};
     use crate::hv::vm::Vm;
 
     const PAGE: usize = 4096;
@@ -149,38 +152,38 @@ mod tests {
         unsafe { dealloc(host, layout) };
     }
 
-    #[test]
-    fn test_dirty_log_read_and_clear() {
+    /// Map `code` at `code_gpa` and a tracked page at `data_gpa`, run the
+    /// guest once from `entry`, then check that the log only names the
+    /// tracked page and reading clears it.
+    #[cfg(target_arch = "x86_64")]
+    fn dirty_log_of(
+        code: &[u8],
+        code_gpa: u64,
+        code_at: usize,
+        data_gpa: u64,
+        entry: impl FnOnce(&mut KvmVcpu),
+    ) {
         let hv = KvmHv::new().expect("open /dev/kvm");
         let vm = hv.create_vm().expect("guest");
         let mem = vm.create_vm_memory().expect("address space");
 
-        // Reset state is real mode with `CS:IP` at 0xffff_fff0 and zero
-        // `DS`, so `mov [0x1000], al` writes guest physical 0x1000.
-        const CODE_GPA: u64 = 0xffff_f000;
-        const DATA_GPA: u64 = 0x1000;
         let layout = Layout::from_size_align(PAGE, PAGE).expect("page-aligned layout");
         // SAFETY: `layout` has non-zero size.
         let code_page = unsafe { alloc_zeroed(layout) };
         // SAFETY: `layout` has non-zero size.
         let data_page = unsafe { alloc_zeroed(layout) };
         assert!(!code_page.is_null() && !data_page.is_null());
-        let code = [
-            0xb0, 0x42, // mov al, 0x42
-            0xa2, 0x00, 0x10, // mov [0x1000], al
-            0xf4, // hlt
-        ];
-        // SAFETY: `code_page` is one page and `code` fits in it at 0xff0.
-        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), code_page.add(0xff0), code.len()) };
+        // SAFETY: `code_page` is one page and `code` fits in it at `code_at`.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), code_page.add(code_at), code.len()) };
         mem.mem_map(
-            CODE_GPA,
+            code_gpa,
             PAGE as u64,
             code_page as usize,
             MemMapOption::default(),
         )
-        .expect("map the reset vector");
+        .expect("map the code");
         mem.mem_map(
-            DATA_GPA,
+            data_gpa,
             PAGE as u64,
             data_page as usize,
             MemMapOption {
@@ -191,38 +194,52 @@ mod tests {
         .expect("map tracked page");
 
         // Region mapped without `log_dirty` has no log.
-        mem.get_dirty_log(CODE_GPA)
+        mem.get_dirty_log(code_gpa)
             .expect_err("dirty log of untracked region");
         assert_eq!(
-            mem.get_dirty_log(DATA_GPA).expect("read the log"),
+            mem.get_dirty_log(data_gpa).expect("read the log"),
             [0],
             "page dirty before the guest ran"
         );
 
         let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
-        assert_eq!(cpu.run(VmEntry::Run).expect("run"), VmExit::Halt);
-        // SAFETY: the vCPU has halted and `data_page` is still allocated.
+        entry(&mut cpu);
+        cpu.run(VmEntry::Run).expect("run");
+        // SAFETY: the vCPU has exited and `data_page` is still allocated.
         assert_eq!(unsafe { *data_page }, 0x42, "guest wrote the page");
 
         assert_eq!(
-            mem.get_dirty_log(DATA_GPA).expect("read the log"),
+            mem.get_dirty_log(data_gpa).expect("read the log"),
             [1],
             "page written by the guest"
         );
         // First read cleared the bit.
         assert_eq!(
-            mem.get_dirty_log(DATA_GPA).expect("read the log"),
+            mem.get_dirty_log(data_gpa).expect("read the log"),
             [0],
             "read did not clear the log"
         );
 
-        mem.unmap(CODE_GPA, PAGE as u64).expect("unmap");
-        mem.unmap(DATA_GPA, PAGE as u64).expect("unmap");
+        mem.unmap(code_gpa, PAGE as u64).expect("unmap");
+        mem.unmap(data_gpa, PAGE as u64).expect("unmap");
         // SAFETY: both came from `alloc_zeroed` with `layout` and are not
         // mapped into the guest anymore.
         unsafe {
             dealloc(code_page, layout);
             dealloc(data_page, layout);
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_dirty_log_read_and_clear() {
+        // Reset state is real mode with `CS:IP` at 0xffff_fff0 and zero
+        // `DS`, so `mov [0x1000], al` writes guest physical 0x1000.
+        let code = [
+            0xb0, 0x42, // mov al, 0x42
+            0xa2, 0x00, 0x10, // mov [0x1000], al
+            0xf4, // hlt
+        ];
+        dirty_log_of(&code, 0xffff_f000, 0xff0, 0x1000, |_| {});
     }
 }
