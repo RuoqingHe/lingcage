@@ -40,11 +40,11 @@ use crate::mem::GuestRam;
 use crate::seccomp::{Filter, Refusal, Thread};
 use crate::vcpu::VmOps;
 
-mod acpi;
-mod cpuid;
-mod mptable;
 pub mod snapshot;
 pub mod vmgenid;
+mod x86_64;
+
+use crate::machine::x86_64::{acpi, cpuid, mptable};
 
 /// End of low RAM. Window from here to 4 GiB holds the I/O APIC and the
 /// LAPIC.

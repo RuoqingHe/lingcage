@@ -57,7 +57,7 @@ pub fn for_vcpu(host: &[CpuidEntry], index: u16) -> Vec<CpuidEntry> {
 
 #[cfg(test)]
 mod tests {
-    use crate::machine::cpuid::*;
+    use crate::machine::x86_64::cpuid::*;
 
     /// Host leaves carrying APIC ID 3, fixed so that the test does not
     /// depend on the machine it runs on.
@@ -154,7 +154,8 @@ mod tests {
 
     #[test]
     fn test_no_leaf_added() {
-        // Leaf 0x8000001E is from AMD, a host without it must not gain one.
+        // Leaf 0x8000001E is from AMD, a host without it must not gain
+        // one.
         let short: Vec<CpuidEntry> = host()
             .into_iter()
             .filter(|leaf| leaf.function != AMD_IDENTITY)

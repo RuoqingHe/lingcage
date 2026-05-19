@@ -16,7 +16,7 @@ use crate::mem::GuestRam;
 /// Address of the floating pointer, top kilobyte of base RAM.
 const TABLE: u64 = 0x9_fc00;
 
-/// Size of the scanned kilobyte, pointer and table fit inside it.
+/// Size of the scanned kilobyte. Pointer and table fit inside it.
 const ROOM: u64 = 0x400;
 
 /// Floating pointer signature.
@@ -50,9 +50,9 @@ const IO_APIC_ENTRY: u8 = 2;
 const INTERRUPT: u8 = 3;
 const LOCAL_INTERRUPT: u8 = 4;
 
-/// Processor flag, enabled.
+/// Processor flag for an enabled processor.
 const CPU_ENABLED: u8 = 1;
-/// Processor flag, the bootstrap processor.
+/// Processor flag for the bootstrap processor.
 const CPU_BOOTSTRAP: u8 = 2;
 
 /// Interrupt type INT, vectored through the APIC.
@@ -173,7 +173,7 @@ pub fn write(ram: &GuestRam, vcpus: u16) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::machine::mptable::*;
+    use crate::machine::x86_64::mptable::*;
 
     /// Read back the floating pointer and the configuration table.
     fn read(vcpus: u16) -> (Vec<u8>, Vec<u8>) {
@@ -200,7 +200,7 @@ mod tests {
     fn test_checksums() {
         let (pointer, config) = read(1);
 
-        // The scan skips a pointer with bad checksum, a table with one is
+        // The scan skips a pointer with bad checksum. A table with one is
         // dropped with `MPTABLE: checksum error!`.
         assert_eq!(&pointer[..4], &POINTER_SIGNATURE, "bad pointer signature");
         assert!(sums_to_zero(&pointer), "bad pointer checksum");

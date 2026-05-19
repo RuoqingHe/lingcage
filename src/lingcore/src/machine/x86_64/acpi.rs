@@ -168,7 +168,7 @@ fn lay_namespace(laying: &mut Laying, parts: &Parts) -> Result<u64> {
     );
 
     // Kernel runs `_EVT` with the GSI as argument on each interrupt
-    // (`acpi_ged_irq_handler` in `drivers/acpi/evged.c`), on a match the
+    // (`acpi_ged_irq_handler` in `drivers/acpi/evged.c`). On a match the
     // method notifies `\_SB_.VGEN`.
     let kind = aml::Name::new(aml::Path::new("_HID"), &EVENTS_HARDWARE);
     let raised = aml::Interrupt::new(true, true, false, false, u32::from(line));
@@ -291,7 +291,7 @@ fn line(part: &Named) -> Option<aml::Interrupt> {
 
 #[cfg(test)]
 mod tests {
-    use crate::machine::acpi::*;
+    use crate::machine::x86_64::acpi::*;
 
     /// Two vCPUs, the VM generation ID, console at `COM1` and two virtio
     /// blocks, the shape assembled by `machine::Machine`.
