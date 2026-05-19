@@ -6,7 +6,7 @@
 //! which identity-map the low 1 GiB are written to low memory, then
 //! vCPU is set up to run 64-bit code at kernel entry.
 
-use crate::boot::{BOOT_PARAMS, Error, Kernel, Result};
+use crate::boot::bzimage::{BOOT_PARAMS, Error, Kernel, Result};
 use crate::hv::arch::{DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
 use crate::hv::vcpu::Vcpu;
 use crate::mem::GuestRam;
@@ -250,7 +250,7 @@ mod tests {
         // tables.
         use std::io::Cursor;
 
-        use crate::boot::tests::bzimage;
+        use crate::boot::bzimage::tests::bzimage;
         use crate::boot::{load_kernel, write_boot_params};
         use crate::hv::backend::kvm::hypervisor::KvmHv;
         use crate::hv::hypervisor::Hypervisor;

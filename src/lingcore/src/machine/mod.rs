@@ -1121,7 +1121,7 @@ mod tests {
         use std::io;
         use std::sync::{Arc, Mutex};
 
-        use crate::boot::tests::bzimage;
+        use crate::boot::bzimage::tests::bzimage;
         use crate::hv::backend::kvm::hypervisor::KvmHv;
 
         /// Sink for the test to read back after the run.
@@ -1186,7 +1186,7 @@ mod tests {
         use std::io;
         use std::sync::{Arc, Mutex};
 
-        use crate::boot::tests::bzimage;
+        use crate::boot::bzimage::tests::bzimage;
         use crate::hv::backend::kvm::hypervisor::KvmHv;
 
         /// Console sink for the test to read back.
@@ -1255,7 +1255,7 @@ mod tests {
     #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_i8042_reset_exits_reboot() {
-        use crate::boot::tests::bzimage;
+        use crate::boot::bzimage::tests::bzimage;
         use crate::hv::backend::kvm::hypervisor::KvmHv;
 
         // Guest writes the reset command, then executes `ud2`. A run which
@@ -1300,7 +1300,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::{Duration, Instant};
 
-        use crate::boot::tests::bzimage;
+        use crate::boot::bzimage::tests::bzimage;
         use crate::hv::backend::kvm::hypervisor::KvmHv;
 
         /// Sink which counts the bytes written.
@@ -1419,7 +1419,7 @@ mod tests {
     #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_stop_spinning_guest() {
-        use crate::boot::tests::bzimage;
+        use crate::boot::bzimage::tests::bzimage;
         use crate::hv::backend::kvm::hypervisor::KvmHv;
 
         /// `jmp` to itself, guest spins without any exit.
@@ -1457,7 +1457,7 @@ mod tests {
     #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_reject_bad_transition() {
-        use crate::boot::tests::bzimage;
+        use crate::boot::bzimage::tests::bzimage;
         use crate::hv::backend::kvm::hypervisor::KvmHv;
 
         /// `ud2` triple faults with the empty IDT, run ends in `Shutdown`.
@@ -1499,7 +1499,7 @@ mod tests {
     #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn test_all_vcpus_exit_on_first_stop() {
-        use crate::boot::tests::bzimage;
+        use crate::boot::bzimage::tests::bzimage;
         use crate::hv::backend::kvm::hypervisor::KvmHv;
 
         /// `ud2` triple faults with the empty IDT, run ends in `Shutdown`.
