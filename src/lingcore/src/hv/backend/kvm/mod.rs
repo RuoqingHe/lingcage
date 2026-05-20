@@ -11,6 +11,9 @@ pub mod memory;
 pub mod vcpu;
 pub mod vm;
 
+/// One-register access and riscv64 vCPU registers.
+#[cfg(target_arch = "riscv64")]
+mod riscv64;
 /// CPUID conversion, MSR batch and x86_64 state blobs.
 #[cfg(target_arch = "x86_64")]
 mod x86_64;

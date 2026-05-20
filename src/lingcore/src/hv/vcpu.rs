@@ -4,8 +4,10 @@
 
 //! The `Vcpu` trait, exit reasons and the entry action for next `run`.
 
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+use crate::hv::arch::Reg;
 #[cfg(target_arch = "x86_64")]
-use crate::hv::arch::{CpuidEntry, DtReg, DtRegVal, Reg, SReg, SegReg, SegRegVal};
+use crate::hv::arch::{CpuidEntry, DtReg, DtRegVal, SReg, SegReg, SegRegVal};
 use crate::hv::{Error, Result, StateBlob};
 
 /// Reason a vCPU exited, mapped by the backend from the native exit.
@@ -88,11 +90,11 @@ pub trait Vcpu: Send {
     fn stopper(&self) -> Box<dyn Stopper>;
 
     /// Read one general register.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     fn get_reg(&self, reg: Reg) -> Result<u64>;
 
     /// Set general registers in one batch.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     fn set_regs(&mut self, vals: &[(Reg, u64)]) -> Result<()>;
 
     /// Read a segment register, decoded into `SegRegVal`.
