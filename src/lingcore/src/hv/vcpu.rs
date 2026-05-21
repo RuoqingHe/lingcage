@@ -4,6 +4,8 @@
 
 //! The `Vcpu` trait, exit reasons and the entry action for next `run`.
 
+#[cfg(target_arch = "riscv64")]
+use crate::hv::arch::ConfigReg;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 use crate::hv::arch::Reg;
 #[cfg(target_arch = "x86_64")]
@@ -132,6 +134,16 @@ pub trait Vcpu: Send {
     /// the batch are written.
     #[cfg(target_arch = "x86_64")]
     fn set_msrs(&mut self, msrs: &[(u32, u64)]) -> Result<()>;
+
+    /// Read one configuration register.
+    #[cfg(target_arch = "riscv64")]
+    fn get_config(&self, reg: ConfigReg) -> Result<u64>;
+
+    /// Returns ISA of the vCPU spelled like `riscv,isa`, namely `rv64`,
+    /// single-letter extensions, then each multi-letter extension after an
+    /// underscore.
+    #[cfg(target_arch = "riscv64")]
+    fn isa(&self) -> Result<String>;
 
     /// Capture the vCPU state as a `StateBlob`. Default returns
     /// `Unsupported`.

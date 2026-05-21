@@ -14,6 +14,8 @@ use kvm_ioctls::{VcpuExit, VcpuFd};
 
 #[cfg(target_arch = "x86_64")]
 use crate::hv::StateBlob;
+#[cfg(target_arch = "riscv64")]
+use crate::hv::arch::ConfigReg;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 use crate::hv::arch::Reg;
 #[cfg(target_arch = "x86_64")]
@@ -421,6 +423,16 @@ impl Vcpu for KvmVcpu {
     #[cfg(target_arch = "riscv64")]
     fn set_regs(&mut self, vals: &[(Reg, u64)]) -> Result<()> {
         riscv64::vcpu::set_core_regs(&self.fd, vals)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn get_config(&self, reg: ConfigReg) -> Result<u64> {
+        riscv64::vcpu::config(&self.fd, reg)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn isa(&self) -> Result<String> {
+        riscv64::vcpu::isa(&self.fd)
     }
 
     #[cfg(target_arch = "x86_64")]

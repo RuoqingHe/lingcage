@@ -2,14 +2,26 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! riscv64 side of `KvmVcpu`, core registers read by id.
+//! riscv64 side of `KvmVcpu`, core and configuration registers read by
+//! id.
 
-use kvm_bindings::KVM_REG_RISCV_CORE;
+use std::mem::offset_of;
+
+use kvm_bindings::{
+    KVM_REG_RISCV_CONFIG, KVM_REG_RISCV_CORE, KVM_REG_RISCV_ISA_EXT, KVM_REG_RISCV_ISA_SINGLE,
+    KVM_REG_RISCV_TIMER, kvm_riscv_config, kvm_riscv_timer,
+};
 use kvm_ioctls::VcpuFd;
 
-use crate::hv::Result;
-use crate::hv::arch::Reg;
-use crate::hv::backend::kvm::riscv64::{get_reg, reg_id, set_reg};
+use crate::hv::arch::{ConfigReg, Reg};
+use crate::hv::backend::kvm::riscv64::{
+    extension_name, get_reg, index, kind, reg_id, reg_list, set_reg,
+};
+use crate::hv::{Error, Result};
+
+/// Single-letter extensions in canonical order of the ISA manual. `i`
+/// opens the string as the base.
+const SINGLE_LETTERS: &str = "iemafdqlcbkjtpvnh";
 
 /// Read core register `reg` of the vCPU named by `fd`.
 pub(in crate::hv::backend::kvm) fn core_reg(fd: &VcpuFd, reg: Reg) -> Result<u64> {
@@ -24,11 +36,63 @@ pub(in crate::hv::backend::kvm) fn set_core_regs(fd: &VcpuFd, vals: &[(Reg, u64)
     Ok(())
 }
 
+/// Read configuration register `reg` of the vCPU named by `fd`. Block
+/// size is zero without its extension.
+pub(in crate::hv::backend::kvm) fn config(fd: &VcpuFd, reg: ConfigReg) -> Result<u64> {
+    let config = |field: usize| reg_id(KVM_REG_RISCV_CONFIG, (field / size_of::<u64>()) as u64);
+    let id = match reg {
+        ConfigReg::Isa => config(offset_of!(kvm_riscv_config, isa)),
+        ConfigReg::SatpMode => config(offset_of!(kvm_riscv_config, satp_mode)),
+        ConfigReg::Timebase => reg_id(
+            KVM_REG_RISCV_TIMER,
+            (offset_of!(kvm_riscv_timer, frequency) / size_of::<u64>()) as u64,
+        ),
+        ConfigReg::CbomBlockSize => config(offset_of!(kvm_riscv_config, zicbom_block_size)),
+        ConfigReg::CbozBlockSize => config(offset_of!(kvm_riscv_config, zicboz_block_size)),
+    };
+    match get_reg(fd, id) {
+        // Block size is `ENOENT` without its extension.
+        Err(Error::Os { errno, .. })
+            if errno == libc::ENOENT
+                && matches!(reg, ConfigReg::CbomBlockSize | ConfigReg::CbozBlockSize) =>
+        {
+            Ok(0)
+        }
+        other => other,
+    }
+}
+
+/// Returns ISA of the vCPU named by `fd`, spelled like `riscv,isa`,
+/// namely `rv64`, single-letter extensions, then each multi-letter
+/// extension enabled by KVM after an underscore.
+pub(in crate::hv::backend::kvm) fn isa(fd: &VcpuFd) -> Result<String> {
+    let letters = config(fd, ConfigReg::Isa)?;
+    let mut isa = String::from("rv64");
+    for letter in SINGLE_LETTERS.chars() {
+        if letters & 1 << (letter as u32 - 'a' as u32) != 0 {
+            isa.push(letter);
+        }
+    }
+    for id in reg_list(fd)? {
+        if kind(id) != KVM_REG_RISCV_ISA_EXT | KVM_REG_RISCV_ISA_SINGLE {
+            continue;
+        }
+        if get_reg(fd, id)? == 0 {
+            continue;
+        }
+        if let Some(name) = extension_name(index(id)) {
+            isa.push('_');
+            isa.push_str(name);
+        }
+    }
+    Ok(isa)
+}
+
 #[cfg(test)]
 mod tests {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
 
-    use crate::hv::arch::Reg;
+    use crate::hv::arch::{ConfigReg, Reg};
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     use crate::hv::hypervisor::Hypervisor;
     use crate::hv::memory::{MemMapOption, VmMemory};
@@ -150,5 +214,38 @@ mod tests {
         // SAFETY: `host` came from `alloc_zeroed` with `layout`, and the VM
         // which maps it is dropped at the end of the scope.
         unsafe { dealloc(host, layout) };
+    }
+
+    #[test]
+    fn test_isa_and_config_registers() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let cpu = vm.create_vcpu(0).expect("vcpu 0");
+
+        let isa = cpu.isa().expect("isa");
+        let letters = &isa[..isa.find('_').unwrap_or(isa.len())];
+        assert!(letters.starts_with("rv64i"), "{isa}");
+        // Letters which KVM does not disable.
+        for letter in ['m', 'a', 'c'] {
+            assert!(letters.contains(letter), "{isa} lacks {letter}");
+        }
+        assert!(
+            matches!(
+                cpu.get_config(ConfigReg::SatpMode).expect("satp"),
+                8 | 9 | 10
+            ),
+            "satp mode is not Sv39, Sv48 or Sv57"
+        );
+        assert_ne!(cpu.get_config(ConfigReg::Timebase).expect("timebase"), 0);
+        // Block size is zero without its extension and a power of two with
+        // it.
+        for (name, reg) in [
+            ("_zicbom", ConfigReg::CbomBlockSize),
+            ("_zicboz", ConfigReg::CbozBlockSize),
+        ] {
+            let size = cpu.get_config(reg).expect("block size");
+            assert_eq!(isa.contains(name), size != 0, "{isa}: {name} {size}");
+            assert!(size == 0 || size.is_power_of_two());
+        }
     }
 }
