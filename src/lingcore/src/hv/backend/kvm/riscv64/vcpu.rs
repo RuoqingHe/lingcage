@@ -2,15 +2,15 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! riscv64 side of `KvmVcpu`. SBI calls left to userspace by KVM which
-//! are refused in the run page, plus core and configuration registers
-//! read by id.
+//! riscv64 side of `KvmVcpu`. Exits left to userspace by KVM and
+//! answered in the run page, plus core and configuration registers read
+//! by id.
 
 use std::mem::offset_of;
 
 use kvm_bindings::{
-    KVM_REG_RISCV_CONFIG, KVM_REG_RISCV_CORE, KVM_REG_RISCV_ISA_EXT, KVM_REG_RISCV_ISA_SINGLE,
-    KVM_REG_RISCV_TIMER, kvm_riscv_config, kvm_riscv_timer, kvm_run,
+    KVM_EXIT_RISCV_SBI, KVM_REG_RISCV_CONFIG, KVM_REG_RISCV_CORE, KVM_REG_RISCV_ISA_EXT,
+    KVM_REG_RISCV_ISA_SINGLE, KVM_REG_RISCV_TIMER, kvm_riscv_config, kvm_riscv_timer, kvm_run,
 };
 use kvm_ioctls::VcpuFd;
 use log::warn;
@@ -30,8 +30,26 @@ const SBI_ERR_NOT_SUPPORTED: i64 = -2;
 /// opens the string as the base.
 const SINGLE_LETTERS: &str = "iemafdqlcbkjtpvnh";
 
+/// The Zkr `seed` CSR, `CSR_SEED` in `arch/riscv/include/asm/csr.h`. KVM
+/// leaves it to userspace. Bits 31:30 carry the status, `ES16` for a
+/// valid draw of sixteen bits and `WAIT` for none.
+const CSR_SEED: u64 = 0x015;
+const SEED_ES16: u64 = 2 << 30;
+const SEED_WAIT: u64 = 1 << 30;
+
+/// Answer the exit in `run`, one which KVM leaves to userspace. SBI call
+/// is refused, so the guest sees an extension the platform does not
+/// have. CSR access is `seed`, answered with entropy.
+pub(in crate::hv::backend::kvm) fn answer(run: &mut kvm_run) {
+    if run.exit_reason == KVM_EXIT_RISCV_SBI {
+        refuse_sbi(run);
+    } else {
+        answer_csr(run);
+    }
+}
+
 /// Answer the SBI call in `run` with `SBI_ERR_NOT_SUPPORTED`.
-pub(in crate::hv::backend::kvm) fn refuse_sbi(run: &mut kvm_run) {
+fn refuse_sbi(run: &mut kvm_run) {
     // SAFETY: the exit was `KVM_EXIT_RISCV_SBI`, so `riscv_sbi` is the
     // union arm filled in by KVM.
     let call = unsafe { &mut run.__bindgen_anon_1.riscv_sbi };
@@ -41,6 +59,28 @@ pub(in crate::hv::backend::kvm) fn refuse_sbi(run: &mut kvm_run) {
     );
     call.ret[0] = SBI_ERR_NOT_SUPPORTED as u64;
     call.ret[1] = 0;
+}
+
+/// Answer the CSR access in `run`. `seed` reads sixteen bits from
+/// `getrandom(2)`, or reports `WAIT` if the call gives none. Other CSRs
+/// read as zero, since KVM forwards no other.
+fn answer_csr(run: &mut kvm_run) {
+    // SAFETY: the exit was `KVM_EXIT_RISCV_CSR`, so `riscv_csr` is the
+    // union arm filled in by KVM.
+    let access = unsafe { &mut run.__bindgen_anon_1.riscv_csr };
+    access.ret_value = if u64::from(access.csr_num) == CSR_SEED {
+        let mut entropy = [0u8; 2];
+        // SAFETY: `entropy` is writable for its length during the call.
+        let drawn = unsafe { libc::getrandom(entropy.as_mut_ptr().cast(), entropy.len(), 0) };
+        if drawn == entropy.len() as isize {
+            SEED_ES16 | u64::from(u16::from_le_bytes(entropy))
+        } else {
+            SEED_WAIT
+        }
+    } else {
+        warn!("CSR {:#x} not emulated, read as zero", access.csr_num);
+        0
+    };
 }
 
 /// Read core register `reg` of the vCPU named by `fd`.
@@ -114,7 +154,7 @@ mod tests {
 
     use crate::hv::arch::{ConfigReg, Reg};
     use crate::hv::backend::kvm::hypervisor::KvmHv;
-    use crate::hv::backend::kvm::riscv64::vcpu::SBI_ERR_NOT_SUPPORTED;
+    use crate::hv::backend::kvm::riscv64::vcpu::{SBI_ERR_NOT_SUPPORTED, SEED_ES16};
     use crate::hv::hypervisor::Hypervisor;
     use crate::hv::memory::{MemMapOption, VmMemory};
     use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
@@ -133,6 +173,46 @@ mod tests {
         0x89, 0x62, 0x13, 0x03, 0x70, 0x03, 0x23, 0x80, 0x62, 0x00, 0x03, 0x83, 0x02, 0x00, 0x23,
         0x84, 0x62, 0x00, 0xb7, 0x58, 0x52, 0x53, 0x9b, 0x88, 0x48, 0x35, 0x01, 0x48, 0x01, 0x45,
         0x81, 0x45, 0x73, 0x00, 0x00, 0x00, 0x01, 0xa0,
+    ];
+
+    /// li t0, 0x2000 / lui a7, 0x08000 / li a6, 0 / ecall / sw a0, 0(t0)
+    /// / ecall for `sbi_system_reset` shutdown / j .
+    ///
+    /// Experimental extension range is forwarded to userspace. The store
+    /// carries `a0`.
+    const SBI_PROGRAM: [u8; 36] = [
+        0x89, 0x62, 0xb7, 0x08, 0x00, 0x08, 0x01, 0x48, 0x73, 0x00, 0x00, 0x00, 0x23, 0xa0, 0xa2,
+        0x00, 0xb7, 0x58, 0x52, 0x53, 0x9b, 0x88, 0x48, 0x35, 0x01, 0x48, 0x01, 0x45, 0x81, 0x45,
+        0x73, 0x00, 0x00, 0x00, 0x01, 0xa0,
+    ];
+
+    #[test]
+    fn test_refuse_forwarded_sbi_call() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let (host, layout) = map_code(&vm, &SBI_PROGRAM);
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        cpu.set_regs(&[(Reg::Pc, CODE)]).expect("entry point");
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Mmio {
+                addr: 0x2000,
+                write: Some(SBI_ERR_NOT_SUPPORTED as u32 as u64),
+                size: 4
+            }
+        );
+        assert_eq!(cpu.run(VmEntry::Run).expect("run"), VmExit::Shutdown);
+
+        // SAFETY: `host` came from `alloc_zeroed` with `layout`, and the VM
+        // which maps it is dropped at the end of the scope.
+        unsafe { dealloc(host, layout) };
+    }
+
+    /// li t0, 0x2000 / csrrw t1, seed, zero / sw t1, 0(t0) / ecall for
+    /// `sbi_system_reset` shutdown / j .
+    const SEED_PROGRAM: [u8; 30] = [
+        0x89, 0x62, 0x73, 0x13, 0x50, 0x01, 0x23, 0xa0, 0x62, 0x00, 0xb7, 0x58, 0x52, 0x53, 0x9b,
+        0x88, 0x48, 0x35, 0x01, 0x48, 0x01, 0x45, 0x81, 0x45, 0x73, 0x00, 0x00, 0x00, 0x01, 0xa0,
     ];
 
     /// Map one page holding `code` at `CODE` in `vm`. Returns allocation of
@@ -270,32 +350,30 @@ mod tests {
         }
     }
 
-    /// li t0, 0x2000 / lui a7, 0x08000 / li a6, 0 / ecall / sw a0, 0(t0)
-    /// / ecall for `sbi_system_reset` shutdown / j .
-    ///
-    /// Experimental extension range is forwarded to userspace. The store
-    /// carries `a0`.
-    const SBI_PROGRAM: [u8; 36] = [
-        0x89, 0x62, 0xb7, 0x08, 0x00, 0x08, 0x01, 0x48, 0x73, 0x00, 0x00, 0x00, 0x23, 0xa0, 0xa2,
-        0x00, 0xb7, 0x58, 0x52, 0x53, 0x9b, 0x88, 0x48, 0x35, 0x01, 0x48, 0x01, 0x45, 0x81, 0x45,
-        0x73, 0x00, 0x00, 0x00, 0x01, 0xa0,
-    ];
-
     #[test]
-    fn test_refuse_forwarded_sbi_call() {
+    fn test_seed_csr_entropy() {
+        // KVM leaves the `seed` CSR to userspace. Guest stores the value
+        // it read, with the `ES16` status bits inside.
         let hv = KvmHv::new().expect("open /dev/kvm");
         let vm = hv.create_vm().expect("guest");
-        let (host, layout) = map_code(&vm, &SBI_PROGRAM);
+        let (host, layout) = map_code(&vm, &SEED_PROGRAM);
         let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        // Without Zkr the access is an illegal instruction in the guest.
+        if !cpu.isa().expect("isa").contains("_zkr") {
+            // SAFETY: `host` came from `alloc_zeroed` with `layout`, and the
+            // VM which maps it is dropped at the end of the scope.
+            unsafe { dealloc(host, layout) };
+            return;
+        }
         cpu.set_regs(&[(Reg::Pc, CODE)]).expect("entry point");
-        assert_eq!(
-            cpu.run(VmEntry::Run).expect("run"),
+        match cpu.run(VmEntry::Run).expect("run") {
             VmExit::Mmio {
                 addr: 0x2000,
-                write: Some(SBI_ERR_NOT_SUPPORTED as u32 as u64),
-                size: 4
-            }
-        );
+                write: Some(seed),
+                size: 4,
+            } => assert_eq!(seed & 0xc000_0000, SEED_ES16, "seed read {seed:#x}"),
+            other => panic!("unexpected exit {other:?}"),
+        }
         assert_eq!(cpu.run(VmEntry::Run).expect("run"), VmExit::Shutdown);
 
         // SAFETY: `host` came from `alloc_zeroed` with `layout`, and the VM

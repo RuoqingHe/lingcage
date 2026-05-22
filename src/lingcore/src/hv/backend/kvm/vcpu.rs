@@ -10,7 +10,7 @@ use std::sync::Arc;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_EXIT_IO_IN;
 #[cfg(target_arch = "riscv64")]
-use kvm_bindings::KVM_EXIT_RISCV_SBI;
+use kvm_bindings::{KVM_EXIT_RISCV_CSR, KVM_EXIT_RISCV_SBI};
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 
@@ -218,14 +218,14 @@ impl Vcpu for KvmVcpu {
             let result = self.fd.run();
             match &result {
                 Err(err) if err.errno() == libc::EAGAIN && stop.is_none() => continue,
-                // SBI call left to userspace by KVM is refused in the run page
-                // and the guest is re-entered.
+                // SBI call or CSR access left to userspace by KVM is answered
+                // in the run page and the guest is re-entered.
                 #[cfg(target_arch = "riscv64")]
-                Ok(VcpuExit::Unsupported(KVM_EXIT_RISCV_SBI)) => {}
+                Ok(VcpuExit::Unsupported(KVM_EXIT_RISCV_SBI | KVM_EXIT_RISCV_CSR)) => {}
                 _ => break result,
             }
             #[cfg(target_arch = "riscv64")]
-            riscv64::vcpu::refuse_sbi(self.fd.get_kvm_run());
+            riscv64::vcpu::answer(self.fd.get_kvm_run());
         };
 
         let exit = match outcome {
