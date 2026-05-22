@@ -120,10 +120,10 @@ mod tests {
 
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     use crate::hv::backend::kvm::memory::*;
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     use crate::hv::backend::kvm::vcpu::KvmVcpu;
     use crate::hv::hypervisor::Hypervisor;
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     use crate::hv::vcpu::{Vcpu, VmEntry};
     use crate::hv::vm::Vm;
 
@@ -155,7 +155,7 @@ mod tests {
     /// Map `code` at `code_gpa` and a tracked page at `data_gpa`, run the
     /// guest once from `entry`, then check that the log only names the
     /// tracked page and reading clears it.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
     fn dirty_log_of(
         code: &[u8],
         code_gpa: u64,
@@ -241,5 +241,23 @@ mod tests {
             0xf4, // hlt
         ];
         dirty_log_of(&code, 0xffff_f000, 0xff0, 0x1000, |_| {});
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    #[test]
+    fn test_dirty_log_read_and_clear() {
+        use crate::hv::arch::Reg;
+
+        // lui t0, 0x40010 / li t1, 0x42 / sb t1, 0(t0) / ecall for
+        // `sbi_system_reset` shutdown / j .
+        let code = [
+            0xb7, 0x02, 0x01, 0x40, 0x13, 0x03, 0x20, 0x04, 0x23, 0x80, 0x62, 0x00, 0xb7, 0x58,
+            0x52, 0x53, 0x9b, 0x88, 0x48, 0x35, 0x01, 0x48, 0x01, 0x45, 0x81, 0x45, 0x73, 0x00,
+            0x00, 0x00, 0x01, 0xa0,
+        ];
+        dirty_log_of(&code, 0x4000_0000, 0, 0x4001_0000, |cpu| {
+            cpu.set_regs(&[(Reg::Pc, 0x4000_0000)])
+                .expect("entry point");
+        });
     }
 }
