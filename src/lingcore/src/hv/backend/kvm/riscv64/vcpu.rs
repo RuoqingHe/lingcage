@@ -2,16 +2,18 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! riscv64 side of `KvmVcpu`, core and configuration registers read by
-//! id.
+//! riscv64 side of `KvmVcpu`. SBI calls left to userspace by KVM which
+//! are refused in the run page, plus core and configuration registers
+//! read by id.
 
 use std::mem::offset_of;
 
 use kvm_bindings::{
     KVM_REG_RISCV_CONFIG, KVM_REG_RISCV_CORE, KVM_REG_RISCV_ISA_EXT, KVM_REG_RISCV_ISA_SINGLE,
-    KVM_REG_RISCV_TIMER, kvm_riscv_config, kvm_riscv_timer,
+    KVM_REG_RISCV_TIMER, kvm_riscv_config, kvm_riscv_timer, kvm_run,
 };
 use kvm_ioctls::VcpuFd;
+use log::warn;
 
 use crate::hv::arch::{ConfigReg, Reg};
 use crate::hv::backend::kvm::riscv64::{
@@ -19,9 +21,27 @@ use crate::hv::backend::kvm::riscv64::{
 };
 use crate::hv::{Error, Result};
 
+// TODO: The SBI debug console extension is not yet offered.
+/// `SBI_ERR_NOT_SUPPORTED`, the reply to a call on an extension which
+/// the platform does not have.
+const SBI_ERR_NOT_SUPPORTED: i64 = -2;
+
 /// Single-letter extensions in canonical order of the ISA manual. `i`
 /// opens the string as the base.
 const SINGLE_LETTERS: &str = "iemafdqlcbkjtpvnh";
+
+/// Answer the SBI call in `run` with `SBI_ERR_NOT_SUPPORTED`.
+pub(in crate::hv::backend::kvm) fn refuse_sbi(run: &mut kvm_run) {
+    // SAFETY: the exit was `KVM_EXIT_RISCV_SBI`, so `riscv_sbi` is the
+    // union arm filled in by KVM.
+    let call = unsafe { &mut run.__bindgen_anon_1.riscv_sbi };
+    warn!(
+        "SBI extension {:#x} function {:#x} not offered, refused",
+        call.extension_id, call.function_id
+    );
+    call.ret[0] = SBI_ERR_NOT_SUPPORTED as u64;
+    call.ret[1] = 0;
+}
 
 /// Read core register `reg` of the vCPU named by `fd`.
 pub(in crate::hv::backend::kvm) fn core_reg(fd: &VcpuFd, reg: Reg) -> Result<u64> {
@@ -94,6 +114,7 @@ mod tests {
 
     use crate::hv::arch::{ConfigReg, Reg};
     use crate::hv::backend::kvm::hypervisor::KvmHv;
+    use crate::hv::backend::kvm::riscv64::vcpu::SBI_ERR_NOT_SUPPORTED;
     use crate::hv::hypervisor::Hypervisor;
     use crate::hv::memory::{MemMapOption, VmMemory};
     use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
@@ -247,5 +268,38 @@ mod tests {
             assert_eq!(isa.contains(name), size != 0, "{isa}: {name} {size}");
             assert!(size == 0 || size.is_power_of_two());
         }
+    }
+
+    /// li t0, 0x2000 / lui a7, 0x08000 / li a6, 0 / ecall / sw a0, 0(t0)
+    /// / ecall for `sbi_system_reset` shutdown / j .
+    ///
+    /// Experimental extension range is forwarded to userspace. The store
+    /// carries `a0`.
+    const SBI_PROGRAM: [u8; 36] = [
+        0x89, 0x62, 0xb7, 0x08, 0x00, 0x08, 0x01, 0x48, 0x73, 0x00, 0x00, 0x00, 0x23, 0xa0, 0xa2,
+        0x00, 0xb7, 0x58, 0x52, 0x53, 0x9b, 0x88, 0x48, 0x35, 0x01, 0x48, 0x01, 0x45, 0x81, 0x45,
+        0x73, 0x00, 0x00, 0x00, 0x01, 0xa0,
+    ];
+
+    #[test]
+    fn test_refuse_forwarded_sbi_call() {
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let (host, layout) = map_code(&vm, &SBI_PROGRAM);
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        cpu.set_regs(&[(Reg::Pc, CODE)]).expect("entry point");
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Mmio {
+                addr: 0x2000,
+                write: Some(SBI_ERR_NOT_SUPPORTED as u32 as u64),
+                size: 4
+            }
+        );
+        assert_eq!(cpu.run(VmEntry::Run).expect("run"), VmExit::Shutdown);
+
+        // SAFETY: `host` came from `alloc_zeroed` with `layout`, and the VM
+        // which maps it is dropped at the end of the scope.
+        unsafe { dealloc(host, layout) };
     }
 }
