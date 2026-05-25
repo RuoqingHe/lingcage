@@ -7,14 +7,16 @@
 //! descriptor, since `RegList` caps the list at 200 ids, which is fewer
 //! than a kernel names.
 
-/// Registers read by id.
+/// Serialized vCPU state.
+pub(in crate::hv::backend::kvm) mod state;
+/// Exits answered in userspace, and registers read by id.
 pub(in crate::hv::backend::kvm) mod vcpu;
 
 use std::os::fd::AsRawFd;
 
 use kvm_bindings::{
     KVM_REG_RISCV, KVM_REG_RISCV_SUBTYPE_MASK, KVM_REG_RISCV_TYPE_MASK, KVM_REG_SIZE_MASK,
-    KVM_REG_SIZE_U64, KVMIO, kvm_one_reg, kvm_reg_list,
+    KVM_REG_SIZE_SHIFT, KVM_REG_SIZE_U64, KVMIO, kvm_one_reg, kvm_reg_list,
 };
 use vmm_sys_util::ioctl::{ioctl_with_mut_ptr, ioctl_with_ref};
 use vmm_sys_util::{ioctl_iow_nr, ioctl_iowr_nr};
@@ -40,6 +42,11 @@ pub(in crate::hv::backend::kvm) fn kind(id: u64) -> u32 {
 pub(in crate::hv::backend::kvm) fn index(id: u64) -> u64 {
     id & !(KVM_REG_RISCV as u64 | KVM_REG_SIZE_MASK)
         & !u64::from(KVM_REG_RISCV_TYPE_MASK | KVM_REG_RISCV_SUBTYPE_MASK)
+}
+
+/// Returns width of register `id` in bytes.
+pub(in crate::hv::backend::kvm) fn width(id: u64) -> usize {
+    1 << ((id & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT)
 }
 
 /// Returns errno of the ioctl which just failed.
@@ -398,6 +405,7 @@ mod tests {
         let id = reg_id(KVM_REG_RISCV_CORE, 10);
         assert_eq!(kind(id), KVM_REG_RISCV_CORE);
         assert_eq!(index(id), 10);
+        assert_eq!(width(id), 8);
 
         // Subtype goes together with the type.
         let id = reg_id(KVM_REG_RISCV_CSR | KVM_REG_RISCV_CSR_AIA, 2);
