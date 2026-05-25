@@ -6,6 +6,8 @@
 
 use std::thread::JoinHandle;
 
+#[cfg(target_arch = "riscv64")]
+use crate::hv::arch::Aia;
 use crate::hv::irq::{IrqSender, MsiSender};
 use crate::hv::memory::VmMemory;
 #[cfg(target_os = "linux")]
@@ -48,10 +50,11 @@ pub trait Vm: Send + Sync {
     /// Returns whether the backend has `cap`.
     fn capability(&self, cap: Cap) -> bool;
 
-    /// Move the irqchip into the kernel. Kernel then handles guest idle
-    /// and changes the meaning of `VmExit::Halt`, so the machine calls
-    /// this during setup. Default returns `Unsupported`.
-    fn enable_in_kernel_irqchip(&self) -> Result<()> {
+    /// Move the irqchip into the kernel, on riscv64 the AIA placed at `aia`.
+    /// Kernel then handles guest idle, and `VmExit::Halt` changes meaning
+    /// accordingly, so the machine calls this during setup. Default returns
+    /// `Unsupported`.
+    fn enable_in_kernel_irqchip(&self, #[cfg(target_arch = "riscv64")] _aia: &Aia) -> Result<()> {
         Err(Error::Unsupported("enable_in_kernel_irqchip"))
     }
 

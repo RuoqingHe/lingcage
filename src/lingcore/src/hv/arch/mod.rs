@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Register ids of each architecture.
+//! Register ids of each architecture, plus the vocabulary added by a
+//! platform.
 //!
 //! The module of host architecture is compiled and re-exported as
 //! `arch::*`. Rest of the crate refers to `Reg` and `SReg` through it.
