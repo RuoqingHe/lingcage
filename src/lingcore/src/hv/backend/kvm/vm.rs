@@ -16,10 +16,16 @@ use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 
 #[cfg(target_arch = "x86_64")]
 use crate::hv::StateBlob;
+#[cfg(target_arch = "riscv64")]
+use crate::hv::arch::Aia;
 use crate::hv::backend::kvm::ioeventfd::KvmIoeventFdRegistry;
+#[cfg(target_arch = "riscv64")]
+use crate::hv::backend::kvm::irq::FIRST_MSI_GSI;
 use crate::hv::backend::kvm::irq::{KvmIrqSender, KvmMsiSender, Routing};
 use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::memory::KvmMemory;
+#[cfg(target_arch = "riscv64")]
+use crate::hv::backend::kvm::riscv64::vm::Platform;
 use crate::hv::backend::kvm::vcpu::KvmVcpu;
 #[cfg(target_arch = "x86_64")]
 use crate::hv::backend::kvm::x86_64::clock::ClockState;
@@ -61,6 +67,9 @@ pub struct KvmVm {
     /// MSR indices from `KVM_GET_MSR_INDEX_LIST`, passed to each vCPU.
     #[cfg(target_arch = "x86_64")]
     msrs: Arc<[u32]>,
+    /// Harts and the AIA.
+    #[cfg(target_arch = "riscv64")]
+    platform: Platform,
 }
 
 impl KvmVm {
@@ -75,6 +84,8 @@ impl KvmVm {
             irqchip: AtomicBool::new(false),
             #[cfg(target_arch = "x86_64")]
             msrs,
+            #[cfg(target_arch = "riscv64")]
+            platform: Platform::default(),
         }
     }
 
@@ -103,6 +114,8 @@ impl Vm for KvmVm {
             .fd
             .create_vcpu(u64::from(cpu_index))
             .map_err(kvm_err("KVM_CREATE_VCPU"))?;
+        #[cfg(target_arch = "riscv64")]
+        self.platform.adopt();
         KvmVcpu::new(
             fd,
             #[cfg(target_arch = "x86_64")]
@@ -168,6 +181,23 @@ impl Vm for KvmVm {
                 ..Default::default()
             })
             .map_err(kvm_err("KVM_CREATE_PIT2"))?;
+        self.irqchip.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Create the AIA for vCPUs created so far. Wired sources take the GSIs
+    /// below the first MSI one, since a sender names its pin in a byte.
+    #[cfg(target_arch = "riscv64")]
+    fn enable_in_kernel_irqchip(&self, aia: &Aia) -> Result<()> {
+        if aia.sources >= FIRST_MSI_GSI {
+            return Err(Error::Overfull {
+                of: "wired interrupt sources",
+            });
+        }
+        self.platform.create_aia(&self.fd, aia)?;
+        // The AIA routes GSI `n` to source `n` for each source and the
+        // reserved source 0. Table written from here carries them again.
+        self.routing.lock().unwrap().pins = aia.sources + 1;
         self.irqchip.store(true, Ordering::Release);
         Ok(())
     }

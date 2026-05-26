@@ -7,10 +7,14 @@
 //! descriptor, since `RegList` caps the list at 200 ids, which is fewer
 //! than a kernel names.
 
+/// The AIA as a KVM device.
+pub(in crate::hv::backend::kvm) mod aia;
 /// Serialized vCPU state.
 pub(in crate::hv::backend::kvm) mod state;
 /// Exits answered in userspace, and registers read by id.
 pub(in crate::hv::backend::kvm) mod vcpu;
+/// Harts and the AIA of a guest.
+pub(in crate::hv::backend::kvm) mod vm;
 
 use std::os::fd::AsRawFd;
 

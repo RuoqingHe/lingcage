@@ -51,6 +51,7 @@ const PIN_IRQCHIP: u32 = 0;
 /// Pins of the in-kernel irqchip, 24 on the I/O APIC. `KVM_CREATE_IRQCHIP`
 /// routes them and `KVM_SET_GSI_ROUTING` overwrites the table, so each
 /// table written has to carry them again.
+#[cfg(target_arch = "x86_64")]
 const PIN_COUNT: u32 = 24;
 
 /// Last GSI carried by the 8259 pair. GSIs up to it get a PIC entry
@@ -64,7 +65,7 @@ const LAST_PIC_PIN: u32 = 15;
 const PIC_PINS: u32 = 8;
 
 /// First GSI taken by an irqfd. Legacy pins are `u8` and stay below it.
-const FIRST_MSI_GSI: u32 = 256;
+pub(in crate::hv::backend::kvm) const FIRST_MSI_GSI: u32 = 256;
 
 /// MSI route of one irqfd.
 #[derive(Clone, Copy)]
@@ -89,10 +90,26 @@ impl Default for MsiRoute {
 /// Routing table of the guest. `KVM_SET_GSI_ROUTING` overwrites the
 /// table, so legacy lines go in together with MSI routes on each write.
 /// The in-kernel PIT raises GSI 0 with no sender bound to it.
-#[derive(Default)]
 pub(in crate::hv::backend::kvm) struct Routing {
+    /// Pins of the in-kernel irqchip carried by each table.
+    pub(in crate::hv::backend::kvm) pins: u32,
     msi: BTreeMap<u32, MsiRoute>,
     next_gsi: u32,
+}
+
+impl Default for Routing {
+    /// No MSI route. I/O APIC pins on x86_64, and none on riscv64 until the
+    /// AIA is created.
+    fn default() -> Self {
+        Routing {
+            #[cfg(target_arch = "x86_64")]
+            pins: PIN_COUNT,
+            #[cfg(not(target_arch = "x86_64"))]
+            pins: 0,
+            msi: BTreeMap::new(),
+            next_gsi: 0,
+        }
+    }
 }
 
 impl Routing {
@@ -106,8 +123,8 @@ impl Routing {
     /// Write the table through `KVM_SET_GSI_ROUTING`. Masked routes are
     /// left out.
     pub(in crate::hv::backend::kvm) fn apply(&self, vm: &VmFd) -> Result<()> {
-        let mut entries = Vec::with_capacity(PIN_COUNT as usize * 2 + self.msi.len());
-        for gsi in 0..PIN_COUNT {
+        let mut entries = Vec::with_capacity(self.pins as usize * 2 + self.msi.len());
+        for gsi in 0..self.pins {
             let mut entry = kvm_irq_routing_entry {
                 gsi,
                 type_: KVM_IRQ_ROUTING_IRQCHIP,
