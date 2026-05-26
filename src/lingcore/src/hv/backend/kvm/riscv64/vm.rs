@@ -52,6 +52,11 @@ impl Platform {
         }
         Ok(())
     }
+
+    /// Returns the AIA, or `Unsupported` with `op` before it is created.
+    pub(in crate::hv::backend::kvm) fn aia(&self, op: &'static str) -> Result<&KvmAia> {
+        self.aia.get().ok_or(Error::Unsupported(op))
+    }
 }
 
 #[cfg(test)]
