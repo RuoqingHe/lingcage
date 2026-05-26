@@ -31,7 +31,9 @@ pub trait Vm: Send + Sync {
     #[cfg(target_os = "linux")]
     type IoeventFdRegistry: IoeventFdRegistry;
 
-    /// Create the vCPU numbered `cpu_index`.
+    /// Create the vCPU numbered `cpu_index`. On riscv64 a vCPU other than 0
+    /// is created stopped, so that the guest starts it through SBI HSM, same
+    /// as an x86_64 one waits for INIT.
     fn create_vcpu(&self, cpu_index: u16) -> Result<Self::Vcpu>;
 
     /// Create the guest physical address space.

@@ -8,9 +8,11 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use kvm_ioctls::VmFd;
+use kvm_bindings::{KVM_MP_STATE_STOPPED, kvm_mp_state};
+use kvm_ioctls::{VcpuFd, VmFd};
 
 use crate::hv::arch::Aia;
+use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::riscv64::aia::KvmAia;
 use crate::hv::{Error, Result};
 
@@ -24,9 +26,18 @@ pub(in crate::hv::backend::kvm) struct Platform {
 }
 
 impl Platform {
-    /// Count a vCPU as a hart.
-    pub(in crate::hv::backend::kvm) fn adopt(&self) {
+    /// Count the vCPU named by `fd`, numbered `cpu_index`, as a hart. vCPU
+    /// other than 0 is stopped, so that the guest starts it through SBI
+    /// HSM.
+    pub(in crate::hv::backend::kvm) fn adopt(&self, cpu_index: u16, fd: &VcpuFd) -> Result<()> {
+        if cpu_index != 0 {
+            fd.set_mp_state(kvm_mp_state {
+                mp_state: KVM_MP_STATE_STOPPED,
+            })
+            .map_err(kvm_err("KVM_SET_MP_STATE"))?;
+        }
         self.harts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Create the AIA placed by `aia` in `vm`, for the harts counted so far.
@@ -45,10 +56,15 @@ impl Platform {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
     use crate::hv::Cap;
     use crate::hv::arch::Aia;
     use crate::hv::backend::kvm::hypervisor::KvmHv;
     use crate::hv::hypervisor::Hypervisor;
+    use crate::hv::vcpu::{Vcpu, VmEntry, VmExit};
     use crate::hv::vm::Vm;
 
     /// An AIA laid out the way a machine lays one out.
@@ -69,6 +85,45 @@ mod tests {
         // KVM initializes an AIA only once, a second one gets `EBUSY`.
         vm.enable_in_kernel_irqchip(&AIA)
             .expect_err("irqchip again");
+    }
+
+    #[test]
+    fn test_kick_blocked_vcpu() {
+        // vCPU other than 0 is created stopped and blocks inside `KVM_RUN`
+        // until the guest starts it, so a kick is needed to bring it out.
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let _cpu0 = vm.create_vcpu(0).expect("vcpu 0");
+        let mut cpu = vm.create_vcpu(1).expect("vcpu 1");
+        let (tell, exits) = mpsc::channel();
+        let running = thread::spawn(move || {
+            let exit = cpu.run(VmEntry::Run);
+            tell.send(exit).expect("report the exit");
+        });
+
+        // Kick before the thread is inside the ioctl has no effect, so
+        // repeat it until the run reports one.
+        let mut exit = None;
+        for _ in 0..50 {
+            vm.stop_vcpu(1, &running).expect("kick");
+            match exits.recv_timeout(Duration::from_millis(100)) {
+                Ok(reported) => {
+                    exit = Some(reported.expect("run"));
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(err) => panic!("vCPU thread went away: {err}"),
+            }
+        }
+        // Checked before the join, so that a thread still inside `KVM_RUN`
+        // fails the test instead of hanging it.
+        let exit = exit.expect("run did not return");
+        running.join().expect("vCPU thread");
+        assert_eq!(
+            exit,
+            VmExit::Interrupted,
+            "guest came out for another reason"
+        );
     }
 
     #[test]

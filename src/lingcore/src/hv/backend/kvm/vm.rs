@@ -115,7 +115,7 @@ impl Vm for KvmVm {
             .create_vcpu(u64::from(cpu_index))
             .map_err(kvm_err("KVM_CREATE_VCPU"))?;
         #[cfg(target_arch = "riscv64")]
-        self.platform.adopt();
+        self.platform.adopt(cpu_index, &fd)?;
         KvmVcpu::new(
             fd,
             #[cfg(target_arch = "x86_64")]
