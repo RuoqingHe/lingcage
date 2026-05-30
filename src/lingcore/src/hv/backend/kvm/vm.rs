@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
 use kvm_ioctls::{Cap as KvmCap, VmFd};
+#[cfg(not(target_arch = "riscv64"))]
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 
@@ -129,14 +130,28 @@ impl Vm for KvmVm {
         Ok(KvmMemory::new(Arc::clone(&self.fd)))
     }
 
+    #[cfg(not(target_arch = "riscv64"))]
     fn create_irq_sender(&self, pin: u8) -> Result<KvmIrqSender> {
         let eventfd = EventFd::new(EFD_NONBLOCK).map_err(kvm_err("eventfd"))?;
-        // `KVM_CREATE_IRQCHIP` routes the legacy lines and `Routing::apply`
+        // The irqchip routes its pins when created and `Routing::apply`
         // rewrites them, so binding a pin writes no table.
         self.fd
             .register_irqfd(&eventfd, u32::from(pin))
             .map_err(kvm_err("KVM_IRQFD"))?;
         Ok(KvmIrqSender::new(eventfd))
+    }
+
+    /// Line is raised through `KVM_IRQ_LINE`, which fails with `ENXIO`
+    /// without irqchip. The check is done here, only once.
+    #[cfg(target_arch = "riscv64")]
+    fn create_irq_sender(&self, pin: u8) -> Result<KvmIrqSender> {
+        if !self.irqchip.load(Ordering::Acquire) {
+            return Err(Error::Os {
+                op: "KVM_IRQ_LINE",
+                errno: libc::ENXIO,
+            });
+        }
+        Ok(KvmIrqSender::new(Arc::clone(&self.fd), u32::from(pin)))
     }
 
     fn create_msi_sender(&self) -> Result<KvmMsiSender> {

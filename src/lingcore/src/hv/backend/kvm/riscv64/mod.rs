@@ -9,6 +9,8 @@
 
 /// The AIA as a KVM device, and its state blob.
 pub(in crate::hv::backend::kvm) mod aia;
+/// Legacy line, pulsed through `KVM_IRQ_LINE`.
+pub(in crate::hv::backend::kvm) mod irq;
 /// Serialized vCPU state.
 pub(in crate::hv::backend::kvm) mod state;
 /// Exits answered in userspace, and registers read by id.

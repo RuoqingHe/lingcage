@@ -16,17 +16,23 @@ use kvm_ioctls::VmFd;
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
 use crate::hv::backend::kvm::kvm_err;
-use crate::hv::irq::{IrqSender, MsiSender};
+#[cfg(target_arch = "riscv64")]
+pub use crate::hv::backend::kvm::riscv64::irq::KvmIrqSender;
+#[cfg(not(target_arch = "riscv64"))]
+use crate::hv::irq::IrqSender;
+use crate::hv::irq::MsiSender;
 use crate::hv::os::linux::irqfd::IrqFd;
 use crate::hv::{Error, Result};
 
-/// Legacy interrupt line, the eventfd bound to its pin by `KVM_IRQFD`.
-/// `send` writes the fd and issues no ioctl on the VM fd. Binding is
-/// not undone on drop, it ends together with the VM fd.
+/// Legacy interrupt line, an eventfd bound to its pin by `KVM_IRQFD`.
+/// `send` writes the fd and issues no ioctl on the VM fd, the binding
+/// ends together with the VM fd.
+#[cfg(not(target_arch = "riscv64"))]
 pub struct KvmIrqSender {
     eventfd: EventFd,
 }
 
+#[cfg(not(target_arch = "riscv64"))]
 impl KvmIrqSender {
     /// Wrap `eventfd`, which is already bound to its pin through `KVM_IRQFD`.
     pub(in crate::hv::backend::kvm) fn new(eventfd: EventFd) -> Self {
@@ -34,6 +40,7 @@ impl KvmIrqSender {
     }
 }
 
+#[cfg(not(target_arch = "riscv64"))]
 impl IrqSender for KvmIrqSender {
     fn send(&self) -> Result<()> {
         // Without resamplefd, KVM raises the line and lowers it for each write.
