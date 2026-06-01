@@ -2,9 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! riscv64 side of `KvmVm`, harts counted for the AIA, and the AIA once
-//! created.
+//! riscv64 side of `KvmVm`. Harts counted for the AIA, the AIA once
+//! created, and the duplicate descriptor of vCPU 0 used to reach the
+//! clock.
 
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -16,21 +18,36 @@ use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::riscv64::aia::KvmAia;
 use crate::hv::{Error, Result};
 
-/// Platform of a riscv64 guest, its harts and the AIA.
+/// Platform of a riscv64 guest, its harts, the AIA and the clock.
 #[derive(Default)]
 pub(in crate::hv::backend::kvm) struct Platform {
     /// The AIA, once created by `enable_in_kernel_irqchip`.
     aia: OnceLock<KvmAia>,
     /// vCPUs created so far. The AIA is sized according to them.
     harts: AtomicU32,
+    /// Duplicate descriptor of vCPU 0. The clock is a timer register of
+    /// each vCPU with one offset per guest behind, so it is read and
+    /// written through this one.
+    boot: OnceLock<OwnedFd>,
 }
 
 impl Platform {
-    /// Count the vCPU named by `fd`, numbered `cpu_index`, as a hart. vCPU
-    /// other than 0 is stopped, so that the guest starts it through SBI
-    /// HSM.
+    /// Count the vCPU named by `fd`, numbered `cpu_index`, as a hart. vCPU 0
+    /// lends its descriptor to the clock. Other vCPUs are stopped, so that
+    /// the guest starts them through SBI HSM.
     pub(in crate::hv::backend::kvm) fn adopt(&self, cpu_index: u16, fd: &VcpuFd) -> Result<()> {
-        if cpu_index != 0 {
+        if cpu_index == 0 {
+            // SAFETY: `fd` is open during the borrow, the duplicate is owned
+            // from here on.
+            let duplicate = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) }
+                .try_clone_to_owned()
+                .map_err(|err| Error::Os {
+                    op: "dup",
+                    errno: err.raw_os_error().unwrap_or(0),
+                })?;
+            // KVM refuses a second vCPU 0, so the slot is free.
+            self.boot.get_or_init(|| duplicate);
+        } else {
             fd.set_mp_state(kvm_mp_state {
                 mp_state: KVM_MP_STATE_STOPPED,
             })
@@ -56,6 +73,12 @@ impl Platform {
     /// Returns the AIA, or `Unsupported` with `op` before it is created.
     pub(in crate::hv::backend::kvm) fn aia(&self, op: &'static str) -> Result<&KvmAia> {
         self.aia.get().ok_or(Error::Unsupported(op))
+    }
+
+    /// Returns the descriptor through which the clock is reached, or
+    /// `Unsupported` with `op` before vCPU 0 exists.
+    pub(in crate::hv::backend::kvm) fn clock(&self, op: &'static str) -> Result<&OwnedFd> {
+        self.boot.get().ok_or(Error::Unsupported(op))
     }
 }
 

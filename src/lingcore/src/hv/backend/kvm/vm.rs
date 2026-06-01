@@ -26,6 +26,8 @@ use crate::hv::backend::kvm::irq::{KvmIrqSender, KvmMsiSender, Routing};
 use crate::hv::backend::kvm::kvm_err;
 use crate::hv::backend::kvm::memory::KvmMemory;
 #[cfg(target_arch = "riscv64")]
+use crate::hv::backend::kvm::riscv64::clock::ClockState;
+#[cfg(target_arch = "riscv64")]
 use crate::hv::backend::kvm::riscv64::vm::Platform;
 use crate::hv::backend::kvm::vcpu::KvmVcpu;
 #[cfg(target_arch = "x86_64")]
@@ -68,7 +70,7 @@ pub struct KvmVm {
     /// MSR indices from `KVM_GET_MSR_INDEX_LIST`, passed to each vCPU.
     #[cfg(target_arch = "x86_64")]
     msrs: Arc<[u32]>,
-    /// Harts and the AIA.
+    /// Harts, the AIA and the clock descriptor.
     #[cfg(target_arch = "riscv64")]
     platform: Platform,
 }
@@ -225,6 +227,21 @@ impl Vm for KvmVm {
     #[cfg(target_arch = "riscv64")]
     fn set_irqchip_state(&self, state: &StateBlob) -> Result<()> {
         self.platform.aia("set_irqchip_state")?.restore(state)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn get_clock(&self) -> Result<StateBlob> {
+        ClockState::capture(self.platform.clock("get_clock")?)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn set_clock(&self, state: &StateBlob) -> Result<()> {
+        ClockState::restore(self.platform.clock("set_clock")?, state)
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn set_clock_elapsed(&self, state: &StateBlob) -> Result<()> {
+        ClockState::restore_elapsed(self.platform.clock("set_clock_elapsed")?, state)
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -9,13 +9,15 @@
 
 /// The AIA as a KVM device, and its state blob.
 pub(in crate::hv::backend::kvm) mod aia;
+/// Serialized guest clock state.
+pub(in crate::hv::backend::kvm) mod clock;
 /// Legacy line, pulsed through `KVM_IRQ_LINE`.
 pub(in crate::hv::backend::kvm) mod irq;
 /// Serialized vCPU state.
 pub(in crate::hv::backend::kvm) mod state;
 /// Exits answered in userspace, and registers read by id.
 pub(in crate::hv::backend::kvm) mod vcpu;
-/// Harts and the AIA of a guest.
+/// Harts, the AIA and the clock descriptor of a guest.
 pub(in crate::hv::backend::kvm) mod vm;
 
 use std::os::fd::AsRawFd;
