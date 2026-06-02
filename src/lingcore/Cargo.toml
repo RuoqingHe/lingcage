@@ -12,7 +12,7 @@ version.workspace = true
 default = ["hv"]
 # ACPI tables in guest RAM. x86_64 only.
 acpi = ["dep:acpi_tables", "mem"]
-# Kernel loading into guest RAM. x86_64 only.
+# Kernel loading into guest RAM. x86_64 and riscv64 only.
 boot = ["dep:linux-loader", "hv", "mem"]
 # Guest-facing devices, serde carries their state.
 devices = ["dep:serde", "dep:serde_json", "vcpu"]

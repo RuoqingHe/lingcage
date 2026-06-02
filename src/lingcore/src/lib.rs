@@ -8,8 +8,8 @@
 //! `lingcore` is a library instead of a VMM. Each component is gated
 //! behind a Cargo feature.
 
-// linux-loader only carries the bzImage loader for x86_64.
-#[cfg(all(feature = "boot", target_arch = "x86_64"))]
+// bzImage on x86_64 and Image on riscv64, no other format is read.
+#[cfg(all(feature = "boot", any(target_arch = "x86_64", target_arch = "riscv64")))]
 pub mod boot;
 #[cfg(feature = "devices")]
 pub mod devices;
