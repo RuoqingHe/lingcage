@@ -105,8 +105,7 @@ impl Thread {
     /// conditions on their arguments. Empty rule list allows the syscall
     /// unconditionally.
     fn extras(self) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
-        // `socket` for `AF_UNIX` only and `ioctl` for `FIONBIO` only, other
-        // family or request is refused.
+        // `socket` for `AF_UNIX` only. Other family is refused.
         let unix_only = vec![
             SeccompRule::new(vec![
                 SeccompCondition::new(
@@ -119,37 +118,26 @@ impl Thread {
             ])
             .map_err(Error::Assemble)?,
         ];
-        let nonblocking_only = vec![
+        // `ioctl` for `request` only. Other request is refused.
+        let request = |request: u64| -> Result<SeccompRule> {
             SeccompRule::new(vec![
                 SeccompCondition::new(
                     IOCTL_REQUEST,
                     SeccompCmpArgLen::Dword,
                     SeccompCmpOp::Eq,
-                    FIONBIO,
+                    request,
                 )
                 .map_err(Error::Assemble)?,
             ])
-            .map_err(Error::Assemble)?,
-        ];
+            .map_err(Error::Assemble)
+        };
         match self {
             // `ioctl` for `KVM_RUN` only, other request is refused.
-            Thread::Vcpu => {
-                let enter = SeccompRule::new(vec![
-                    SeccompCondition::new(
-                        IOCTL_REQUEST,
-                        SeccompCmpArgLen::Dword,
-                        SeccompCmpOp::Eq,
-                        KVM_RUN,
-                    )
-                    .map_err(Error::Assemble)?,
-                ])
-                .map_err(Error::Assemble)?;
-                Ok(BTreeMap::from([(libc::SYS_ioctl, vec![enter])]))
-            }
+            Thread::Vcpu => Ok(BTreeMap::from([(libc::SYS_ioctl, vec![request(KVM_RUN)?])])),
             // The ioeventfd is polled and read, the disk is sought, read,
             // written and flushed, the channel accepts incoming connections and
             // opens, connects, sends on, receives on and closes a host socket
-            // per connection.
+            // per connection. `ioctl` is for `FIONBIO`.
             Thread::Device => Ok(BTreeMap::from([
                 (libc::SYS_accept4, Vec::new()),
                 (libc::SYS_close, Vec::new()),
@@ -161,7 +149,7 @@ impl Thread {
                 (libc::SYS_read, Vec::new()),
                 (libc::SYS_recvfrom, Vec::new()),
                 (libc::SYS_sendto, Vec::new()),
-                (libc::SYS_ioctl, nonblocking_only),
+                (libc::SYS_ioctl, vec![request(FIONBIO)?]),
                 (libc::SYS_socket, unix_only),
             ])),
         }
