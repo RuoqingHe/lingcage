@@ -81,6 +81,19 @@ const COMMON: &[libc::c_long] = &[
     libc::SYS_write,
 ];
 
+/// Architecture which the allowlist checks syscall numbers against.
+#[cfg(target_arch = "x86_64")]
+const ARCH: TargetArch = TargetArch::x86_64;
+#[cfg(target_arch = "riscv64")]
+const ARCH: TargetArch = TargetArch::riscv64;
+
+/// Syscall behind `poll(2)`. x86_64 has `poll`, riscv64 only has
+/// `ppoll`.
+#[cfg(target_arch = "x86_64")]
+const SYS_POLL: libc::c_long = libc::SYS_poll;
+#[cfg(target_arch = "riscv64")]
+const SYS_POLL: libc::c_long = libc::SYS_ppoll;
+
 /// Index of `request` in `ioctl(fd, request, ...)`.
 const IOCTL_REQUEST: u8 = 1;
 
@@ -91,6 +104,12 @@ const KVM_RUN: u64 = 0xae80;
 /// `FIONBIO`, the request issued by `set_nonblocking` on a socket, from
 /// `include/uapi/asm-generic/ioctls.h`.
 const FIONBIO: u64 = 0x5421;
+
+/// `KVM_IRQ_LINE` is `_IOW(KVMIO, 0x61, struct kvm_irq_level)`, eight
+/// bytes, from `include/uapi/linux/kvm.h`. A riscv64 thread raises the
+/// line of a device through it.
+#[cfg(target_arch = "riscv64")]
+const KVM_IRQ_LINE: u64 = 0x4008_ae61;
 
 impl Thread {
     /// Returns the name of this thread in a `SIGSYS` report.
@@ -132,12 +151,26 @@ impl Thread {
             .map_err(Error::Assemble)
         };
         match self {
-            // `ioctl` for `KVM_RUN` only, other request is refused.
-            Thread::Vcpu => Ok(BTreeMap::from([(libc::SYS_ioctl, vec![request(KVM_RUN)?])])),
+            // `ioctl` for `KVM_RUN`, and on riscv64 for `KVM_IRQ_LINE` which
+            // raises the line of the console. The thread there also draws the
+            // `seed` CSR of the guest from `getrandom`.
+            Thread::Vcpu => Ok(BTreeMap::from([
+                (
+                    libc::SYS_ioctl,
+                    vec![
+                        request(KVM_RUN)?,
+                        #[cfg(target_arch = "riscv64")]
+                        request(KVM_IRQ_LINE)?,
+                    ],
+                ),
+                #[cfg(target_arch = "riscv64")]
+                (libc::SYS_getrandom, Vec::new()),
+            ])),
             // The ioeventfd is polled and read, the disk is sought, read,
             // written and flushed, the channel accepts incoming connections and
             // opens, connects, sends on, receives on and closes a host socket
-            // per connection. `ioctl` is for `FIONBIO`.
+            // per connection. `ioctl` is for `FIONBIO`, and on riscv64 for
+            // `KVM_IRQ_LINE` which raises the line of a device.
             Thread::Device => Ok(BTreeMap::from([
                 (libc::SYS_accept4, Vec::new()),
                 (libc::SYS_close, Vec::new()),
@@ -145,11 +178,18 @@ impl Thread {
                 (libc::SYS_fcntl, Vec::new()),
                 (libc::SYS_fdatasync, Vec::new()),
                 (libc::SYS_lseek, Vec::new()),
-                (libc::SYS_poll, Vec::new()),
+                (SYS_POLL, Vec::new()),
                 (libc::SYS_read, Vec::new()),
                 (libc::SYS_recvfrom, Vec::new()),
                 (libc::SYS_sendto, Vec::new()),
-                (libc::SYS_ioctl, vec![request(FIONBIO)?]),
+                (
+                    libc::SYS_ioctl,
+                    vec![
+                        request(FIONBIO)?,
+                        #[cfg(target_arch = "riscv64")]
+                        request(KVM_IRQ_LINE)?,
+                    ],
+                ),
                 (libc::SYS_socket, unix_only),
             ])),
         }
@@ -177,7 +217,7 @@ impl Filter {
             Refusal::Trap => SeccompAction::Trap,
             Refusal::Errno => SeccompAction::Errno(libc::ENOSYS as u32),
         };
-        let filter = SeccompFilter::new(rules, refused, SeccompAction::Allow, TargetArch::x86_64)
+        let filter = SeccompFilter::new(rules, refused, SeccompAction::Allow, ARCH)
             .map_err(Error::Assemble)?;
         let program = seccompiler::BpfProgram::try_from(filter).map_err(Error::Assemble)?;
         Ok(Filter {

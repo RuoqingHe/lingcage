@@ -34,7 +34,7 @@ machine = [
 serde = ["dep:serde"]
 # Guest RAM, held as vm-memory regions.
 mem = ["dep:libc", "dep:vm-memory"]
-# Per-thread syscall allowlists. x86_64 Linux only.
+# Per-thread syscall allowlists. x86_64 and riscv64 Linux only.
 seccomp = ["dep:libc", "dep:seccompiler"]
 # vCPU run loop and the bus which it dispatches to.
 vcpu = ["hv"]
