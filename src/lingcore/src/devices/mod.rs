@@ -14,6 +14,7 @@ use crate::hv::vcpu::VmExit;
 
 pub mod bus;
 pub mod i8042;
+pub mod pm1;
 pub mod serial;
 #[cfg(feature = "virtio")]
 pub mod virtio;
