@@ -29,7 +29,8 @@ There are two crates in this repository:
 
 ### Prerequisites
 
-- x86_64 Linux with KVM enabled, and read/write access to `/dev/kvm`.
+- x86_64 or riscv64 Linux with KVM enabled, and read/write access to `/dev/kvm`. riscv64 host needs
+  AIA, since interrupt controller of a guest is in-kernel APLIC and IMSICs.
 
 - Rust toolchain, pinned via [rust-toolchain.toml](rust-toolchain.toml). Install via
   [rustup](https://rustup.rs):
@@ -123,9 +124,10 @@ cargo test --workspace --all-features
 
 Unit tests under `hv`, `boot` and `machine` open `/dev/kvm` and run guest code, so a KVM host is
 needed. `cargo check --target aarch64-unknown-linux-gnu` and `--target x86_64-apple-darwin` make
-sure the `cfg` gates are correct. Only x86_64 Linux builds the `machine` feature.
+sure the `cfg` gates are correct. Only x86_64 and riscv64 Linux build the `machine` feature.
 
 ## Status
 
 `lingcore` boots a Linux guest with the devices above, captures and clones it. KVM is the only
-backend and `x86_64` is the only architecture for now. `lingcage` is coming soon.
+backend, `x86_64` boots a bzImage with ACPI tables and `riscv64` boots an Image with device tree.
+`lingcage` is coming soon.
