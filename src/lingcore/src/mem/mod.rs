@@ -47,6 +47,12 @@ pub enum Error {
         /// Guest address of the copy.
         gpa: u64,
     },
+    /// Template mapped by a clone covers less than RAM of the guest.
+    #[error("template is shorter than {size:#x} bytes of guest RAM")]
+    ShortTemplate {
+        /// Bytes of RAM covered by the regions.
+        size: u64,
+    },
 }
 
 /// Result alias for guest RAM.
@@ -101,9 +107,19 @@ impl GuestRam {
     /// read from the file on first access, and a written page becomes a
     /// private copy of the guest, so the template is unchanged. The order is
     /// the same as returned by `regions` and written by
-    /// `Machine::write_memory`.
+    /// `Machine::write_memory`. Template covering less than the regions is
+    /// reported as `ShortTemplate`. A page mapped past the end of the file
+    /// raises `SIGBUS` on its first access.
     #[cfg(target_os = "linux")]
     pub fn cloned_from(regions: &[(u64, u64)], template: &File) -> Result<Self> {
+        let size = regions
+            .iter()
+            .try_fold(0u64, |total, &(_, size)| total.checked_add(size))
+            .ok_or(Error::Take)?;
+        if template.metadata().map_err(|_| Error::Take)?.len() < size {
+            return Err(Error::ShortTemplate { size });
+        }
+
         let mut at = 0u64;
         let mut mapped = Vec::with_capacity(regions.len());
         for &(gpa, size) in regions {
@@ -293,6 +309,30 @@ mod tests {
             .join()
             .expect("writing thread")
             .expect("fill the socket");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_clone_from_template() {
+        const SIZE: u64 = 1 << 20;
+        let template = file_of(&vec![0xa5u8; SIZE as usize], "template");
+        let ram = GuestRam::cloned_from(&[(0, SIZE)], &template).expect("map the template");
+
+        // The last page comes from the file, not from a fresh mapping.
+        let mut landed = [0u8; 8];
+        ram.read(SIZE - 8, &mut landed).expect("read back");
+        assert_eq!(landed, [0xa5u8; 8]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_reject_short_template() {
+        const SIZE: u64 = 1 << 20;
+        let template = file_of(&[0xa5u8; PAGE as usize], "short");
+        assert!(matches!(
+            GuestRam::cloned_from(&[(0, SIZE)], &template),
+            Err(Error::ShortTemplate { size }) if size == SIZE
+        ));
     }
 
     #[test]
