@@ -15,8 +15,13 @@ pub mod boot;
 pub mod devices;
 #[cfg(feature = "hv")]
 pub mod hv;
-// Boot tables are of a PC and the ioeventfds are eventfds.
-#[cfg(all(feature = "machine", target_os = "linux", target_arch = "x86_64"))]
+// Boot tables are of a PC or a device tree, and `KVM_IOEVENTFD` is a
+// Linux interface.
+#[cfg(all(
+    feature = "machine",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 pub mod machine;
 #[cfg(feature = "mem")]
 pub mod mem;

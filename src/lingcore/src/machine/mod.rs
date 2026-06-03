@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Machine assembly. Guest RAM, the kernel loaded into it, a bus with
-//! the serial console, and a vCPU entered at the kernel in long mode.
+//! the serial console, and a vCPU entered at the kernel. Entry is in
+//! long mode on x86_64, and in supervisor mode with the device tree on
+//! riscv64.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -38,10 +40,16 @@ use crate::mem::GuestRam;
 use crate::seccomp::{Filter, Refusal, Thread};
 use crate::vcpu::VmOps;
 
+#[cfg(target_arch = "riscv64")]
+mod riscv64;
 pub mod snapshot;
 pub mod vmgenid;
+#[cfg(target_arch = "x86_64")]
 mod x86_64;
 
+#[cfg(target_arch = "riscv64")]
+use crate::machine::riscv64::*;
+#[cfg(target_arch = "x86_64")]
 use crate::machine::x86_64::*;
 
 /// Bytes of RAM given to a guest by `Config::default`.
@@ -100,11 +108,22 @@ pub enum Error {
     #[error("guest needs a kernel")]
     NoKernel,
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
+    #[cfg(target_arch = "x86_64")]
     #[error("MP table does not fit in its kilobyte")]
     NoRoomForMpTable,
     /// ACPI tables overrun the area below the VM generation ID.
+    #[cfg(target_arch = "x86_64")]
     #[error("ACPI tables overrun the area below the VM generation ID")]
     NoRoomForTables,
+    /// Device tree overruns its window, or text offset of the kernel leaves
+    /// no room for the tree and the identifier below the kernel.
+    #[cfg(target_arch = "riscv64")]
+    #[error("device tree does not fit below kernel")]
+    NoRoomForTree,
+    /// Failed to assemble the device tree.
+    #[cfg(target_arch = "riscv64")]
+    #[error("failed to assemble device tree")]
+    Tree,
     /// Failed to encode or decode the snapshot.
     #[error("failed to read or write snapshot")]
     Snapshot,
@@ -193,7 +212,7 @@ pub struct Config {
     pub memory: u64,
     /// Number of vCPUs, at least one.
     pub vcpus: u16,
-    /// Kernel image path, a bzImage on x86.
+    /// Kernel image path, a bzImage on x86_64 or an Image on riscv64.
     pub kernel: PathBuf,
     /// Initramfs path, a cpio archive loaded above the kernel.
     pub initrd: Option<PathBuf>,
@@ -1012,7 +1031,7 @@ mod tests {
             memory: 16 << 20,
             ..Default::default()
         };
-        #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(feature = "kvm", target_os = "linux"))]
         {
             use crate::hv::backend::kvm::hypervisor::KvmHv;
 
@@ -1027,7 +1046,7 @@ mod tests {
 
     #[test]
     fn test_reject_unreadable_kernel() {
-        #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(feature = "kvm", target_os = "linux"))]
         {
             use crate::hv::backend::kvm::hypervisor::KvmHv;
 

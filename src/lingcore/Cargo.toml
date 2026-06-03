@@ -14,15 +14,19 @@ default = ["hv"]
 acpi = ["dep:acpi_tables", "mem"]
 # Kernel loading into guest RAM. x86_64 and riscv64 only.
 boot = ["dep:linux-loader", "hv", "mem"]
+# Device tree in guest RAM. riscv64 only.
+fdt = ["dep:vm-fdt", "mem"]
 # Guest-facing devices, serde carries their state.
 devices = ["dep:serde", "dep:serde_json", "vcpu"]
 # Hypervisor backends and the Linux mechanisms under them, libc for poll(2).
 hv = ["dep:libc"]
-# Guest assembly, RAM, kernel, bus and the run loop. x86_64 Linux only.
+# Guest assembly, RAM, kernel, bus and the run loop. x86_64 and riscv64
+# Linux only.
 machine = [
   "acpi",
   "boot",
   "devices",
+  "fdt",
   "hv",
   "mem",
   "seccomp",
@@ -69,3 +73,7 @@ kvm-ioctls = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 seccompiler = { workspace = true, optional = true }
 vmm-sys-util = { workspace = true, optional = true }
+
+# Device tree writer, a bzImage guest names its devices in ACPI.
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vm-fdt = { workspace = true, optional = true }
