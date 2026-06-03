@@ -706,7 +706,7 @@ impl<H: Hypervisor> Machine<H> {
     pub fn read_memory(&mut self, from: &mut File) -> Result<()> {
         for region in self.ram.regions() {
             let want = region.size as usize;
-            if self.ram.fill_from(region.gpa, from, want)? != want {
+            if self.ram.fill_all_from(region.gpa, from, want)? != want {
                 return Err(Error::SnapshotShape);
             }
         }

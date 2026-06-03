@@ -174,6 +174,23 @@ impl GuestRam {
             .map_err(|_| Error::Copy { gpa })
     }
 
+    /// Read `count` bytes from `source` into guest RAM at `gpa`. Count
+    /// returned is only short once the source has run dry.
+    pub fn fill_all_from(&self, gpa: u64, source: &mut File, count: usize) -> Result<usize> {
+        // A single `read(2)` takes at most `MAX_RW_COUNT`, `0x7ffff000`
+        // bytes (`rw_verify_area` in `fs/read_write.c`), so a region of
+        // 2 GiB or more needs several reads.
+        let mut filled = 0;
+        while filled < count {
+            let taken = self.fill_from(gpa + filled as u64, source, count - filled)?;
+            if taken == 0 {
+                break;
+            }
+            filled += taken;
+        }
+        Ok(filled)
+    }
+
     /// Write `count` bytes of guest RAM at `gpa` to `sink`. Short write is
     /// reported as `Copy`.
     pub fn drain_to(&self, gpa: u64, sink: &mut File, count: usize) -> Result<()> {
@@ -247,6 +264,35 @@ mod tests {
         let mut source = file_of(&[0xa5u8; 100], "dry");
         // Count returned is what the source had, not what was asked for.
         assert_eq!(ram.fill_from(0, &mut source, 4096).expect("fill"), 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fill_all_from_piecewise_source() {
+        // Source gives a piece at a time, the same way a read of 2 GiB or
+        // more does. It is one end of a socket pair, written from its own
+        // thread, so the buffer between the two ends decides the piece
+        // size.
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        const COUNT: usize = 4 << 20;
+        let ram = GuestRam::new(&[(0, 8 << 20)]).expect("host pages");
+        let (reading, mut writing) = UnixStream::pair().expect("open a socket pair");
+        let filling = std::thread::spawn(move || writing.write_all(&[0xa5u8; COUNT]));
+        let mut source = File::from(std::os::fd::OwnedFd::from(reading));
+
+        assert_eq!(
+            ram.fill_all_from(0, &mut source, COUNT).expect("fill"),
+            COUNT
+        );
+        let mut landed = [0u8; 8];
+        ram.read(COUNT as u64 - 8, &mut landed).expect("read back");
+        assert_eq!(landed, [0xa5u8; 8]);
+        filling
+            .join()
+            .expect("writing thread")
+            .expect("fill the socket");
     }
 
     #[test]
