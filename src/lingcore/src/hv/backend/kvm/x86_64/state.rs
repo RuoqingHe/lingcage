@@ -302,13 +302,33 @@ fn capture_msrs(fd: &VcpuFd, indices: &[u32]) -> Result<BTreeMap<u32, u64>> {
     Ok(captured)
 }
 
+/// Read back one MSR after a refused write. Returns the value held by
+/// the vCPU, or `None` if the kernel does not read it back. Note that
+/// nested KVM reads a non-zero `MSR_IA32_PERF_CAPABILITIES` (0x345)
+/// and refuses to write it.
+#[cfg(target_arch = "x86_64")]
+fn held_msr(fd: &VcpuFd, index: u32) -> Result<Option<u64>> {
+    let entries = [kvm_bindings::kvm_msr_entry {
+        index,
+        ..Default::default()
+    }];
+    let mut msrs = kvm_bindings::Msrs::from_entries(&entries).map_err(|_| Error::Overfull {
+        of: "model-specific registers",
+    })?;
+    let read = fd.get_msrs(&mut msrs).map_err(kvm_err("KVM_GET_MSRS"))?;
+    if read == 1 {
+        Ok(Some(msrs.as_slice()[0].data))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Write captured MSRs in ascending index order, which puts `IA32_TSC`
 /// (0x10) before `IA32_TSC_DEADLINE` (0x6e0), since KVM reads the TSC
 /// while setting the deadline. KVM stops a batch at the first register
-/// it refuses. Refused zero is stepped over, since `MSR_KVM_ASYNC_PF_INT`
-/// can be read without in-kernel LAPIC but not written, and a new vCPU
-/// reads zero there. Refused non-zero value is reported as
-/// `Error::Partial`.
+/// it refuses. Refused zero is stepped over, since a new vCPU reads
+/// zero there. Refused non-zero value already read by the vCPU is
+/// stepped over as well. Anything else is reported as `Error::Partial`.
 #[cfg(target_arch = "x86_64")]
 fn restore_msrs(fd: &VcpuFd, msrs: &BTreeMap<u32, u64>) -> Result<()> {
     let entries = msrs
@@ -328,10 +348,13 @@ fn restore_msrs(fd: &VcpuFd, msrs: &BTreeMap<u32, u64>) -> Result<()> {
             })?;
         let written = fd.set_msrs(&msrs).map_err(kvm_err("KVM_SET_MSRS"))?;
         if written < batch && rest[written].data != 0 {
-            return Err(Error::Partial {
-                op: "KVM_SET_MSRS",
-                index: rest[written].index,
-            });
+            let refused = rest[written];
+            if held_msr(fd, refused.index)? != Some(refused.data) {
+                return Err(Error::Partial {
+                    op: "KVM_SET_MSRS",
+                    index: refused.index,
+                });
+            }
         }
         rest = &rest[batch.min(written + 1)..];
     }
