@@ -20,6 +20,7 @@ use crate::boot;
 use crate::devices::Shared;
 use crate::devices::bus::Bus;
 use crate::devices::i8042::I8042;
+use crate::devices::pm1::{self, Pm1};
 use crate::devices::serial::Serial;
 use crate::devices::virtio::mmio;
 use crate::hv::hypervisor::Hypervisor;
@@ -46,6 +47,14 @@ const COM1_SIZE: u16 = 8;
 /// placed on the bus.
 const I8042_COMMAND: u16 = 0x64;
 
+/// Command which makes the i8042 pulse the reset line, the value
+/// carried by the reset register of FADT.
+const I8042_RESET: u8 = 0xfe;
+
+/// Port base of the ACPI PM1 register block, above the ports of fixed
+/// devices of a PC.
+const PM1_AT: u16 = 0x600;
+
 /// IRQ of the first serial console, `ttyS0`.
 pub(in crate::machine) const COM1_IRQ: u8 = 4;
 
@@ -56,6 +65,10 @@ pub(in crate::machine) const VIRTIO_AT: u64 = 0xd000_0000;
 /// IRQ of the GED. No device on the bus takes line 9, which is the SCI
 /// on a PC.
 pub(in crate::machine) const EVENTS_IRQ: u8 = 9;
+
+/// IRQ of the SCI. No device on the bus raises it, but the FADT names a
+/// line and the kernel takes it, so no other device is put on this one.
+const SCI_IRQ: u8 = 10;
 
 /// IRQ of the first virtio device, an ISA line free on PC. Each device
 /// takes the next line.
@@ -113,14 +126,16 @@ pub(in crate::machine) fn create_vcpus<H: Hypervisor>(
     Ok(vcpus)
 }
 
-/// Place the fixed devices on `bus`, `uart` on COM1, and the i8042
-/// command port which a kernel writes its reset request to.
+/// Place the fixed devices on `bus`, `uart` on COM1, the i8042 command
+/// port used by a kernel for its reset request, and the PM1 block used
+/// for its power-off request.
 pub(in crate::machine) fn place_fixed<W>(bus: &mut Bus, uart: Shared<Serial<W>>) -> Result<()>
 where
     W: Write + Send + 'static,
 {
     bus.place_port(COM1, COM1_SIZE, Box::new(uart))?;
     bus.place_port(I8042_COMMAND, 1, Box::new(I8042))?;
+    bus.place_port(PM1_AT, pm1::SIZE, Box::new(Pm1::default()))?;
     Ok(())
 }
 
@@ -140,6 +155,10 @@ pub(in crate::machine) fn enter<V: Vcpu>(
             vcpus: config.vcpus,
             genid: genid.at(),
             events: EVENTS_IRQ,
+            sci: SCI_IRQ,
+            pm1: PM1_AT,
+            reset_port: I8042_COMMAND,
+            reset_value: I8042_RESET,
             console: acpi::Named {
                 at: u64::from(COM1),
                 room: u64::from(COM1_SIZE),
@@ -464,8 +483,8 @@ mod tests {
         );
         assert_eq!(
             devices.len(),
-            3,
-            "the console, the keyboard controller and the entropy source"
+            4,
+            "console, keyboard controller, PM1 block and entropy source"
         );
         assert!(
             devices

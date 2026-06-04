@@ -7,6 +7,7 @@
 //! the GED, the console and virtio register blocks with their lines.
 
 use acpi_tables::fadt::{FADTBuilder, Flags};
+use acpi_tables::gas::{AccessSize, AddressSpace, GAS};
 use acpi_tables::madt::{
     EnabledStatus, IoApic, LocalInterruptController, MADT, ProcessorLocalApic,
 };
@@ -15,6 +16,7 @@ use acpi_tables::sdt::Sdt;
 use acpi_tables::xsdt::XSDT;
 use acpi_tables::{Aml, aml};
 
+use crate::devices::pm1;
 use crate::machine::{Error, Result};
 use crate::mem::GuestRam;
 
@@ -77,6 +79,14 @@ const VIRTIO_HARDWARE: aml::AmlStr = "LNRO0005";
 /// `_HID` of a 16550 compatible serial port, the id listed by `8250_pnp`.
 const CONSOLE_HARDWARE: &str = "PNP0501";
 
+/// Path of the sleep state package, read by `acpi_get_sleep_type_data`.
+const SOFT_OFF_PATH: &str = "\\_S5_";
+
+/// `IAPC_BOOT_ARCH` with no VGA and no CMOS RTC, since neither of them
+/// is on the bus (ACPI 6.5, table 5.10). Bit 1, the 8042, stays clear,
+/// the command port is placed but a keyboard controller is not.
+const BOOT_ARCHITECTURE: u16 = (1 << 2) | (1 << 5);
+
 /// One device named by the DSDT, with resources carried by its `_CRS`.
 ///
 /// The i8042 is not among them, since a `PNP0303` entry would make the
@@ -98,6 +108,14 @@ pub struct Parts {
     pub genid: u64,
     /// Interrupt line of the GED, `\_SB_.GED_`.
     pub events: u8,
+    /// Interrupt line of the SCI.
+    pub sci: u8,
+    /// Port base of the PM1 register block.
+    pub pm1: u16,
+    /// Port the reset register writes to.
+    pub reset_port: u16,
+    /// Value carried by the reset register.
+    pub reset_value: u8,
     /// Serial console, `\_SB_.COM1`.
     pub console: Named,
     /// Virtio register blocks, `\_SB_.V000` onward in slot order.
@@ -134,7 +152,7 @@ pub fn lay(ram: &GuestRam, parts: &Parts) -> Result<()> {
         next: TABLES_AT,
     };
     let namespace = lay_namespace(&mut laying, parts)?;
-    let machine = lay_machine(&mut laying, namespace)?;
+    let machine = lay_machine(&mut laying, namespace, parts)?;
     let processors = lay_processors(&mut laying, parts.vcpus)?;
 
     let mut list = XSDT::new(OEM_ID, *b"LINGXSDT", OEM_REVISION);
@@ -186,7 +204,17 @@ fn lay_namespace(laying: &mut Laying, parts: &Parts) -> Result<u64> {
         vec![&kind, &resources, &handler],
     );
 
+    // `\_S5` names the `SLP_TYP` which PM1 control register takes for
+    // soft off. Kernel which can not read one registers no power-off
+    // method.
+    let state = pm1::SOFT_OFF;
+    let off = aml::Name::new(
+        aml::Path::new(SOFT_OFF_PATH),
+        &aml::Package::new(vec![&state, &state]),
+    );
+
     let mut namespace = Vec::new();
+    off.to_aml_bytes(&mut namespace);
     identifier.to_aml_bytes(&mut namespace);
     events.to_aml_bytes(&mut namespace);
     name_console(&mut namespace, &parts.console);
@@ -198,16 +226,34 @@ fn lay_namespace(laying: &mut Laying, parts: &Parts) -> Result<u64> {
     laying.lay(table.as_slice())
 }
 
-/// Write the FADT with `X_DSDT` set to `namespace` and `HW_REDUCED_ACPI`
-/// set, so that no fixed hardware register block is looked for (ACPI
-/// 6.5, section 4.1).
-fn lay_machine(laying: &mut Laying, namespace: u64) -> Result<u64> {
-    let table = FADTBuilder::new(OEM_ID, *b"LINGFADT", OEM_REVISION)
+/// Write the FADT, `X_DSDT` naming the namespace, the PM1 block, the SCI
+/// and the reset register. `HW_REDUCED_ACPI` stays clear, otherwise a
+/// kernel reading it takes the reset of the firmware and finds no PM1
+/// block (ACPI 6.5, 4.1).
+fn lay_machine(laying: &mut Laying, namespace: u64, parts: &Parts) -> Result<u64> {
+    let mut table = FADTBuilder::new(OEM_ID, *b"LINGFADT", OEM_REVISION)
         .dsdt_64(namespace)
-        .flag(Flags::HwReducedAcpi)
-        .finalize();
+        .flag(Flags::Wbinvd)
+        .flag(Flags::PwrButton)
+        .flag(Flags::SlpButton)
+        .flag(Flags::ResetRegSup);
+    table.sci_int = u16::from(parts.sci).into();
+    table.pm1a_evt_blk = u32::from(parts.pm1).into();
+    table.pm1_evt_len = pm1::EVENT_PORTS;
+    table.pm1a_cnt_blk = (u32::from(parts.pm1) + u32::from(pm1::EVENT_PORTS)).into();
+    table.pm1_cnt_len = pm1::CONTROL_PORTS;
+    table.iapc_boot_arch = BOOT_ARCHITECTURE.into();
+    table.reset_reg = GAS::new(
+        AddressSpace::SystemIo,
+        u8::BITS as u8,
+        0,
+        AccessSize::ByteAccess,
+        u64::from(parts.reset_port),
+    );
+    table.reset_value = parts.reset_value;
+
     let mut bytes = Vec::new();
-    table.to_aml_bytes(&mut bytes);
+    table.finalize().to_aml_bytes(&mut bytes);
     laying.lay(&bytes)
 }
 
@@ -293,13 +339,17 @@ fn line(part: &Named) -> Option<aml::Interrupt> {
 mod tests {
     use crate::machine::x86_64::acpi::*;
 
-    /// Two vCPUs, the VM generation ID, console at `COM1` and two virtio
-    /// blocks, the shape assembled by `machine::Machine`.
+    /// Two vCPUs, the VM generation ID, the PM1 block, console at `COM1` and
+    /// two virtio blocks, the shape assembled by `machine::Machine`.
     fn parts() -> Parts {
         Parts {
             vcpus: 2,
             genid: GENID_AT,
             events: 9,
+            sci: 10,
+            pm1: 0x600,
+            reset_port: 0x64,
+            reset_value: 0xfe,
             console: Named {
                 at: 0x3f8,
                 room: 8,
@@ -332,6 +382,14 @@ mod tests {
         bytes
     }
 
+    /// Returns address of the FADT, reached the same way a kernel reaches
+    /// it, the RSDP, then the first entry of the XSDT.
+    fn machine_table(ram: &GuestRam) -> u64 {
+        let pointer = read(ram, POINTER_AT, 36);
+        let list = u64::from_le_bytes(pointer[24..32].try_into().expect("eight bytes"));
+        u64::from_le_bytes(read(ram, list + 36, 8).try_into().expect("entry"))
+    }
+
     #[test]
     fn test_rsdp_in_scan_window() {
         let ram = ram();
@@ -360,9 +418,7 @@ mod tests {
         // The DSDT is reached from the RSDP through the XSDT and the FADT,
         // same path as the kernel takes, so a table naming wrong address
         // fails here.
-        let pointer = read(&ram, POINTER_AT, 36);
-        let list = u64::from_le_bytes(pointer[24..32].try_into().expect("eight bytes"));
-        let machine = u64::from_le_bytes(read(&ram, list + 36, 8).try_into().expect("entry"));
+        let machine = machine_table(&ram);
         assert_eq!(&read(&ram, machine, 4), b"FACP", "no FADT at XSDT entry");
         // `X_DSDT` is at offset 140 of the FADT (`struct acpi_table_fadt`).
         let namespace =
@@ -390,5 +446,81 @@ mod tests {
             "not two LNRO0005 devices in the DSDT"
         );
         assert!(names(b"COM1"), "no COM1 device in the DSDT");
+    }
+
+    /// Offsets of the fields read below, from `struct acpi_table_fadt` in
+    /// `include/acpi/actbl.h`.
+    const SCI_INT: u64 = 46;
+    const PM1A_EVT_BLK: u64 = 56;
+    const PM1A_CNT_BLK: u64 = 64;
+    const PM1_EVT_LEN: u64 = 88;
+    const PM1_CNT_LEN: u64 = 89;
+    const FLAGS: u64 = 112;
+    const RESET_REG: u64 = 116;
+    const RESET_VALUE: u64 = 128;
+
+    #[test]
+    fn test_fadt_pm1_and_reset_register() {
+        let ram = ram();
+        let parts = parts();
+        lay(&ram, &parts).expect("lay tables");
+        let machine = machine_table(&ram);
+        let long = |at: u64| u32::from_le_bytes(read(&ram, machine + at, 4).try_into().unwrap());
+
+        // Hardware reduced machine has no PM1 block, and a kernel reading
+        // the flag takes the reset of the firmware over the register below.
+        assert_eq!(
+            long(FLAGS) & Flags::HwReducedAcpi as u32,
+            0,
+            "machine reports itself as hardware reduced"
+        );
+        assert_ne!(
+            long(FLAGS) & Flags::ResetRegSup as u32,
+            0,
+            "no reset support"
+        );
+
+        // The PM1 block, as placed on the bus by `place_fixed`.
+        assert_eq!(long(PM1A_EVT_BLK), u32::from(parts.pm1));
+        assert_eq!(
+            long(PM1A_CNT_BLK),
+            u32::from(parts.pm1) + u32::from(pm1::EVENT_PORTS)
+        );
+        assert_eq!(read(&ram, machine + PM1_EVT_LEN, 1)[0], pm1::EVENT_PORTS);
+        assert_eq!(read(&ram, machine + PM1_CNT_LEN, 1)[0], pm1::CONTROL_PORTS);
+        assert_eq!(read(&ram, machine + SCI_INT, 1)[0], parts.sci);
+
+        // The reset register, a byte written to the i8042 command port.
+        let register = read(&ram, machine + RESET_REG, 12);
+        assert_eq!(register[0], AddressSpace::SystemIo as u8, "not a port");
+        assert_eq!(register[1], u8::BITS as u8, "not a byte wide");
+        assert_eq!(
+            u64::from_le_bytes(register[4..12].try_into().expect("eight bytes")),
+            u64::from(parts.reset_port)
+        );
+        assert_eq!(read(&ram, machine + RESET_VALUE, 1)[0], parts.reset_value);
+    }
+
+    #[test]
+    fn test_dsdt_s5_sleep_state() {
+        let ram = ram();
+        lay(&ram, &parts()).expect("lay tables");
+        let machine = machine_table(&ram);
+        let namespace =
+            u64::from_le_bytes(read(&ram, machine + 140, 8).try_into().expect("address"));
+        let length =
+            u32::from_le_bytes(read(&ram, namespace + 4, 4).try_into().expect("four bytes"));
+
+        // `acpi_get_sleep_type_data` looks the name up in the namespace and
+        // takes the first element of the package as `SLP_TYP`.
+        let table = read(&ram, namespace, length as usize);
+        let at = table
+            .windows(4)
+            .position(|window| window == b"_S5_")
+            .expect("no _S5 in the DSDT");
+        assert!(
+            table[at..].contains(&pm1::SOFT_OFF),
+            "_S5 does not carry the sleep type taken by PM1 block"
+        );
     }
 }
