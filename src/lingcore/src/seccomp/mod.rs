@@ -344,37 +344,26 @@ mod tests {
         assert_eq!(seeking, (-1, libc::EBADF), "lseek did not reach the kernel");
     }
     #[test]
-    #[ignore = "brings its process down, run by test_sigsys_report"]
-    fn test_helper_trap_on_socket() {
-        // Helper run by `test_sigsys_report` in a child process, confines
-        // the thread under `Refusal::Trap`, then calls `socket`. Handler
-        // ends the process.
-        let filter = Filter::new(Thread::Vcpu, Refusal::Trap).expect("assemble allowlist");
-        filter.confine().expect("install allowlist");
-        // SAFETY: `socket` takes no pointer. Under `Refusal::Trap` the kernel
-        // raises `SIGSYS` instead of returning.
-        let opened = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        panic!("socket returned {opened} under a trapping allowlist");
-    }
-
-    #[test]
     fn test_sigsys_report() {
         // Report names the thread and the syscall number. It is read from
         // a child process, since the handler ends the process which made
         // it.
-        let ran = std::process::Command::new(std::env::current_exe().expect("test binary path"))
-            .args([
-                "--exact",
-                "--ignored",
-                "seccomp::tests::test_helper_trap_on_socket",
-            ])
-            .output()
-            .expect("run helper");
-        let said = String::from_utf8_lossy(&ran.stderr);
+        use crate::seccomp::report::tests::ended_in_a_child;
+
+        // Allowlist is assembled here instead of in the child. Building one
+        // allocates, which the child of a fork cannot do.
+        let filter = Filter::new(Thread::Vcpu, Refusal::Trap).expect("assemble allowlist");
+        let ended = ended_in_a_child(|| {
+            filter.confine().expect("install allowlist");
+            // SAFETY: `socket` takes no pointer. Under `Refusal::Trap` the
+            // kernel raises `SIGSYS` instead of returning.
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        });
+        let said = &ended.said;
         let owed = format!("the vcpu thread was refused syscall {}", libc::SYS_socket);
         assert!(said.contains(&owed), "stderr was:\n{said}");
         assert_eq!(
-            ran.status.code(),
+            ended.code,
             Some(128 + libc::SIGSYS),
             "exit status is not 128 + SIGSYS"
         );

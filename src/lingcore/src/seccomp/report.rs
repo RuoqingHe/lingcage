@@ -144,8 +144,85 @@ impl Line {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::seccomp) mod tests {
     use crate::seccomp::report::*;
+
+    /// A child as it ended, the standard error it wrote and the status it
+    /// exited with, `None` for a child ended by a signal.
+    pub(in crate::seccomp) struct Ended {
+        /// All that the child wrote to standard error.
+        pub said: String,
+        /// Exit status of the child.
+        pub code: Option<libc::c_int>,
+    }
+
+    /// Run `work` in a forked child with its standard error as a pipe, and
+    /// read back what it wrote and how it ended. The child holds the locks
+    /// of the threads left behind by fork, so `work` must not allocate.
+    pub(in crate::seccomp) fn ended_in_a_child<F: FnOnce()>(work: F) -> Ended {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+
+        let mut ends = [0; 2];
+        // SAFETY: `pipe` fills the two-element array given to it, which
+        // outlives the call.
+        let opened = unsafe { libc::pipe(ends.as_mut_ptr()) };
+        assert_eq!(opened, 0, "open pipe for the child");
+        let [reading, writing] = ends;
+
+        // SAFETY: `fork` takes no pointer.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork a child");
+        if child == 0 {
+            // SAFETY: both descriptors come from `pipe`, and the child holds
+            // the only copy of each.
+            unsafe {
+                libc::close(reading);
+                libc::dup2(writing, libc::STDERR_FILENO);
+                libc::close(writing);
+            }
+            // Catching the panic keeps the child from unwinding into the suite
+            // as a second harness. It does not make a panicking `work` safe,
+            // since the panic allocates before this catches it.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            // SAFETY: `_exit` takes no pointer and does not return.
+            unsafe { libc::_exit(if ran.is_ok() { STOOD } else { PANICKED }) };
+        }
+
+        // SAFETY: the descriptor comes from `pipe` and the parent holds the
+        // only copy, `File` owns it from here.
+        unsafe { libc::close(writing) };
+        // SAFETY: `reading` comes from the same `pipe` and the parent holds
+        // its only copy, `File` owns it from here.
+        let mut pipe = unsafe { std::fs::File::from_raw_fd(reading) };
+        // The read ends when the child does, and it has no deadline. A
+        // child which neither writes nor exits holds the suite here.
+        let mut said = Vec::new();
+        pipe.read_to_end(&mut said)
+            .expect("read output of the child");
+
+        let mut status = 0;
+        // SAFETY: `waitpid` fills the given status, which outlives the call.
+        let waited = unsafe { libc::waitpid(child, &raw mut status, 0) };
+        assert_eq!(waited, child, "wait for child");
+        let ended = Ended {
+            said: String::from_utf8_lossy(&said).to_string(),
+            code: libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status)),
+        };
+        assert_ne!(
+            ended.code,
+            Some(PANICKED),
+            "work panicked in the child:\n{}",
+            ended.said
+        );
+        ended
+    }
+
+    /// Status a child exits with when `work` returned, and the one when
+    /// `work` panicked. Both are different from the `KILLED_BY_SIGSYS`
+    /// used by the handler to end a child.
+    const STOOD: libc::c_int = 1;
+    const PANICKED: libc::c_int = 2;
 
     #[test]
     fn test_refused_fits_in_siginfo() {
@@ -159,37 +236,22 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "brings its process down, run by test_report_sigsys_not_from_seccomp"]
-    fn test_helper_raise_sigsys() {
-        // Helper run by `test_report_sigsys_not_from_seccomp` in a child
-        // process, registers the handler, then raises `SIGSYS` with
-        // `raise`.
-        arm("vcpu").expect("register handler");
-        // SAFETY: `raise` takes no pointer, the SIGSYS handler is registered.
-        let raised = unsafe { libc::raise(libc::SIGSYS) };
-        panic!("raise returned {raised}, handler did not run");
-    }
-
-    #[test]
     fn test_report_sigsys_not_from_seccomp() {
         // A `SIGSYS` with `si_code` other than `SYS_SECCOMP` is reported
         // by signal number only. It is raised by hand in a child and read
-        // from its stderr, since the handler ends the process which made
-        // it.
-        let ran = std::process::Command::new(std::env::current_exe().expect("test binary path"))
-            .args([
-                "--exact",
-                "--ignored",
-                "seccomp::report::tests::test_helper_raise_sigsys",
-            ])
-            .output()
-            .expect("run helper");
-        let said = String::from_utf8_lossy(&ran.stderr);
+        // from its stderr.
+        let ended = ended_in_a_child(|| {
+            arm("vcpu").expect("register handler");
+            // SAFETY: `raise` takes no pointer, the handler is registered.
+            unsafe { libc::raise(libc::SIGSYS) };
+        });
+
         let owed = format!("took signal {}, not from seccomp", libc::SIGSYS);
+        let said = &ended.said;
         assert!(said.contains(&owed), "stderr was:\n{said}");
         assert_eq!(
-            ran.status.code(),
-            Some(128 + libc::SIGSYS),
+            ended.code,
+            Some(KILLED_BY_SIGSYS),
             "exit status is not 128 + SIGSYS"
         );
     }
