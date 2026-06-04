@@ -180,6 +180,7 @@ pub(in crate::machine) fn enter<V: Vcpu>(
 #[cfg(test)]
 mod tests {
     use crate::machine::x86_64::*;
+    #[cfg(all(feature = "kvm", target_os = "linux"))]
     use crate::machine::*;
 
     #[test]
