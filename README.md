@@ -102,6 +102,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `Config::disk` attaches a file as virtio-blk device, `Config::channel` adds vsock device and
 `Config::network` adds virtio-net device.
 
+Only RAM of a clone is copy-on-write. A restored guest takes its filesystem state from captured RAM,
+so it needs the disk as capture left it. Copy the disk while the guest is paused, keep that copy
+untouched, and give each clone its own copy. Two clones over one disk corrupt the filesystem between
+them, and neither reports an error.
+
 `Machine` goes through `Created`, `Running`, `Paused` and `Shutdown` states:
 
 - `start` runs each vCPU on its own thread.
