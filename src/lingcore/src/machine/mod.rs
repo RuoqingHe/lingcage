@@ -699,8 +699,14 @@ impl<H: Hypervisor> Machine<H> {
     }
 
     /// Write guest RAM to `out`, region by region in layout order and
-    /// without header. Machine state is not checked.
+    /// without header. `BadTransition` unless the guest is `Paused`.
     pub fn write_memory(&self, out: &mut File) -> Result<()> {
+        if self.state != State::Paused {
+            return Err(Error::BadTransition {
+                from: self.state,
+                to: State::Paused,
+            });
+        }
         for region in self.ram.regions() {
             self.ram.drain_to(region.gpa, out, region.size as usize)?;
         }
@@ -708,8 +714,15 @@ impl<H: Hypervisor> Machine<H> {
     }
 
     /// Read guest RAM from `from` as laid out by `write_memory`, a short
-    /// region is reported as `SnapshotShape`. Machine state is not checked.
+    /// region is reported as `SnapshotShape`. `BadTransition` unless the
+    /// guest is `Created` or `Paused`.
     pub fn read_memory(&mut self, from: &mut File) -> Result<()> {
+        if self.state != State::Created && self.state != State::Paused {
+            return Err(Error::BadTransition {
+                from: self.state,
+                to: State::Paused,
+            });
+        }
         for region in self.ram.regions() {
             let want = region.size as usize;
             if self.ram.fill_all_from(region.gpa, from, want)? != want {
