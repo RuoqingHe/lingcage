@@ -679,14 +679,20 @@ impl<H: Hypervisor> Machine<H> {
     }
 
     /// Capture the guest state other than RAM, through `read_state`. An
-    /// irqchip or clock the backend can not report is left out.
+    /// irqchip or clock not supported by the backend is left out, any other
+    /// read failure is returned.
     pub fn capture(&self) -> Result<Snapshot> {
         let (processors, devices) = self.read_state()?;
+        let reported = |part: crate::hv::Result<crate::hv::StateBlob>| match part {
+            Ok(blob) => Ok(Some(blob)),
+            Err(crate::hv::Error::Unsupported(_)) => Ok(None),
+            Err(err) => Err(err),
+        };
         Ok(Snapshot::new(
             self.memory_size,
             self.vcpu_count,
-            self.vm.get_irqchip_state().ok(),
-            self.vm.get_clock().ok(),
+            reported(self.vm.get_irqchip_state())?,
+            reported(self.vm.get_clock())?,
             processors,
             devices,
         ))
