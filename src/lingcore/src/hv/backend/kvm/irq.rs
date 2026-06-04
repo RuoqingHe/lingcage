@@ -13,7 +13,7 @@ use kvm_bindings::{
     kvm_irq_routing_irqchip, kvm_irq_routing_msi, kvm_msi,
 };
 use kvm_ioctls::VmFd;
-use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EventFd};
 
 use crate::hv::backend::kvm::kvm_err;
 #[cfg(target_arch = "riscv64")]
@@ -214,7 +214,7 @@ impl MsiSender for KvmMsiSender {
     }
 
     fn create_irqfd(&self) -> Result<KvmIrqFd> {
-        let eventfd = EventFd::new(EFD_NONBLOCK).map_err(kvm_err("eventfd"))?;
+        let eventfd = EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC).map_err(kvm_err("eventfd"))?;
         let gsi = {
             let mut routing = self.routing.lock().unwrap();
             let gsi = routing.take_gsi();

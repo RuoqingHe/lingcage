@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use kvm_bindings::{KVM_PIT_SPEAKER_DUMMY, kvm_pit_config};
 use kvm_ioctls::{Cap as KvmCap, VmFd};
 #[cfg(not(target_arch = "riscv64"))]
-use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EventFd};
 use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
@@ -134,7 +134,7 @@ impl Vm for KvmVm {
 
     #[cfg(not(target_arch = "riscv64"))]
     fn create_irq_sender(&self, pin: u8) -> Result<KvmIrqSender> {
-        let eventfd = EventFd::new(EFD_NONBLOCK).map_err(kvm_err("eventfd"))?;
+        let eventfd = EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC).map_err(kvm_err("eventfd"))?;
         // The irqchip routes its pins when created and `Routing::apply`
         // rewrites them, so binding a pin writes no table.
         self.fd

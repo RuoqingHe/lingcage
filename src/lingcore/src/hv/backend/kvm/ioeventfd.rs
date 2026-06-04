@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
-use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EventFd};
 
 use crate::hv::backend::kvm::kvm_err;
 use crate::hv::os::linux::ioeventfd::{IoeventFd, IoeventFdRegistry};
@@ -105,7 +105,7 @@ impl IoeventFdRegistry for KvmIoeventFdRegistry {
     type IoeventFd = KvmIoeventFd;
 
     fn create(&self) -> Result<KvmIoeventFd> {
-        let eventfd = EventFd::new(EFD_NONBLOCK).map_err(kvm_err("eventfd"))?;
+        let eventfd = EventFd::new(EFD_NONBLOCK | EFD_CLOEXEC).map_err(kvm_err("eventfd"))?;
         Ok(KvmIoeventFd {
             eventfd,
             bound: Mutex::new(None),
