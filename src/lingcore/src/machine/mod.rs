@@ -8,7 +8,7 @@
 //! riscv64.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -58,6 +58,10 @@ pub const DEFAULT_MEMORY: u64 = 128 << 20;
 /// Host file read by the entropy source.
 const ENTROPY_SOURCE: &str = "/dev/urandom";
 
+/// Bytes of guest RAM which `write_memory` scans and writes as one
+/// piece. A zero piece becomes a hole in the image.
+const IMAGE_CHUNK: usize = 64 << 10;
+
 /// Maximum time the device thread waits on the ioeventfds and host
 /// descriptors before reading the order.
 const DEVICE_TICK: Duration = Duration::from_millis(200);
@@ -98,6 +102,9 @@ pub enum Error {
     /// Failed to open the disk file or read its length.
     #[error("failed to open disk file")]
     Disk(#[source] std::io::Error),
+    /// Failed to write the RAM image.
+    #[error("failed to write RAM image")]
+    Ram(#[source] std::io::Error),
     /// Failed to connect the network socket.
     #[error("failed to connect network socket")]
     Network(#[source] std::io::Error),
@@ -699,7 +706,9 @@ impl<H: Hypervisor> Machine<H> {
     }
 
     /// Write guest RAM to `out`, region by region in layout order and
-    /// without header. `BadTransition` unless the guest is `Paused`.
+    /// without header. `BadTransition` unless the guest is `Paused`. Zero
+    /// chunks are skipped by seeking, the image reads the same as a dense
+    /// one.
     pub fn write_memory(&self, out: &mut File) -> Result<()> {
         if self.state != State::Paused {
             return Err(Error::BadTransition {
@@ -707,15 +716,35 @@ impl<H: Hypervisor> Machine<H> {
                 to: State::Paused,
             });
         }
+        let start = out.stream_position().map_err(Error::Ram)?;
+        let mut total = 0u64;
+        let mut chunk = vec![0u8; IMAGE_CHUNK];
         for region in self.ram.regions() {
-            self.ram.drain_to(region.gpa, out, region.size as usize)?;
+            let mut at = 0u64;
+            while at < region.size {
+                let count = chunk.len().min((region.size - at) as usize);
+                let piece = &mut chunk[..count];
+                self.ram.read(region.gpa + at, piece)?;
+                if piece.iter().any(|byte| *byte != 0) {
+                    out.write_all(piece).map_err(Error::Ram)?;
+                } else {
+                    out.seek(SeekFrom::Current(count as i64))
+                        .map_err(Error::Ram)?;
+                }
+                at += count as u64;
+                total += count as u64;
+            }
         }
+        // Length is the start plus RAM size, no matter there are trailing
+        // zeroes or not.
+        out.set_len(start + total).map_err(Error::Ram)?;
         Ok(())
     }
 
-    /// Read guest RAM from `from` as laid out by `write_memory`, a short
-    /// region is reported as `SnapshotShape`. `BadTransition` unless the
-    /// guest is `Created` or `Paused`.
+    /// Read guest RAM from `from` as laid out by `write_memory`. A short
+    /// region is reported as `SnapshotShape`. A hole in a sparse image
+    /// reads back as zeroes. `BadTransition` unless the guest is `Created`
+    /// or `Paused`.
     pub fn read_memory(&mut self, from: &mut File) -> Result<()> {
         if self.state != State::Created && self.state != State::Paused {
             return Err(Error::BadTransition {
