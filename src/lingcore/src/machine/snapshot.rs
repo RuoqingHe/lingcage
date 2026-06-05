@@ -92,10 +92,10 @@ impl Snapshot {
     }
 
     /// Returns `SnapshotShape` unless the snapshot was taken from a guest of
-    /// `memory` bytes, `vcpus` vCPUs and `devices` devices, and carries one
-    /// state per vCPU.
-    pub(in crate::machine) fn fits(&self, memory: u64, vcpus: u16, devices: usize) -> Result<()> {
-        if self.memory != memory || self.vcpus != vcpus || self.devices.len() != devices {
+    /// `memory` bytes and `vcpus` vCPUs, and carries one state per vCPU.
+    /// Device entries are matched by `Blob::kind` instead of counted.
+    pub(crate) fn fits(&self, memory: u64, vcpus: u16) -> Result<()> {
+        if self.memory != memory || self.vcpus != vcpus {
             return Err(Error::SnapshotShape);
         }
         if self.processors.len() != usize::from(vcpus) {
@@ -150,18 +150,27 @@ mod tests {
     #[test]
     fn test_reject_other_shape() {
         let snapshot = taken(16 << 20, 2, 3);
-        snapshot.fits(16 << 20, 2, 3).expect("fit its own shape");
+        snapshot.fits(16 << 20, 2).expect("fit its own shape");
 
-        // Another RAM size, vCPU count or device count is refused.
-        for (memory, vcpus, devices) in [(32 << 20, 2, 3), (16 << 20, 4, 3), (16 << 20, 2, 4)] {
+        // Another RAM size or vCPU count is refused.
+        for (memory, vcpus) in [(32 << 20, 2), (16 << 20, 4)] {
             assert!(
-                matches!(
-                    snapshot.fits(memory, vcpus, devices),
-                    Err(Error::SnapshotShape)
-                ),
-                "snapshot fits {memory} bytes, {vcpus} vCPUs and {devices} devices"
+                matches!(snapshot.fits(memory, vcpus), Err(Error::SnapshotShape)),
+                "snapshot fits {memory} bytes and {vcpus} vCPUs"
             );
         }
+    }
+
+    #[test]
+    fn test_device_count_not_checked() {
+        // Device entries are matched by `Blob::kind` at restore, so a
+        // device added or removed since does not affect the shape check.
+        let snapshot = taken(16 << 20, 2, 3);
+        snapshot.fits(16 << 20, 2).expect("same count");
+        taken(16 << 20, 2, 4)
+            .fits(16 << 20, 2)
+            .expect("one device more");
+        taken(16 << 20, 2, 0).fits(16 << 20, 2).expect("no devices");
     }
 
     #[test]
@@ -171,7 +180,7 @@ mod tests {
         let mut snapshot = taken(16 << 20, 2, 0);
         snapshot.processors.pop();
         assert!(matches!(
-            snapshot.fits(16 << 20, 2, 0),
+            snapshot.fits(16 << 20, 2),
             Err(Error::SnapshotShape)
         ));
     }

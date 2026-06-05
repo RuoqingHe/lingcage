@@ -6,6 +6,7 @@
 //! and the offset into it. Read of an unclaimed address returns all
 //! ones, write to it is dropped.
 
+use std::collections::{HashMap, VecDeque};
 use std::io;
 
 use crate::devices::{Blob, Device, Error, Result};
@@ -139,16 +140,43 @@ impl Bus {
             .collect()
     }
 
-    /// Restore the list returned by `capture`, a list of another length is
-    /// reported as `State`.
+    /// Restore the blobs returned by `capture`, matched by `Blob::kind` in
+    /// saved order against placement order. A saved kind not on the bus is
+    /// reported as `State` before any blob is applied. Device without a blob
+    /// keeps its power-on state.
     pub fn restore(&mut self, blobs: &[Option<Blob>]) -> Result<()> {
-        if blobs.len() != self.count() {
+        // Saved blobs of each kind, in saved order.
+        let mut saved: HashMap<&str, VecDeque<&Blob>> = HashMap::new();
+        for blob in blobs.iter().flatten() {
+            saved.entry(blob.kind.as_str()).or_default().push_back(blob);
+        }
+        // Kind of each placed device, in placement order. Stateless device
+        // captures `None` and takes no blob.
+        let kinds = self
+            .capture()?
+            .into_iter()
+            .map(|blob| blob.map(|blob| blob.kind))
+            .collect::<Vec<_>>();
+        // More saved blobs of a kind than placed devices means a device which
+        // existed at snapshot time is gone.
+        let mut placed_counts: HashMap<&str, usize> = HashMap::new();
+        for kind in kinds.iter().flatten() {
+            *placed_counts.entry(kind.as_str()).or_default() += 1;
+        }
+        if saved
+            .iter()
+            .any(|(kind, queue)| queue.len() > placed_counts.get(kind).copied().unwrap_or(0))
+        {
             return Err(Error::State);
         }
-        for (placed, blob) in self.placed_mut().zip(blobs) {
-            if let Some(blob) = blob {
-                placed.device.restore(blob)?;
-            }
+        for (kind, placed) in kinds.iter().zip(self.placed_mut()) {
+            let Some(kind) = kind else {
+                continue;
+            };
+            let Some(blob) = saved.get_mut(kind.as_str()).and_then(VecDeque::pop_front) else {
+                continue;
+            };
+            placed.device.restore(blob)?;
         }
         Ok(())
     }
@@ -204,6 +232,136 @@ mod tests {
 
     fn uart() -> Box<dyn Device> {
         Box::new(Serial::new(Vec::new()))
+    }
+
+    /// Device with one byte of state under `kind`.
+    struct Cell {
+        kind: &'static str,
+        state: u8,
+    }
+
+    impl Device for Cell {
+        fn read(&mut self, _offset: u64, _size: u8) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _offset: u64, _size: u8, _value: u64) -> io::Result<Option<VmExit>> {
+            Ok(None)
+        }
+
+        fn capture(&self) -> Result<Option<Blob>> {
+            Ok(Some(Blob {
+                kind: self.kind.to_string(),
+                version: 1,
+                data: vec![self.state],
+            }))
+        }
+
+        fn restore(&mut self, blob: &Blob) -> Result<()> {
+            if blob.kind != self.kind {
+                return Err(Error::WrongState {
+                    found: blob.kind.clone(),
+                    wanted: self.kind,
+                });
+            }
+            self.state = *blob.data.first().ok_or(Error::State)?;
+            Ok(())
+        }
+    }
+
+    fn cell(kind: &'static str, state: u8) -> crate::devices::Shared<Cell> {
+        crate::devices::Shared::new(Cell { kind, state })
+    }
+
+    fn blob(kind: &str, state: u8) -> Option<Blob> {
+        Some(Blob {
+            kind: kind.to_string(),
+            version: 1,
+            data: vec![state],
+        })
+    }
+
+    #[test]
+    fn test_restore_matches_blob_kind() {
+        let one = cell("one", 0);
+        let two = cell("two", 0);
+        let mut bus = Bus::new();
+        bus.place_mmio(0x1000, 0x100, Box::new(one.clone()))
+            .expect("first device");
+        bus.place_mmio(0x2000, 0x100, Box::new(two.clone()))
+            .expect("second device");
+
+        // Not in placement order, with a stateless marker in between.
+        let blobs = [blob("two", 22), None, blob("one", 11)];
+        bus.restore(&blobs).expect("restore by kind");
+        assert_eq!(one.with(|cell| cell.state), 11);
+        assert_eq!(two.with(|cell| cell.state), 22);
+    }
+
+    #[test]
+    fn test_restore_same_kind_in_order() {
+        let first = cell("mm", 0);
+        let second = cell("mm", 0);
+        let mut bus = Bus::new();
+        bus.place_mmio(0x1000, 0x100, Box::new(first.clone()))
+            .expect("first device");
+        bus.place_mmio(0x2000, 0x100, Box::new(second.clone()))
+            .expect("second device");
+
+        // Two saved blobs of one kind, taken in placement order.
+        bus.restore(&[blob("mm", 1), blob("mm", 2)])
+            .expect("restore");
+        assert_eq!(first.with(|cell| cell.state), 1);
+        assert_eq!(second.with(|cell| cell.state), 2);
+    }
+
+    #[test]
+    fn test_restore_older_snapshot() {
+        let one = cell("one", 0);
+        let two = cell("two", 7);
+        let mut bus = Bus::new();
+        bus.place_mmio(0x1000, 0x100, Box::new(one.clone()))
+            .expect("first device");
+        bus.place_mmio(0x2000, 0x100, Box::new(two.clone()))
+            .expect("second device");
+
+        // Snapshot only carries `one`, taken before `two` was placed.
+        bus.restore(&[blob("one", 11)]).expect("restore");
+        assert_eq!(one.with(|cell| cell.state), 11);
+        assert_eq!(
+            two.with(|cell| cell.state),
+            7,
+            "added device lost its power-on state"
+        );
+    }
+
+    #[test]
+    fn test_reject_snapshot_of_unknown_device() {
+        let one = cell("one", 0);
+        let mut bus = Bus::new();
+        bus.place_mmio(0x1000, 0x100, Box::new(one.clone()))
+            .expect("device");
+
+        // `two` was on the bus at capture time but is gone now.
+        assert!(matches!(
+            bus.restore(&[blob("one", 11), blob("two", 22)]),
+            Err(Error::State)
+        ));
+        // Refusal happened before any blob was applied.
+        assert_eq!(one.with(|cell| cell.state), 0);
+
+        // Two saved blobs of a kind while the bus has only one.
+        assert!(matches!(
+            bus.restore(&[blob("one", 11), blob("one", 22)]),
+            Err(Error::State)
+        ));
+        assert_eq!(one.with(|cell| cell.state), 0);
+
+        // Also a kind the bus does not have.
+        assert!(matches!(
+            bus.restore(&[blob("three", 33)]),
+            Err(Error::State)
+        ));
     }
 
     #[test]

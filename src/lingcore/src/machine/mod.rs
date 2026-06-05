@@ -140,8 +140,8 @@ pub enum Error {
         /// Format version named by the snapshot.
         version: u32,
     },
-    /// Shape of the snapshot (RAM size, vCPU count, device count) does not
-    /// match this guest, or its RAM image is too short.
+    /// Shape of the snapshot (RAM size and vCPU count) does not match this
+    /// guest, or its RAM image is too short.
     #[error("snapshot does not fit shape of the guest")]
     SnapshotShape,
     /// vCPU or device thread did not park within `HOLD_WITHIN`, or a vCPU
@@ -770,8 +770,7 @@ impl<H: Hypervisor> Machine<H> {
                 to: State::Created,
             });
         }
-        let devices = self.devices.0.lock().unwrap().count();
-        snapshot.fits(self.memory_size, self.vcpu_count, devices)?;
+        snapshot.fits(self.memory_size, self.vcpu_count)?;
 
         if let Some(blob) = snapshot.irqchip() {
             self.vm.set_irqchip_state(blob)?;

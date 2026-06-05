@@ -322,9 +322,16 @@ impl Transport {
         }
     }
 
-    /// Restore `state`. Queues are restored up to the shorter one of the two
-    /// lists, a ring marked ready is rebuilt with its cursors.
+    /// Restore `state`. Queue count different from the device is reported
+    /// as `WrongQueues`, which means the blob came from another type of
+    /// device. Ring marked ready is rebuilt with its cursors.
     fn take_up(&mut self, state: TransportState) -> BusResult<()> {
+        if state.queues.len() != self.queues.len() {
+            return Err(BusError::WrongQueues {
+                found: state.queues.len(),
+                wanted: self.queues.len(),
+            });
+        }
         self.status = state.status;
         self.device_features_sel = state.device_features_sel;
         self.driver_features = state.driver_features;
@@ -851,5 +858,32 @@ mod tests {
             0,
             "QUEUE_READY survived the reset"
         );
+    }
+
+    #[test]
+    fn test_reject_blob_queue_count() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut mmio = transport(&line);
+
+        let blob = BusDevice::capture(&mmio)
+            .expect("capture")
+            .expect("transport has state");
+        // Blob written by a transport with one more queue, as another kind
+        // of device behind the same `virtio-mmio` kind would write.
+        let mut state: TransportState = serde_json::from_slice(&blob.data).expect("decode");
+        state.queues.push(SlotState::default());
+        let blob = Blob {
+            kind: blob.kind,
+            version: blob.version,
+            data: serde_json::to_vec(&state).expect("encode"),
+        };
+
+        assert!(matches!(
+            BusDevice::restore(&mut mmio, &blob),
+            Err(BusError::WrongQueues {
+                found: 2,
+                wanted: 1
+            })
+        ));
     }
 }

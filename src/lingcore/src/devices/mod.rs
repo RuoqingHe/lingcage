@@ -52,6 +52,14 @@ pub enum Error {
         /// Layout version the blob was written with.
         version: u32,
     },
+    /// `Blob::data` carries a queue count which the device does not have.
+    #[error("state with {found} queues restored into device with {wanted} queues")]
+    WrongQueues {
+        /// Queue count the blob was captured with.
+        found: usize,
+        /// Queue count the device has.
+        wanted: usize,
+    },
 }
 
 /// Result alias for placing devices.
