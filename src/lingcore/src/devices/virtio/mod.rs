@@ -73,8 +73,8 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Device behind a transport, with its kind, its features and the work
-/// done when a queue is notified. Transport runs the handshake and checks
-/// the chains.
+/// done when a queue is notified or when its state is restored.
+/// Transport runs the handshake and checks the chains.
 pub trait Device: Send {
     /// Returns the device ID, as numbered in section 5 of virtio 1.2.
     fn device_id(&self) -> u32;
@@ -115,4 +115,11 @@ pub trait Device: Send {
     /// Handle a notification on queue `index`. Pop chains from `queue` and
     /// report each of them as used.
     fn notify(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()>;
+
+    /// Handle the work left after a restore of device state, with `queue`
+    /// and `ram` same as `notify` gets them. Transport calls it once per
+    /// built queue. Default is a no-op.
+    fn restored(&mut self, _index: u16, _queue: &mut Queue, _ram: &GuestRam) -> Result<()> {
+        Ok(())
+    }
 }

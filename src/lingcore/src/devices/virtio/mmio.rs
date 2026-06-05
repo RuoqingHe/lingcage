@@ -399,6 +399,35 @@ impl BusDevice for Transport {
             serde_json::from_slice(&blob.data).map_err(|_| BusError::State)?;
         self.take_up(state)
     }
+
+    fn restored(&mut self) {
+        let mut raised = false;
+        for index in 0..self.queues.len() as u16 {
+            let Some(queue) = self.queues[usize::from(index)].queue.as_mut() else {
+                continue;
+            };
+            let (_, answered) = queue.cursors();
+            // Malformed chain sets `DEVICE_NEEDS_RESET` like `notify` does,
+            // it does not fail the restore.
+            if let Err(refused) = self.device.restored(index, queue, &self.ram) {
+                warn!(
+                    "queue {index} not served after a restore, DEVICE_NEEDS_RESET set: {refused}"
+                );
+                self.status |= STATUS_NEEDS_RESET;
+                continue;
+            }
+            raised |= queue.cursors().1 != answered;
+        }
+        if !raised {
+            return;
+        }
+        self.interrupt_status |= INTERRUPT_VRING;
+        // Failed raise leaves the work in the used ring, which will be
+        // seen at the next raise.
+        if let Err(err) = self.line.send() {
+            warn!("the line for a restore was not raised: {err}");
+        }
+    }
 }
 
 /// Upper 32 bits of `value`.
@@ -488,6 +517,10 @@ mod tests {
                 queue.add_used(ram, chain.head, written)?;
             }
             Ok(())
+        }
+
+        fn restored(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
+            self.notify(index, queue, ram)
         }
     }
 
@@ -858,6 +891,44 @@ mod tests {
             0,
             "QUEUE_READY survived the reset"
         );
+    }
+
+    #[test]
+    fn test_restored_serves_pending_work() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut mmio = transport(&line);
+        let ram = mmio.ram.clone();
+
+        // One writable buffer, published in the available ring.
+        let mut descriptor = [0u8; 16];
+        descriptor[0..8].copy_from_slice(&BUFFER.to_le_bytes());
+        descriptor[8..12].copy_from_slice(&16u32.to_le_bytes());
+        descriptor[12..14].copy_from_slice(&2u16.to_le_bytes());
+        ram.write(DESC_TABLE, &descriptor).expect("descriptor");
+        ram.write(AVAIL_RING + 4, &0u16.to_le_bytes())
+            .expect("head");
+        ram.write(AVAIL_RING + 2, &1u16.to_le_bytes())
+            .expect("index");
+
+        set(&mut mmio, QUEUE_NUM, 8);
+        set(&mut mmio, QUEUE_DESC_LOW, DESC_TABLE as u32);
+        set(&mut mmio, QUEUE_AVAIL_LOW, AVAIL_RING as u32);
+        set(&mut mmio, QUEUE_USED_LOW, USED_RING as u32);
+        set(&mut mmio, QUEUE_READY, 1);
+
+        BusDevice::restored(&mut mmio);
+
+        // Backend filled the buffer, reported it used and raised the line.
+        let mut filled = [0u8; 16];
+        ram.read(BUFFER, &mut filled).expect("read the buffer back");
+        assert_eq!(filled, [0xa5u8; 16], "buffer not filled");
+        assert_eq!(used_index(&ram), 1);
+        assert_eq!(line.raises(), 1, "line not raised after the restore");
+        assert_eq!(reg(&mut mmio, INTERRUPT_STATUS), INTERRUPT_VRING);
+
+        // No new chain offered, second run raises no line.
+        BusDevice::restored(&mut mmio);
+        assert_eq!(line.raises(), 1, "an untouched queue woke the guest");
     }
 
     #[test]

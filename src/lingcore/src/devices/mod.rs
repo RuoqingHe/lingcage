@@ -90,6 +90,10 @@ pub trait Device: Send {
             wanted: "stateless",
         })
     }
+
+    /// Handle the work left after a `restore`, once all blobs are applied.
+    /// Default is a no-op.
+    fn restored(&mut self) {}
 }
 
 /// State captured from a device, bytes in the layout of the device
@@ -149,5 +153,9 @@ impl<D: Device> Device for Shared<D> {
 
     fn restore(&mut self, blob: &Blob) -> Result<()> {
         self.with(|device| device.restore(blob))
+    }
+
+    fn restored(&mut self) {
+        self.with(|device| device.restored())
     }
 }

@@ -26,12 +26,17 @@ use crate::mem::GuestRam;
 /// `include/uapi/linux/virtio_ids.h`.
 const VSOCK: u32 = 19;
 
-/// Queue indices, `VSOCK_VQ_RX`, `VSOCK_VQ_TX` and `VSOCK_VQ_MAX` in
-/// `include/linux/virtio_vsock.h`. Event queue is offered but left
-/// empty.
+/// Queue indices, the `VSOCK_VQ_*` enum in
+/// `drivers/net/vmw_vsock/virtio_transport.c`.
 const RX: u16 = 0;
 const TX: u16 = 1;
+const EVT: u16 = 2;
 const QUEUES: u16 = 3;
+
+/// `VIRTIO_VSOCK_EVENT_TRANSPORT_RESET` in
+/// `include/uapi/linux/virtio_vsock.h`. On this event the guest closes
+/// open connections and keeps listening ones, under the new CID.
+const TRANSPORT_RESET: u32 = 0;
 
 /// Largest payload of one packet, `VIRTIO_VSOCK_MAX_PKT_BUF_SIZE`.
 const PACKET: usize = 64 * 1024;
@@ -69,6 +74,9 @@ pub struct Vsock {
     waiting: Vec<(Header, Vec<u8>)>,
     /// Host port assigned to the last incoming connection.
     last_port: u32,
+    /// Transport reset pending for the guest. Each restore sets it, posting
+    /// the event to event queue clears it.
+    reset_owed: bool,
 }
 
 impl Vsock {
@@ -81,6 +89,7 @@ impl Vsock {
             open: HashMap::new(),
             waiting: Vec::new(),
             last_port: 0,
+            reset_owed: false,
         }
     }
 
@@ -321,6 +330,21 @@ impl Vsock {
         }
         Ok(())
     }
+
+    /// Post the owed transport reset event to event queue. Event stays owed
+    /// while the guest has posted no buffer.
+    fn post_reset(&mut self, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
+        if !self.reset_owed {
+            return Ok(());
+        }
+        let Some(chain) = queue.pop(ram)? else {
+            return Ok(());
+        };
+        let written = write_event(&chain, ram, TRANSPORT_RESET)?;
+        queue.add_used(ram, chain.head, written)?;
+        self.reset_owed = false;
+        Ok(())
+    }
 }
 
 impl Device for Vsock {
@@ -392,8 +416,23 @@ impl Device for Vsock {
                 self.expire(Instant::now());
                 self.give(queue, ram)?;
             }
-            // Event queue is left empty.
+            EVT => self.post_reset(queue, ram)?,
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn restored(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
+        // Connections open at the host end and packets held for the guest
+        // are from before the restore. Both are dropped, and host ends are
+        // closed with them.
+        self.open.clear();
+        self.waiting.clear();
+        // One reset per restore, only posted on the event queue. Call of
+        // each queue sets the flag, call of this queue reads it.
+        self.reset_owed = true;
+        if index == EVT {
+            self.post_reset(queue, ram)?;
         }
         Ok(())
     }
@@ -432,7 +471,19 @@ fn write_packet(chain: &Chain, ram: &GuestRam, header: &Header, payload: &[u8]) 
     let mut whole = vec![0u8; ROOM + payload.len()];
     header.write(&mut whole);
     whole[ROOM..].copy_from_slice(payload);
+    write_fully(chain, ram, &whole)
+}
 
+/// Write the event into writable descriptors of `chain`, laid out as
+/// `struct virtio_vsock_event` in `include/uapi/linux/virtio_vsock.h`,
+/// only the id in little endian. Returns bytes written.
+fn write_event(chain: &Chain, ram: &GuestRam, id: u32) -> Result<u32> {
+    write_fully(chain, ram, &id.to_le_bytes())
+}
+
+/// Write `whole` into writable descriptors of `chain`. Returns bytes
+/// written, or `Error::Request` if the chain is too short for them.
+fn write_fully(chain: &Chain, ram: &GuestRam, whole: &[u8]) -> Result<u32> {
     let mut written = 0usize;
     for descriptor in &chain.descriptors {
         if !descriptor.writable() || written == whole.len() {
@@ -445,7 +496,7 @@ fn write_packet(chain: &Chain, ram: &GuestRam, header: &Header, payload: &[u8]) 
             })?;
         written += room;
     }
-    // Partial write would leave `len` of the header past the bytes present.
+    // Partial write would read as a shorter message than the one sent.
     if written != whole.len() {
         return Err(Error::Request);
     }
@@ -474,7 +525,9 @@ mod tests {
     /// at `0x1000` and `0x2000` past it.
     const TX_RING: u64 = 0x1000;
     const RX_RING: u64 = 0x5000;
+    const EVT_RING: u64 = 0x1_5000;
     const BUFFER: u64 = 0x9000;
+    const EVENT_BUFFER: u64 = 0x1_9000;
     const RAM_SIZE: u64 = 0x20000;
 
     /// Host stream with separate buffer per direction.
@@ -678,6 +731,22 @@ mod tests {
         let mut bytes = [0u8; ROOM];
         ram.read(at, &mut bytes).expect("read the buffer");
         Header::read(&bytes).expect("header")
+    }
+
+    /// Post one writable buffer as available entry `slot` of event ring.
+    /// Size is one `event_list` entry of the driver, one event.
+    fn guest_offers_event(ram: &GuestRam, slot: u16) {
+        let at = EVENT_BUFFER + u64::from(slot) * 0x400;
+        describe(ram, EVT_RING, slot, at, 4, WRITE);
+        publish(ram, EVT_RING, slot, slot, slot + 1);
+    }
+
+    /// Returns id of the event in the buffer of entry `slot`.
+    fn event_given(ram: &GuestRam, slot: u16) -> u32 {
+        let at = EVENT_BUFFER + u64::from(slot) * 0x400;
+        let mut bytes = [0u8; 4];
+        ram.read(at, &mut bytes).expect("read the event");
+        u32::from_le_bytes(bytes)
     }
 
     fn device(landed: &Landed) -> Vsock {
@@ -1155,5 +1224,65 @@ mod tests {
         vsock.notify(RX, &mut rx, &ram).expect("notify rx");
         assert_eq!(guest_given(&ram, 0).op, Op::Response);
         assert!(vsock.waiting.is_empty(), "reply still held");
+    }
+
+    #[test]
+    fn test_transport_reset_after_restore() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut rx = queue(RX_RING);
+        let mut evt = queue(EVT_RING);
+
+        // Transport calls `restored` once per queue, reset is posted on
+        // the call of event queue.
+        vsock.restored(RX, &mut rx, &ram).expect("restored rx");
+        guest_offers_event(&ram, 0);
+        vsock.restored(EVT, &mut evt, &ram).expect("restored evt");
+        assert_eq!(event_given(&ram, 0), TRANSPORT_RESET);
+        assert!(!vsock.reset_owed, "reset still owed");
+
+        // No second event without another restore.
+        guest_offers_event(&ram, 1);
+        vsock.notify(EVT, &mut evt, &ram).expect("notify evt");
+        assert_eq!(evt.cursors().1, 1, "restore posted more than one event");
+    }
+
+    #[test]
+    fn test_reset_held_until_event_buffer() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut evt = queue(EVT_RING);
+
+        // No buffer posted at the restore.
+        vsock.restored(EVT, &mut evt, &ram).expect("restored evt");
+        assert!(vsock.reset_owed, "reset dropped with the buffer");
+        assert_eq!(evt.cursors(), (0, 0), "event posted with no buffer");
+
+        // Next event queue notification with a buffer delivers it.
+        guest_offers_event(&ram, 0);
+        vsock.notify(EVT, &mut evt, &ram).expect("notify evt");
+        assert_eq!(event_given(&ram, 0), TRANSPORT_RESET);
+        assert!(!vsock.reset_owed, "reset still owed");
+    }
+
+    #[test]
+    fn test_one_reset_per_restore() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut evt = queue(EVT_RING);
+
+        guest_offers_event(&ram, 0);
+        vsock.restored(EVT, &mut evt, &ram).expect("first restore");
+        guest_offers_event(&ram, 1);
+        vsock.restored(EVT, &mut evt, &ram).expect("second restore");
+
+        assert_eq!(evt.cursors().1, 2, "not one event per restore");
+        assert_eq!(event_given(&ram, 0), TRANSPORT_RESET);
+        assert_eq!(event_given(&ram, 1), TRANSPORT_RESET);
+        vsock.notify(EVT, &mut evt, &ram).expect("notify evt");
+        assert_eq!(evt.cursors().1, 2, "extra event appeared");
     }
 }

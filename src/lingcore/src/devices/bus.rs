@@ -178,6 +178,9 @@ impl Bus {
             };
             placed.device.restore(blob)?;
         }
+        for placed in self.placed_mut() {
+            placed.device.restored();
+        }
         Ok(())
     }
 }
@@ -234,10 +237,12 @@ mod tests {
         Box::new(Serial::new(Vec::new()))
     }
 
-    /// Device with one byte of state under `kind`.
+    /// Device with one byte of state under `kind`, plus a record of the
+    /// hooks called by the bus.
     struct Cell {
         kind: &'static str,
         state: u8,
+        restored: usize,
     }
 
     impl Device for Cell {
@@ -267,10 +272,18 @@ mod tests {
             self.state = *blob.data.first().ok_or(Error::State)?;
             Ok(())
         }
+
+        fn restored(&mut self) {
+            self.restored += 1;
+        }
     }
 
     fn cell(kind: &'static str, state: u8) -> crate::devices::Shared<Cell> {
-        crate::devices::Shared::new(Cell { kind, state })
+        crate::devices::Shared::new(Cell {
+            kind,
+            state,
+            restored: 0,
+        })
     }
 
     fn blob(kind: &str, state: u8) -> Option<Blob> {
@@ -296,6 +309,9 @@ mod tests {
         bus.restore(&blobs).expect("restore by kind");
         assert_eq!(one.with(|cell| cell.state), 11);
         assert_eq!(two.with(|cell| cell.state), 22);
+        // `restored` was called on each device.
+        assert_eq!(one.with(|cell| cell.restored), 1);
+        assert_eq!(two.with(|cell| cell.restored), 1);
     }
 
     #[test]
@@ -333,6 +349,7 @@ mod tests {
             7,
             "added device lost its power-on state"
         );
+        assert_eq!(two.with(|cell| cell.restored), 1);
     }
 
     #[test]
@@ -349,6 +366,7 @@ mod tests {
         ));
         // Refusal happened before any blob was applied.
         assert_eq!(one.with(|cell| cell.state), 0);
+        assert_eq!(one.with(|cell| cell.restored), 0);
 
         // Two saved blobs of a kind while the bus has only one.
         assert!(matches!(
