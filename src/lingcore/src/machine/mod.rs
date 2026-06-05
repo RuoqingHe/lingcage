@@ -154,8 +154,8 @@ pub enum Error {
     /// vCPU thread panicked.
     #[error("vCPU thread panicked")]
     VcpuThread,
-    /// Device thread panicked.
-    #[error("device thread panicked")]
+    /// Device thread panicked or exited on error.
+    #[error("device thread panicked or exited on error")]
     DeviceThread,
     /// Failed to assemble or install an allowlist on a thread.
     #[error("failed to confine guest threads")]
@@ -862,7 +862,8 @@ impl<H: Hypervisor> Machine<H> {
         // host I/O holds up the rest. Chains are served here instead of on
         // vCPU threads. It reads the same order as vCPU threads, so a paused
         // guest is not captured with a chain half served. On error the
-        // thread logs and exits, machine state is unchanged.
+        // thread logs and returns `DeviceThread`, and the drop sets the stop
+        // order, so `wait` returns it.
         let rings: Vec<(Shared<Transport>, Arc<dyn IoeventFd>, u16)> = self
             .wired
             .iter()
@@ -887,6 +888,7 @@ impl<H: Hypervisor> Machine<H> {
         let orders = Arc::clone(&self.orders);
         let filter = working.clone();
         self.device_threads = vec![std::thread::spawn(move || {
+            let _signal = SignalOnDrop(Arc::clone(&orders));
             if let Some(filter) = filter {
                 filter.confine()?;
             }
@@ -909,7 +911,7 @@ impl<H: Hypervisor> Machine<H> {
                 // wait.
                 if waiting.ready(DEVICE_TICK, &mut signalled).is_err() {
                     error!("device thread exits, ioeventfd wait failed");
-                    break;
+                    return Err(Error::DeviceThread);
                 }
                 // The read clears the count, ioeventfd left unread stays
                 // ready. Host descriptor has no count to clear.
@@ -921,7 +923,7 @@ impl<H: Hypervisor> Machine<H> {
                     });
                 if taken.is_err() {
                     error!("device thread exits, ioeventfd read failed");
-                    break;
+                    return Err(Error::DeviceThread);
                 }
                 // Each queue is served no matter it signalled or not. Host
                 // descriptor is reported with `OUTSIDE` instead of against a
@@ -931,7 +933,7 @@ impl<H: Hypervisor> Machine<H> {
                     .try_for_each(|(transport, _, ring)| transport.with(|t| t.notify(*ring)));
                 if let Err(unanswered) = worked {
                     error!("device thread exits, notify failed: {unanswered}");
-                    break;
+                    return Err(Error::DeviceThread);
                 }
                 match orders.standing() {
                     Order::Run => {}
@@ -1020,10 +1022,20 @@ impl<H: Hypervisor> Machine<H> {
             let exit = thread.join().map_err(|_| Error::VcpuThread)?;
             first = first.or(Some(exit));
         }
+        // Device thread which panicked or exited on error is reported in
+        // place of the vCPU exit, once the machine is `Shutdown`.
+        let mut devices = Ok(());
         for thread in self.device_threads.drain(..) {
-            thread.join().map_err(|_| Error::DeviceThread)??;
+            let ended = thread
+                .join()
+                .map_err(|_| Error::DeviceThread)
+                .and_then(|ended| ended);
+            if devices.is_ok() {
+                devices = ended;
+            }
         }
         self.state = State::Shutdown;
+        devices?;
         first.unwrap_or(Ok(VmExit::Shutdown))
     }
 }
