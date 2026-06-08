@@ -7,6 +7,8 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 
+use log::warn;
+
 use crate::devices::{Blob, Device, Error, Result};
 use crate::hv::irq::IrqSender;
 use crate::hv::vcpu::VmExit;
@@ -56,9 +58,15 @@ const IIR_FIFO_ENABLED: u8 = 0xc0;
 /// `FCR` bit which enables the FIFOs.
 const FCR_ENABLE: u8 = 0x01;
 
-/// 16550 UART. Transmitted bytes are written to `out`, bytes passed to
-/// `receive` are queued for the guest to read. `line` is raised for empty
-/// transmit register and for queued input, according to `IER` bits.
+// TODO: The `LSR` overrun bit is not yet raised for dropped input.
+/// Bound of queued input, one page. Guest drains it byte by byte through
+/// `DATA`.
+const INPUT_BOUND: usize = 4096;
+
+/// 16550 UART. Transmitted bytes go to `out`, bytes passed to `receive`
+/// are queued for the guest to read and dropped beyond `INPUT_BOUND`.
+/// `line` is raised for empty transmit register and for input, according
+/// to `IER` bits.
 pub struct Serial<W: Write> {
     out: W,
     input: VecDeque<u8>,
@@ -67,6 +75,8 @@ pub struct Serial<W: Write> {
     /// Pending interrupts as `IIR` bits. A reason already pending does not
     /// raise the line again, so a run of bytes only raises it once.
     asking: u8,
+    /// Set once the fill is logged. Cleared when the queue has room again.
+    drop_logged: bool,
     ier: u8,
     fcr: u8,
     lcr: u8,
@@ -83,6 +93,7 @@ impl<W: Write> Serial<W> {
             input: VecDeque::new(),
             line: None,
             asking: 0,
+            drop_logged: false,
             ier: 0,
             fcr: 0,
             lcr: 0,
@@ -131,9 +142,24 @@ impl<W: Write> Serial<W> {
     }
 
     /// Queue `bytes` for the guest to read from `DATA` and raise the line
-    /// for them.
+    /// for them. Bytes beyond `INPUT_BOUND` are dropped and the fill is
+    /// logged once, a full queue is not an error.
     pub fn receive(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.input.extend(bytes);
+        // Room ends the fill, so the next fill logs again.
+        if self.input.len() < INPUT_BOUND {
+            self.drop_logged = false;
+        }
+        // `restore` accepts a blob whose input is longer than the bound.
+        let room = INPUT_BOUND.saturating_sub(self.input.len());
+        let (taken, dropped) = bytes.split_at(bytes.len().min(room));
+        if !dropped.is_empty() && !self.drop_logged {
+            warn!(
+                "queue is full, {} bytes of console input dropped",
+                dropped.len()
+            );
+            self.drop_logged = true;
+        }
+        self.input.extend(taken);
         self.ask_about_input()
     }
 
@@ -254,7 +280,8 @@ struct SerialState {
 }
 
 impl<W: Write + Send> crate::devices::Receive for crate::devices::Shared<Serial<W>> {
-    /// Queue `bytes` without waiting for the guest to read them.
+    /// Queue `bytes` without waiting for the guest to read them, bytes
+    /// beyond `INPUT_BOUND` are dropped.
     fn receive(&self, bytes: &[u8]) -> io::Result<()> {
         self.with(|uart| uart.receive(bytes))
     }
@@ -618,6 +645,88 @@ mod tests {
         let mut out = Vec::new();
         std::mem::swap(&mut out, &mut uart.out);
         assert_eq!(out, b"hi\n");
+    }
+
+    #[test]
+    fn test_input_queue_bound() {
+        let mut uart = Serial::new(Vec::new());
+
+        // Twice the bound arrives at once.
+        uart.receive(&[0xa5; INPUT_BOUND * 2])
+            .expect("receive a burst");
+
+        let mut drained = 0;
+        while uart.read(LSR) & LSR_DATA_READY != 0 {
+            uart.read(DATA);
+            drained += 1;
+        }
+        assert_eq!(drained, INPUT_BOUND, "queue grew past the bound");
+    }
+
+    #[test]
+    fn test_kept_input_served_in_order() {
+        let mut uart = Serial::new(Vec::new());
+
+        let burst: Vec<u8> = (0..=255u8).cycle().take(INPUT_BOUND * 2).collect();
+        uart.receive(&burst).expect("receive a burst");
+
+        // The prefix which fits is read back in order.
+        for (offset, byte) in burst.iter().take(INPUT_BOUND).enumerate() {
+            assert_eq!(uart.read(DATA), *byte, "byte {offset} differs");
+        }
+        assert_eq!(
+            uart.read(LSR),
+            LSR_TRANSMIT_EMPTY,
+            "input left past the bound"
+        );
+    }
+
+    #[test]
+    fn test_input_bound_across_bursts() {
+        let mut uart = Serial::new(Vec::new());
+
+        // Bursts while the guest is not reading. `receive` does not fail
+        // on a full queue.
+        for _ in 0..4 {
+            uart.receive(&[0x5a; INPUT_BOUND])
+                .expect("receive onto a full queue");
+        }
+
+        // Half drained, one more burst fills up to the bound and no more.
+        for _ in 0..INPUT_BOUND / 2 {
+            uart.read(DATA);
+        }
+        uart.receive(&[0x5a; INPUT_BOUND])
+            .expect("receive after a drain");
+
+        let mut drained = 0;
+        while uart.read(LSR) & LSR_DATA_READY != 0 {
+            uart.read(DATA);
+            drained += 1;
+        }
+        assert_eq!(drained, INPUT_BOUND, "burst grew the queue past the bound");
+    }
+
+    #[test]
+    fn test_fill_logged_once() {
+        let mut uart = Serial::new(Vec::new());
+
+        // Exact fill drops no byte and sets no mark.
+        uart.receive(&[0x5a; INPUT_BOUND])
+            .expect("receive an exact fill");
+        assert!(!uart.drop_logged, "exact fill was marked");
+
+        // First dropped byte marks the fill. Drops while the queue stays
+        // full do not log again.
+        uart.receive(&[0x5a; 1]).expect("receive a byte");
+        assert!(uart.drop_logged, "fill was not marked");
+        uart.receive(&[0x5a; 1]).expect("receive onto a full queue");
+        assert!(uart.drop_logged, "mark was cleared while still full");
+
+        // One byte of room ends the fill, so the next fill logs again.
+        uart.read(DATA);
+        uart.receive(&[0x5a; 2]).expect("receive after a drain");
+        assert!(uart.drop_logged, "refill was not marked");
     }
 
     /// Guest reads `LSR` and writes it to `DATA`, then reads the queued byte
