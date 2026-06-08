@@ -112,6 +112,13 @@ pub trait Device: Send {
         Vec::new()
     }
 
+    /// Returns the longest time the device can wait before it has work not
+    /// reported by any descriptor, an incoming connection to expire for
+    /// example. Default returns `None`.
+    fn wake_after(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Handle a notification on queue `index`. Pop chains from `queue` and
     /// report each of them as used.
     fn notify(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()>;

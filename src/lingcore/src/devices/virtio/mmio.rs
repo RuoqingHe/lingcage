@@ -9,6 +9,7 @@
 //! behind it does the actual work when a queue is notified.
 
 use std::io;
+use std::time::Duration;
 
 use log::warn;
 
@@ -294,6 +295,11 @@ impl Transport {
         self.device.outside()
     }
 
+    /// Returns the longest time the device can wait, see `Device::wake_after`.
+    pub fn wake_after(&self) -> Option<Duration> {
+        self.device.wake_after()
+    }
+
     fn state(&self) -> TransportState {
         TransportState {
             status: self.status,
@@ -445,6 +451,7 @@ mod tests {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Once};
+    use std::time::Duration;
 
     use log::{Level, LevelFilter, Log, Metadata, Record};
 
@@ -482,6 +489,8 @@ mod tests {
     struct Filler {
         refuse: bool,
         served: Arc<AtomicUsize>,
+        /// Wait reported through `wake_after`.
+        wake: Option<Duration>,
     }
 
     impl Device for Filler {
@@ -521,6 +530,10 @@ mod tests {
 
         fn restored(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
             self.notify(index, queue, ram)
+        }
+
+        fn wake_after(&self) -> Option<std::time::Duration> {
+            self.wake
         }
     }
 
@@ -691,6 +704,7 @@ mod tests {
             Box::new(Filler {
                 refuse: false,
                 served: Arc::clone(&served),
+                ..Default::default()
             }),
             ram.clone(),
             Box::new(line.clone()),
@@ -743,6 +757,7 @@ mod tests {
             Box::new(Filler {
                 refuse: true,
                 served: Arc::new(AtomicUsize::new(0)),
+                ..Default::default()
             }),
             ram,
             Box::new(line.clone()),
@@ -806,6 +821,7 @@ mod tests {
             Box::new(Filler {
                 refuse: true,
                 served: Arc::new(AtomicUsize::new(0)),
+                ..Default::default()
             }),
             ram,
             Box::new(line.clone()),
@@ -956,5 +972,21 @@ mod tests {
                 wanted: 1
             })
         ));
+    }
+
+    #[test]
+    fn test_wake_after_passthrough() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
+        let mmio = Transport::new(
+            Box::new(Filler {
+                wake: Some(Duration::from_millis(40)),
+                ..Default::default()
+            }),
+            ram,
+            Box::new(line.clone()),
+        );
+
+        assert_eq!(mmio.wake_after(), Some(Duration::from_millis(40)));
     }
 }

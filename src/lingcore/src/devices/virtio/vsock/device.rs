@@ -448,6 +448,20 @@ impl Device for Vsock {
         waited
     }
 
+    /// Returns time until `PATIENCE` deadline of the nearest connection.
+    /// `None` while no connection is waiting on the guest.
+    fn wake_after(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.open
+            .values()
+            .filter(|held| held.connection.waiting_on_guest())
+            .map(|held| match held.since {
+                Some(since) => (since + PATIENCE).saturating_duration_since(now),
+                None => PATIENCE,
+            })
+            .min()
+    }
+
     fn notify(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
         // First queue served in each round takes count of the kick.
         if index == RX {
@@ -1440,5 +1454,42 @@ mod tests {
         vsock.notify(RX, &mut rx, &ram).expect("notify rx");
         assert_eq!(guest_given(&ram, 0).op, Op::Request);
         assert_ne!(kick_count(&vsock), 0, "no ring for the incoming connection");
+    }
+
+    #[test]
+    fn test_wake_after_incoming_deadline() {
+        let mut vsock = device(&Landed::default());
+        assert_eq!(
+            vsock.wake_after(),
+            None,
+            "wake with no incoming connection pending"
+        );
+
+        // Connection not yet found waiting has its full `PATIENCE` left.
+        incoming_and_waiting(&mut vsock);
+        assert_eq!(vsock.wake_after(), Some(PATIENCE));
+
+        let start = std::time::Instant::now();
+        vsock.expire(start);
+        let first = vsock.wake_after().expect("deadline");
+        assert!(first < PATIENCE, "wait not shortened");
+
+        // Incoming connection half way to its deadline is the nearer one.
+        vsock.open.insert(
+            (GUEST_PORT + 1, OPEN_PORT),
+            Held {
+                connection: Connection::asking(GUEST_CID, GUEST_PORT + 1, OPEN_PORT),
+                stream: Box::new(Landed::default()),
+                since: Some(start - PATIENCE / 2),
+            },
+        );
+        let left = vsock.wake_after().expect("deadline");
+        assert!(left < PATIENCE / 2, "nearer deadline lost");
+
+        // Incoming connection already due leaves no wait.
+        vsock.open.values_mut().for_each(|held| {
+            held.since = Some(start - PATIENCE);
+        });
+        assert_eq!(vsock.wake_after(), Some(Duration::ZERO));
     }
 }
