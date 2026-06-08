@@ -364,9 +364,9 @@ struct Standing {
     parked: usize,
 }
 
-/// Order shared by vCPU and device threads and `pause`, `stop` and
-/// `wait`. Each thread reads the order before its next run or wait,
-/// `parked` counts the threads parked on a `Hold`.
+/// Order shared by vCPU and device threads, `pause`, `stop`, `wait`,
+/// and each `StopHandle`. Each thread reads the order before its next
+/// run or wait. `parked` counts the threads parked on a `Hold`.
 #[derive(Default)]
 struct Orders {
     standing: Mutex<Standing>,
@@ -510,8 +510,9 @@ pub struct Machine<H: Hypervisor> {
     /// One thread per started vCPU. `stop_vcpu` signals a vCPU through its
     /// handle.
     threads: Vec<JoinHandle<Result<VmExit>>>,
-    /// One `Stopper` per vCPU, in creation order, used by `ask_out`.
-    stoppers: Vec<Box<dyn Stopper>>,
+    /// One `Stopper` per vCPU, in creation order, shared with each
+    /// `StopHandle`.
+    stoppers: Arc<Vec<Box<dyn Stopper>>>,
     orders: Arc<Orders>,
     /// VM generation ID, renewed by `restore`.
     genid: VmGenId,
@@ -627,7 +628,7 @@ impl<H: Hypervisor> Machine<H> {
         if let Some(loaded) = &loaded {
             enter(&ram, config, &mut vcpus, loaded, &genid)?;
         }
-        let stoppers = vcpus.iter().map(|vcpu| vcpu.stopper()).collect();
+        let stoppers = Arc::new(vcpus.iter().map(|vcpu| vcpu.stopper()).collect::<Vec<_>>());
         let vcpus = vcpus
             .into_iter()
             .map(|vcpu| Arc::new(Mutex::new(vcpu)))
@@ -1024,11 +1025,26 @@ impl<H: Hypervisor> Machine<H> {
         self.ask_out()
     }
 
+    /// Returns a handle which stops the guest from a thread not owning the
+    /// machine. It has the same effect as `stop` except the per-thread
+    /// signal, which is sent by `wait`.
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle {
+            orders: Arc::clone(&self.orders),
+            stoppers: Arc::clone(&self.stoppers),
+            ioeventfds: self
+                .wired
+                .iter()
+                .flat_map(|wired| wired.ioeventfds.iter().map(Arc::clone))
+                .collect(),
+        }
+    }
+
     /// Stop each vCPU through its `Stopper`, which the backend checks on
     /// entry to `run`, and through `stop_vcpu`, a signal landing inside
     /// `run`. One call covers both cases, so `wait` joins without retry.
     fn ask_out(&self) -> Result<()> {
-        for stopper in &self.stoppers {
+        for stopper in self.stoppers.iter() {
             stopper.stop();
         }
         for (index, thread) in self.threads.iter().enumerate() {
@@ -1073,6 +1089,32 @@ impl<H: Hypervisor> Machine<H> {
         self.state = State::Shutdown;
         devices?;
         first.unwrap_or(Ok(VmExit::Shutdown))
+    }
+}
+
+/// Stop of a machine, detached from the thread owning it. It is `Clone`
+/// and `Send`, so one can be held on each stopping thread.
+#[derive(Clone)]
+pub struct StopHandle {
+    orders: Arc<Orders>,
+    stoppers: Arc<Vec<Box<dyn Stopper>>>,
+    ioeventfds: Vec<Arc<dyn IoeventFd>>,
+}
+
+impl StopHandle {
+    /// Set the stop order, stop each vCPU through its `Stopper` and signal
+    /// the ioeventfds, so that the wait of device thread ends. A vCPU in the
+    /// middle of `run` keeps running until `wait` signals it.
+    pub fn stop(&self) -> Result<()> {
+        self.orders.tell(Order::Stop);
+        for stopper in self.stoppers.iter() {
+            stopper.stop();
+        }
+        // Signal is what wakes up the wait of device thread for an order.
+        for ioeventfd in &self.ioeventfds {
+            ioeventfd.signal()?;
+        }
+        Ok(())
     }
 }
 

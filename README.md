@@ -111,7 +111,8 @@ them, and neither reports an error.
 
 - `start` runs each vCPU on its own thread.
 - `pause` parks them, `resume` continues them.
-- `stop` kicks vCPUs out of the guest.
+- `stop` kicks vCPUs out of the guest. `stop_handle` gives that kick to a thread which does not own
+  the machine.
 - `wait` joins the threads and returns exit reason of the first vCPU thread joined.
 
 ## Objectives
