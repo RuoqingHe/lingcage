@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::os::fd::RawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use log::warn;
@@ -77,11 +79,16 @@ pub struct Vsock {
     /// Transport reset pending for the guest. Each restore sets it, posting
     /// the event to event queue clears it.
     reset_owed: bool,
+    /// Non-blocking eventfd signalled as host-side work arrives. `outside`
+    /// reports it, so wait of the device thread ends with the work.
+    #[cfg(target_os = "linux")]
+    kick: OwnedFd,
 }
 
 impl Vsock {
     /// Create the device for the guest at `guest_cid`, connections are
-    /// opened on `endpoint`.
+    /// opened on `endpoint`. On Linux, panics if eventfd of the kick can not
+    /// be opened.
     pub fn new(guest_cid: u64, endpoint: Box<dyn Endpoint>) -> Self {
         Vsock {
             guest_cid,
@@ -90,6 +97,8 @@ impl Vsock {
             waiting: Vec::new(),
             last_port: 0,
             reset_owed: false,
+            #[cfg(target_os = "linux")]
+            kick: kick(),
         }
     }
 
@@ -126,6 +135,7 @@ impl Vsock {
                 },
             );
             self.owe(asks, Vec::new());
+            self.signal();
         }
     }
 
@@ -156,6 +166,7 @@ impl Vsock {
         }
         for header in owed {
             self.owe(header, Vec::new());
+            self.signal();
         }
     }
 
@@ -164,8 +175,45 @@ impl Vsock {
         self.waiting.push((header, payload));
     }
 
+    /// Signal the kick to wake up the wait of device thread. The write does
+    /// not block, signals before the count is taken are added up.
+    #[cfg(target_os = "linux")]
+    fn signal(&self) {
+        let one = 1u64.to_ne_bytes();
+        // SAFETY: `one` is 8 bytes, the width an eventfd write takes.
+        let wrote = unsafe { libc::write(self.kick.as_raw_fd(), one.as_ptr().cast(), 8) };
+        if wrote != 8 {
+            warn!("kick not signalled: {}", io::Error::last_os_error());
+        }
+    }
+
+    /// `signal` off Linux. No kick, and no device thread to wake.
+    #[cfg(not(target_os = "linux"))]
+    fn signal(&self) {}
+
+    /// Take count of the kick. Called once per round, before serving the
+    /// rings which come from it. Signal during the serving wakes the next
+    /// wait.
+    #[cfg(target_os = "linux")]
+    fn take_kick(&self) {
+        let mut count = [0u8; 8];
+        // SAFETY: `count` is 8 bytes, the width an eventfd read fills.
+        let read = unsafe { libc::read(self.kick.as_raw_fd(), count.as_mut_ptr().cast(), 8) };
+        if read != 8 {
+            // Empty kick reads as `WouldBlock`.
+            debug_assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+        }
+    }
+
+    /// `take_kick` off Linux. No kick, and no device thread to wake.
+    #[cfg(not(target_os = "linux"))]
+    fn take_kick(&self) {}
+
     /// Handle one packet from the transmit ring.
     fn took(&mut self, header: &Header, payload: &[u8]) {
+        // Packet from the guest moves credit of its connection, which is
+        // what `outside` waits on.
+        self.signal();
         // Packet for another CID or of another kind is reset, not dropped.
         if header.dst_cid != HOST_CID || header.kind != STREAM {
             self.owe(header.answer(Op::Reset), Vec::new());
@@ -266,6 +314,7 @@ impl Vsock {
         }
         for header in owed {
             self.owe(header, Vec::new());
+            self.signal();
         }
     }
 
@@ -301,6 +350,7 @@ impl Vsock {
         }
         for (header, payload) in owed {
             self.owe(header, payload);
+            self.signal();
         }
     }
 
@@ -369,18 +419,17 @@ impl Device for Vsock {
         read
     }
 
-    /// Returns descriptors of the endpoint while below `CONNECTIONS` open,
-    /// plus host end of each open connection, with `Read` while the guest
-    /// has room, `Write` while bytes wait for the host end, and `Both` for
-    /// both. One with neither is left out until credit of the guest arrives
-    /// on the ring.
+    /// Returns the kick on Linux, then descriptors of the endpoint while
+    /// below `CONNECTIONS` open, and host end of each open connection,
+    /// `Read` for room, `Write` for owed bytes, `Both` for both.
     fn outside(&self) -> Vec<(RawFd, Interest)> {
+        let mut waited = Vec::new();
+        #[cfg(target_os = "linux")]
+        waited.push((self.kick.as_raw_fd(), Interest::Read));
         // At `CONNECTIONS` open, endpoint is not waited on.
-        let mut waited = if self.open.len() < CONNECTIONS {
-            self.endpoint.outside()
-        } else {
-            Vec::new()
-        };
+        if self.open.len() < CONNECTIONS {
+            waited.extend(self.endpoint.outside());
+        }
         for held in self.open.values() {
             let Some(fd) = held.stream.descriptor() else {
                 continue;
@@ -400,6 +449,10 @@ impl Device for Vsock {
     }
 
     fn notify(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
+        // First queue served in each round takes count of the kick.
+        if index == RX {
+            self.take_kick();
+        }
         match index {
             TX => {
                 self.take(queue, ram)?;
@@ -436,6 +489,18 @@ impl Device for Vsock {
         }
         Ok(())
     }
+}
+
+/// Open the kick, a non-blocking eventfd. `EFD_CLOEXEC` keeps it away
+/// from exec'd program.
+#[cfg(target_os = "linux")]
+fn kick() -> OwnedFd {
+    // SAFETY: `eventfd(2)` takes an initial count and flags, returns a
+    // descriptor or -1.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    assert!(fd >= 0, "an eventfd: {}", io::Error::last_os_error());
+    // SAFETY: `fd` was just opened and has no other owner.
+    unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
 /// Read header and payload from readable descriptors of `chain`. Returns
@@ -747,6 +812,19 @@ mod tests {
         let mut bytes = [0u8; 4];
         ram.read(at, &mut bytes).expect("read the event");
         u32::from_le_bytes(bytes)
+    }
+
+    /// Read count of the kick without blocking. Zero when every signal is
+    /// taken.
+    #[cfg(target_os = "linux")]
+    fn kick_count(vsock: &Vsock) -> u64 {
+        let mut count = [0u8; 8];
+        // SAFETY: `count` is 8 bytes, the width an eventfd read fills.
+        let read = unsafe { libc::read(vsock.kick.as_raw_fd(), count.as_mut_ptr().cast(), 8) };
+        if read != 8 {
+            return 0;
+        }
+        u64::from_ne_bytes(count)
     }
 
     fn device(landed: &Landed) -> Vsock {
@@ -1284,5 +1362,83 @@ mod tests {
         assert_eq!(event_given(&ram, 1), TRANSPORT_RESET);
         vsock.notify(EVT, &mut evt, &ram).expect("notify evt");
         assert_eq!(evt.cursors().1, 2, "extra event appeared");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_kick_in_outside() {
+        let vsock = device(&Landed::default());
+        let fd = vsock.kick.as_raw_fd();
+        assert_eq!(
+            vsock.outside().first(),
+            Some(&(fd, Interest::Read)),
+            "kick not waited on"
+        );
+
+        // `EFD_CLOEXEC` keeps the kick away from exec'd program.
+        // SAFETY: `fd` is open, and `F_GETFD` takes no argument.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "kick leaks across exec");
+
+        // Kick does not block, signals accumulate while count is not taken.
+        for _ in 0..100 {
+            vsock.signal();
+        }
+        assert_eq!(kick_count(&vsock), 100, "rings were lost");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_kick_on_credit_change() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        assert_ne!(kick_count(&vsock), 0, "no ring for the request");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_kick_on_host_bytes() {
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        // Signals of the setup are taken in the round they landed in.
+        assert_eq!(kick_count(&vsock), 0);
+
+        landed.ready.lock().unwrap().extend_from_slice(b"world");
+        vsock.pump();
+        assert_ne!(kick_count(&vsock), 0, "no ring for the landed bytes");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_kick_on_incoming_connection() {
+        let landed = Landed::default();
+        let mut vsock = Vsock::new(
+            GUEST_CID,
+            Box::new(Incoming {
+                waiting: vec![(GUEST_PORT, landed.clone())],
+                asked: Arc::new(Mutex::new(0)),
+                arrives_on: Arc::new(paired()),
+            }),
+        );
+        let ram = ram();
+        let mut rx = queue(RX_RING);
+
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        assert_eq!(guest_given(&ram, 0).op, Op::Request);
+        assert_ne!(kick_count(&vsock), 0, "no ring for the incoming connection");
     }
 }
