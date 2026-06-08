@@ -62,13 +62,10 @@ const ENTROPY_SOURCE: &str = "/dev/urandom";
 /// piece. A zero piece becomes a hole in the image.
 const IMAGE_CHUNK: usize = 64 << 10;
 
-/// Maximum time the device thread waits on the ioeventfds and host
-/// descriptors before reading the order.
-const DEVICE_TICK: Duration = Duration::from_millis(200);
-
-/// Token a host descriptor is reported with, token of an ioeventfd is
-/// its ring index.
-const OUTSIDE: u64 = u64::MAX;
+/// Base of the token a host descriptor is reported with. Its token is
+/// the base plus index of the transport. Token of an ioeventfd is its
+/// index in `rings`, far below the base.
+const OUTSIDE: u64 = 1 << 32;
 
 /// Maximum time `pause` waits for vCPU and device threads to park. The
 /// stop lands as a signal plus a flag read on entry to `run`, so a vCPU
@@ -856,13 +853,14 @@ impl<H: Hypervisor> Machine<H> {
             })
             .collect();
 
-        // One thread per machine, waiting on ioeventfds of each device.
-        // Fewer threads per guest, at the price that a device blocked in
-        // host I/O holds up the rest. Chains are served here instead of on
-        // vCPU threads. It reads the same order as vCPU threads, so a paused
-        // guest is not captured with a chain half served. On error the
-        // thread logs and returns `DeviceThread`, and the drop sets the stop
-        // order, so `wait` returns it.
+        // One thread per machine, waiting on the ioeventfds, host
+        // descriptors and deadlines of each device. Fewer threads per
+        // guest, at the price that a device blocked in host I/O holds up
+        // the rest. Chains are served here instead of on vCPU threads. It
+        // reads the same order as vCPU threads, so a paused guest is not
+        // captured with a chain half served. On error the thread logs and
+        // returns `DeviceThread`, and the drop sets the stop order, so
+        // `wait` returns it.
         let rings: Vec<(Shared<Transport>, Arc<dyn IoeventFd>, u16)> = self
             .wired
             .iter()
@@ -877,13 +875,16 @@ impl<H: Hypervisor> Machine<H> {
                     .collect::<Vec<_>>()
             })
             .collect();
-        // Each transport once, for its host descriptors. `rings` lists a
-        // device once per queue.
-        let outsides: Vec<Shared<Transport>> = self
-            .wired
-            .iter()
-            .map(|wired| wired.transport.clone())
-            .collect();
+        // Each transport once, with the rings it owns, for its host
+        // descriptors and deadlines. `rings` lists a device once per queue.
+        let mut outsides: Vec<(Shared<Transport>, std::ops::Range<usize>)> =
+            Vec::with_capacity(self.wired.len());
+        let mut first = 0;
+        for wired in &self.wired {
+            let end = first + wired.ioeventfds.len();
+            outsides.push((wired.transport.clone(), first..end));
+            first = end;
+        }
         let orders = Arc::clone(&self.orders);
         let filter = working.clone();
         self.device_threads = vec![std::thread::spawn(move || {
@@ -893,6 +894,7 @@ impl<H: Hypervisor> Machine<H> {
             }
             let mut waiting = Waiting::new();
             let mut signalled = Vec::with_capacity(rings.len());
+            let mut serving = Vec::with_capacity(rings.len());
             loop {
                 // The set is rebuilt in each round. Descriptors of a device
                 // change with its connections, and interest of each changes
@@ -901,14 +903,32 @@ impl<H: Hypervisor> Machine<H> {
                 for (token, (_, ioeventfd, _)) in rings.iter().enumerate() {
                     waiting.add(ioeventfd.as_raw_fd(), token as u64, Interest::Read);
                 }
-                for transport in &outsides {
+                for (index, (transport, _)) in outsides.iter().enumerate() {
                     for (fd, interest) in transport.with(|t| t.outside()) {
-                        waiting.add(fd, OUTSIDE, interest);
+                        waiting.add(fd, OUTSIDE + index as u64, interest);
                     }
                 }
-                // Signal during `notify` or a hold stays counted for the next
-                // wait.
-                if waiting.ready(DEVICE_TICK, &mut signalled).is_err() {
+                // The nearest deadline reported by a device bounds the wait.
+                // With none, `Duration::MAX` waits without one. `ready` caps
+                // the poll at i32::MAX ms.
+                let mut after = Duration::MAX;
+                let mut armed: Vec<usize> = Vec::new();
+                for (index, (transport, _)) in outsides.iter().enumerate() {
+                    let Some(deadline) = transport.with(|t| t.wake_after()) else {
+                        continue;
+                    };
+                    if deadline < after {
+                        after = deadline;
+                        armed.clear();
+                        armed.push(index);
+                    } else if deadline == after {
+                        armed.push(index);
+                    }
+                }
+                // Signal during `notify` or a hold stays counted for the
+                // next wait. Ioeventfd of the entropy source keeps the set
+                // non-empty, so the wait really waits.
+                if waiting.ready(after, &mut signalled).is_err() {
                     error!("device thread exits, ioeventfd wait failed");
                     return Err(Error::DeviceThread);
                 }
@@ -916,7 +936,7 @@ impl<H: Hypervisor> Machine<H> {
                 // ready. Host descriptor has no count to clear.
                 let taken = signalled
                     .iter()
-                    .filter(|token| **token != OUTSIDE)
+                    .filter(|token| **token < OUTSIDE)
                     .try_for_each(|token| {
                         rings[*token as usize].1.wait(Duration::ZERO).map(|_| ())
                     });
@@ -924,12 +944,29 @@ impl<H: Hypervisor> Machine<H> {
                     error!("device thread exits, ioeventfd read failed");
                     return Err(Error::DeviceThread);
                 }
-                // Each queue is served no matter it signalled or not. Host
-                // descriptor is reported with `OUTSIDE` instead of against a
-                // queue, and `notify` over an empty queue raises no line.
-                let worked = rings
-                    .iter()
-                    .try_for_each(|(transport, _, ring)| transport.with(|t| t.notify(*ring)));
+                // Only serve what signalled. An ioeventfd names its ring, a
+                // host descriptor names rings of its transport. A wait which
+                // ran out a deadline serves the transport the deadline is
+                // due on. Tied deadlines are all served.
+                serving.clear();
+                signalled.sort_unstable();
+                signalled.dedup();
+                for token in &signalled {
+                    if *token < OUTSIDE {
+                        serving.push(*token as usize);
+                    } else {
+                        serving.extend(outsides[(*token - OUTSIDE) as usize].1.clone());
+                    }
+                }
+                if signalled.is_empty() {
+                    for index in &armed {
+                        serving.extend(outsides[*index].1.clone());
+                    }
+                }
+                let worked = serving.iter().try_for_each(|ring| {
+                    let (transport, _, queue) = &rings[*ring];
+                    transport.with(|t| t.notify(*queue))
+                });
                 if let Err(unanswered) = worked {
                     error!("device thread exits, notify failed: {unanswered}");
                     return Err(Error::DeviceThread);
@@ -997,7 +1034,7 @@ impl<H: Hypervisor> Machine<H> {
         for (index, thread) in self.threads.iter().enumerate() {
             self.vm.stop_vcpu(index as u16, thread)?;
         }
-        // Signal wakes the device thread now instead of at the next tick.
+        // Signal is what wakes up the wait of device thread for an order.
         for wired in &self.wired {
             for ioeventfd in &wired.ioeventfds {
                 ioeventfd.signal()?;
