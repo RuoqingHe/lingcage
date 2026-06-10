@@ -92,10 +92,11 @@ impl Device for Pm1 {
         let value = value as u16;
         match offset {
             ENABLE => self.enable = value,
-            CONTROL if value & SLEEP_ENABLE != 0 => {
-                if (value & SLEEP_TYPE) >> SLEEP_TYPE_SHIFT == u16::from(SOFT_OFF) {
-                    return Ok(Some(VmExit::Shutdown));
-                }
+            CONTROL
+                if value & SLEEP_ENABLE != 0
+                    && (value & SLEEP_TYPE) >> SLEEP_TYPE_SHIFT == u16::from(SOFT_OFF) =>
+            {
+                return Ok(Some(VmExit::Shutdown));
             }
             _ => {}
         }
