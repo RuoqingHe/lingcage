@@ -6,6 +6,11 @@ on:
 jobs:
   build:
     name: Compile Workspace
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - --target x86_64-unknown-linux-gnu
     uses: ./.github/workflows/per-commit.yml
     with:
-      run: RUSTFLAGS='-D warnings' cargo build --workspace --all-targets --all-features --locked
+      run: RUSTFLAGS='-D warnings' cargo build --workspace --all-targets --locked ${{ matrix.platform }} --features lingcore/machine,lingcore/kvm

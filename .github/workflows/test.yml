@@ -6,6 +6,11 @@ on:
 jobs:
   test:
     name: Run Test Suite
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - --target x86_64-unknown-linux-gnu
     uses: ./.github/workflows/per-commit.yml
     with:
-      run: cargo test --workspace --locked
+      run: cargo test --workspace --locked ${{ matrix.platform }} --features lingcore/machine,lingcore/kvm
