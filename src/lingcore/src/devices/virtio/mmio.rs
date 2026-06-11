@@ -373,6 +373,13 @@ impl BusDevice for Transport {
     fn write(&mut self, offset: u64, size: u8, value: u64) -> io::Result<Option<VmExit>> {
         match offset.checked_sub(CONFIG) {
             Some(offset) => self.device.write_config(offset, size, value),
+            // QUEUE_NOTIFY store of another width misses the ioeventfd
+            // bound for 4 bytes and lands here on the vCPU thread, whose
+            // allowlist refuses what serving a queue needs. Only the
+            // device thread serves the ioeventfd.
+            None if offset == QUEUE_NOTIFY && size != 4 => {
+                warn!("{size}-byte QUEUE_NOTIFY store of {value:#x} ignored");
+            }
             // Registers are 32 bits wide, wider write carries its low word.
             None => self.write_register(offset, value as u32)?,
         }
@@ -611,6 +618,45 @@ mod tests {
         set(&mut mmio, DRIVER_FEATURES, (VERSION_1 >> 32) as u32);
         set(&mut mmio, STATUS, STATUS_FEATURES_OK);
         assert_eq!(reg(&mut mmio, STATUS), STATUS_FEATURES_OK);
+    }
+
+    #[test]
+    fn test_ignore_notify_of_other_width() {
+        // QUEUE_NOTIFY store of a width other than the 4 bytes the
+        // ioeventfd is bound for serves no queue, only the device thread
+        // serves the ioeventfd.
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut mmio = transport(&line);
+        let ram = mmio.ram.clone();
+
+        let mut descriptor = [0u8; 16];
+        descriptor[0..8].copy_from_slice(&BUFFER.to_le_bytes());
+        descriptor[8..12].copy_from_slice(&16u32.to_le_bytes());
+        descriptor[12..14].copy_from_slice(&2u16.to_le_bytes());
+        ram.write(DESC_TABLE, &descriptor).expect("descriptor");
+        ram.write(AVAIL_RING + 4, &0u16.to_le_bytes())
+            .expect("head");
+        ram.write(AVAIL_RING + 2, &1u16.to_le_bytes())
+            .expect("index");
+        set(&mut mmio, QUEUE_SEL, 0);
+        set(&mut mmio, QUEUE_NUM, 8);
+        set(&mut mmio, QUEUE_DESC_LOW, DESC_TABLE as u32);
+        set(&mut mmio, QUEUE_AVAIL_LOW, AVAIL_RING as u32);
+        set(&mut mmio, QUEUE_USED_LOW, USED_RING as u32);
+        set(&mut mmio, QUEUE_READY, 1);
+
+        for width in [1u8, 2, 8] {
+            BusDevice::write(&mut mmio, QUEUE_NOTIFY, width, 0).expect("store");
+        }
+        let mut used = [0u8; 2];
+        ram.read(USED_RING + 2, &mut used).expect("used index");
+        assert_eq!(u16::from_le_bytes(used), 0, "queue was served");
+        assert_eq!(line.raises(), 0, "line was raised");
+
+        // The 4-byte store which the ioeventfd is bound for serves it.
+        set(&mut mmio, QUEUE_NOTIFY, 0);
+        ram.read(USED_RING + 2, &mut used).expect("used index");
+        assert_eq!(u16::from_le_bytes(used), 1);
     }
 
     #[test]
