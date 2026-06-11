@@ -425,6 +425,16 @@ impl Orders {
             standing = self.changed.wait(standing).unwrap();
         }
     }
+
+    /// Wait up to `within` for the stop order. Returns whether it stands.
+    fn wait_for_a_stop_within(&self, within: Duration) -> bool {
+        let standing = self.standing.lock().unwrap();
+        let (standing, _) = self
+            .changed
+            .wait_timeout_while(standing, within, |standing| standing.order != Order::Stop)
+            .unwrap();
+        standing.order == Order::Stop
+    }
 }
 
 /// Outcome of waiting for the threads to park.
@@ -1068,6 +1078,23 @@ impl<H: Hypervisor> Machine<H> {
     pub fn wait(&mut self) -> Result<VmExit> {
         self.state.valid_transition(State::Shutdown)?;
         self.orders.wait_for_a_stop();
+        self.join()
+    }
+
+    /// Wait up to `within` for a thread to finish, then join like `wait`
+    /// does. Returns `None` if none finished in time, the guest keeps
+    /// running and a later `wait`, `stop` or `pause` takes it from there.
+    pub fn wait_timeout(&mut self, within: Duration) -> Result<Option<VmExit>> {
+        self.state.valid_transition(State::Shutdown)?;
+        if !self.orders.wait_for_a_stop_within(within) {
+            return Ok(None);
+        }
+        self.join().map(Some)
+    }
+
+    /// Signal the threads out of `run` and join them, once the stop order
+    /// stands.
+    fn join(&mut self) -> Result<VmExit> {
         self.ask_out()?;
         let mut first = None;
         for thread in self.threads.drain(..) {
@@ -1157,6 +1184,28 @@ mod tests {
         orders.tell(Order::Run);
         told.recv_timeout(Duration::from_secs(5))
             .expect("parked thread did not return in 5 s");
+    }
+
+    #[test]
+    fn test_timed_stop_wait_returns() {
+        let orders = Arc::new(Orders::default());
+        orders.tell(Order::Run);
+        assert!(
+            !orders.wait_for_a_stop_within(Duration::from_millis(20)),
+            "stop reported while none was told"
+        );
+
+        // Order told from another thread ends the wait early.
+        let telling = Arc::clone(&orders);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            telling.tell(Order::Stop);
+        });
+        assert!(
+            orders.wait_for_a_stop_within(Duration::from_secs(5)),
+            "stop told was missed"
+        );
+        assert!(orders.wait_for_a_stop_within(Duration::ZERO));
     }
 
     #[test]
