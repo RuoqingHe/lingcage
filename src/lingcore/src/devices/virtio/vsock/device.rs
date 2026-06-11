@@ -56,6 +56,11 @@ const PATIENCE: Duration = Duration::from_secs(2);
 /// incoming connections wait at the endpoint.
 const CONNECTIONS: usize = 1024;
 
+/// Maximum packets held for the receive ring. At the bound no host end
+/// is read, its bytes wait in the socket, and packet for the guest is
+/// dropped. Guest which offers no buffer gets no more.
+const WAITING: usize = 1024;
+
 /// Open connection with its host stream.
 struct Held {
     connection: Connection,
@@ -75,9 +80,11 @@ pub struct Vsock {
     endpoint: Box<dyn Endpoint>,
     /// Open connections keyed by guest port and host port.
     open: HashMap<(u32, u32), Held>,
-    /// Packets for receive ring, held until the guest offers a buffer. Their
-    /// bytes are already read from the host end.
+    /// Packets for receive ring, held until the guest offers a buffer.
+    /// Their bytes are already read from the host end. At most `WAITING`.
     waiting: Vec<(Header, Vec<u8>)>,
+    /// Packets dropped at the `WAITING` bound, logged on the first one.
+    dropped: u64,
     /// Host port assigned to the last incoming connection.
     last_port: u32,
     /// Transport reset pending for the guest. Each restore sets it, posting
@@ -99,6 +106,7 @@ impl Vsock {
             endpoint,
             open: HashMap::new(),
             waiting: Vec::new(),
+            dropped: 0,
             last_port: 0,
             reset_owed: false,
             #[cfg(target_os = "linux")]
@@ -175,9 +183,23 @@ impl Vsock {
         }
     }
 
-    /// Queue a packet for the receive ring.
+    /// Queue a packet for the receive ring. At `WAITING` held, the packet is
+    /// dropped instead.
     fn owe(&mut self, header: Header, payload: Vec<u8>) {
+        if self.waiting.len() >= WAITING {
+            if self.dropped == 0 {
+                warn!("{WAITING} packets waiting on the guest already, the rest are dropped");
+            }
+            self.dropped += 1;
+            return;
+        }
         self.waiting.push((header, payload));
+    }
+
+    /// Returns whether a host end may be read. Bytes read would wait on the
+    /// guest, and at most `WAITING` packets wait at once.
+    fn takes_more(&self) -> bool {
+        self.waiting.len() < WAITING
     }
 
     /// Signal the kick to wake up the wait of device thread. The write does
@@ -344,6 +366,9 @@ impl Vsock {
     pub fn pump(&mut self) {
         let mut owed = Vec::new();
         for held in self.open.values_mut() {
+            if self.waiting.len() + owed.len() >= WAITING {
+                break;
+            }
             let (connection, stream) = (&mut held.connection, &mut held.stream);
             let room = connection.room().min(PACKET as u32);
             if room == 0 {
@@ -448,7 +473,7 @@ impl Device for Vsock {
                 continue;
             };
             let interest = match (
-                held.connection.room() > 0,
+                held.connection.room() > 0 && self.takes_more(),
                 !held.connection.waiting().is_empty(),
             ) {
                 (true, true) => Interest::Both,
@@ -1271,6 +1296,62 @@ mod tests {
             vsock.waiting.last().map(|(header, _)| header.op),
             Some(Op::Reset),
             "connection not closed by reset"
+        );
+    }
+
+    #[test]
+    fn test_waiting_packets_bound() {
+        // Guest which offers no buffer while sending junk is answered with
+        // `WAITING` resets and no more. The rest are counted.
+        let mut vsock = device(&Landed::default());
+        for _ in 0..WAITING + 5 {
+            vsock.took(&from_guest(Op::Data, 0, WINDOW), &[]);
+        }
+        assert_eq!(vsock.waiting.len(), WAITING, "bound not held");
+        assert_eq!(vsock.dropped, 5, "drops not counted");
+    }
+
+    #[test]
+    fn test_no_host_read_at_packet_bound() {
+        // At the bound, no host end is read, its bytes wait in the socket.
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("take the request");
+        landed.ready.lock().unwrap().extend_from_slice(b"held back");
+        // `Response` on an open connection is answered with a reset each
+        // time, which fills up the bound.
+        while vsock.waiting.len() < WAITING {
+            vsock.took(&from_guest(Op::Response, 0, WINDOW), &[]);
+        }
+
+        vsock.pump();
+        assert_eq!(
+            &*landed.ready.lock().unwrap(),
+            b"held back",
+            "host end read at the bound"
+        );
+
+        // Host end with a descriptor is not waited on for reading either.
+        let stream = paired();
+        let fd = stream.as_raw_fd();
+        vsock.open.insert(
+            (GUEST_PORT + 1, OPEN_PORT),
+            Held {
+                connection: Connection::new(GUEST_CID, &from_guest(Op::Request, 0, WINDOW)),
+                stream: Box::new(stream),
+                since: None,
+                write_shut: false,
+            },
+        );
+        assert!(
+            !vsock
+                .outside()
+                .iter()
+                .any(|(at, interest)| *at == fd && *interest != Interest::Write),
+            "host end waited on for reading at the bound"
         );
     }
 
