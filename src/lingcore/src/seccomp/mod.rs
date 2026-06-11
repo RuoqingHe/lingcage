@@ -168,9 +168,9 @@ impl Thread {
             ])),
             // The ioeventfd is polled and read, the disk is sought, read,
             // written and flushed, the channel accepts incoming connections and
-            // opens, connects, sends on, receives on and closes a host socket
-            // per connection. `ioctl` is for `FIONBIO`, and on riscv64 for
-            // `KVM_IRQ_LINE` which raises the line of a device.
+            // opens, connects, sends on, receives on, shuts and closes a host
+            // socket per connection. `ioctl` is for `FIONBIO`, and on riscv64
+            // for `KVM_IRQ_LINE` which raises the line of a device.
             Thread::Device => Ok(BTreeMap::from([
                 (libc::SYS_accept4, Vec::new()),
                 (libc::SYS_close, Vec::new()),
@@ -182,6 +182,7 @@ impl Thread {
                 (libc::SYS_read, Vec::new()),
                 (libc::SYS_recvfrom, Vec::new()),
                 (libc::SYS_sendto, Vec::new()),
+                (libc::SYS_shutdown, Vec::new()),
                 (
                     libc::SYS_ioctl,
                     vec![

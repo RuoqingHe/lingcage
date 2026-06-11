@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read};
+use std::net::Shutdown;
 use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -62,6 +63,9 @@ struct Held {
     /// Moment the connection was first found waiting on the guest. `None`
     /// while it is not waiting.
     since: Option<Instant>,
+    /// Set once write direction of the stream is shut, after the last bytes
+    /// of the guest are written.
+    write_shut: bool,
 }
 
 /// Vsock device, with context id of the guest, the endpoint its
@@ -132,6 +136,7 @@ impl Vsock {
                     connection,
                     stream,
                     since: None,
+                    write_shut: false,
                 },
             );
             self.owe(asks, Vec::new());
@@ -280,6 +285,7 @@ impl Vsock {
                         connection,
                         stream,
                         since: None,
+                        write_shut: false,
                     },
                 );
                 self.owe(opened, Vec::new());
@@ -290,21 +296,34 @@ impl Vsock {
 
     /// Write waiting bytes of each connection to its host end as far as it
     /// takes them, and queue `CreditUpdate` for bytes written. Host end
-    /// taking zero bytes keeps its connection, failed host end is closed
-    /// with a reset.
+    /// refusing a write receives no more. Once the last bytes of a
+    /// connection are written, shutdown of the guest reaches the host end.
     fn carry(&mut self) {
         let mut gone = Vec::new();
         let mut owed = Vec::new();
         for (ports, held) in &mut self.open {
             let (connection, stream) = (&mut held.connection, &mut held.stream);
             let waiting = connection.waiting();
-            if waiting.is_empty() {
+            if !waiting.is_empty() {
+                match host::write(stream.as_mut(), waiting) {
+                    Ok(0) => {}
+                    Ok(count) => owed.push(connection.forwarded(count)),
+                    Err(_) => owed.push(connection.host_receives_no_more()),
+                }
+            }
+            if !connection.waiting().is_empty() {
                 continue;
             }
-            match host::write(stream.as_mut(), waiting) {
-                Ok(0) => {}
-                Ok(count) => owed.push(connection.forwarded(count)),
-                Err(_) => gone.push(*ports),
+            if connection.guest_sends_no_more() && !held.write_shut {
+                // Host end already gone is told nothing, its next read or
+                // write reports it.
+                let _ = stream.shutdown(Shutdown::Write);
+                held.write_shut = true;
+            }
+            if connection.guest_closed() {
+                gone.push(*ports);
+            } else if let Some(header) = connection.finished() {
+                owed.push(header);
             }
         }
         for ports in gone {
@@ -319,12 +338,12 @@ impl Vsock {
     }
 
     /// Read each host stream up to the credit of its connection and queue
-    /// the bytes for receive ring. Stream at end of stream or failed is
-    /// closed with a reset.
+    /// the bytes for receive ring. Stream at end of stream or failed sends
+    /// no more, the guest is told and the connection stays for bytes the
+    /// guest still sends.
     pub fn pump(&mut self) {
-        let mut gone = Vec::new();
         let mut owed = Vec::new();
-        for (ports, held) in &mut self.open {
+        for held in self.open.values_mut() {
             let (connection, stream) = (&mut held.connection, &mut held.stream);
             let room = connection.room().min(PACKET as u32);
             if room == 0 {
@@ -332,20 +351,14 @@ impl Vsock {
             }
             let mut taken = vec![0u8; room as usize];
             match stream.read(&mut taken) {
-                // Zero means end of stream, host end has closed.
-                Ok(0) => gone.push(*ports),
+                Ok(0) => owed.push((connection.host_sends_no_more(), Vec::new())),
                 Ok(count) => {
                     taken.truncate(count);
                     owed.push((connection.host_sent(count as u32), taken));
                 }
                 // No bytes ready, stream stays open.
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                Err(_) => gone.push(*ports),
-            }
-        }
-        for ports in gone {
-            if let Some(mut held) = self.open.remove(&ports) {
-                owed.push((held.connection.host_done(), Vec::new()));
+                Err(_) => owed.push((connection.host_sends_no_more(), Vec::new())),
             }
         }
         for (header, payload) in owed {
@@ -588,7 +601,7 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::sync::{Arc, Mutex};
 
-    use crate::devices::virtio::vsock::connection::WINDOW;
+    use crate::devices::virtio::vsock::connection::{SHUTDOWN_RECEIVE, SHUTDOWN_SEND, WINDOW};
     use crate::devices::virtio::vsock::device::*;
 
     const GUEST_CID: u64 = 3;
@@ -618,6 +631,8 @@ mod tests {
         ready: Arc<Mutex<Vec<u8>>>,
         /// Set once the far end has closed.
         gone: Arc<Mutex<bool>>,
+        /// Directions shut by the device, in order.
+        shut: Arc<Mutex<Vec<Shutdown>>>,
     }
 
     impl io::Write for Landed {
@@ -636,11 +651,21 @@ mod tests {
         fn descriptor(&self) -> Option<RawFd> {
             None
         }
+
+        fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+            self.shut.lock().unwrap().push(how);
+            Ok(())
+        }
     }
 
     impl Stream for Backed {
         fn descriptor(&self) -> Option<RawFd> {
             None
+        }
+
+        fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+            self.shut.lock().unwrap().push(how);
+            Ok(())
         }
     }
 
@@ -668,6 +693,8 @@ mod tests {
     struct Backed {
         taken: Arc<Mutex<Vec<u8>>>,
         full: Arc<Mutex<bool>>,
+        /// Directions shut by the device, in order.
+        shut: Arc<Mutex<Vec<Shutdown>>>,
     }
 
     impl io::Write for Backed {
@@ -965,6 +992,7 @@ mod tests {
                     connection: Connection::asking(GUEST_CID, port, OPEN_PORT),
                     stream: Box::new(Landed::default()),
                     since: None,
+                    write_shut: false,
                 },
             );
         }
@@ -1030,6 +1058,7 @@ mod tests {
                 connection: Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
                 stream: Box::new(ours),
                 since: None,
+                write_shut: false,
             },
         );
         assert_eq!(
@@ -1069,6 +1098,7 @@ mod tests {
                 connection: Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
                 stream: Box::new(Landed::default()),
                 since: None,
+                write_shut: false,
             },
         );
     }
@@ -1132,18 +1162,116 @@ mod tests {
         assert_eq!(vsock.open.len(), 1);
 
         // Far end closes without any write from the guest, so the read in
-        // `pump` is the only place it shows up.
+        // `pump` is the only place it shows up. Guest is told the host end
+        // sends no more, and connection stays for bytes of the guest.
         *landed.gone.lock().unwrap() = true;
         guest_offers(&ram, 1);
         vsock
             .notify(RX, &mut rx, &ram)
             .expect("read from the host end");
+        let told = guest_given(&ram, 1);
+        assert_eq!(told.op, Op::Shutdown, "no shutdown after end of stream");
+        assert_eq!(told.flags, SHUTDOWN_SEND);
+        assert_eq!(vsock.open.len(), 1, "end of stream closed the connection");
+
+        // Guest still sends. Its bytes reach the host end, and the
+        // `CreditUpdate` for them is taken by the next buffer.
+        guest_sends(&ram, 1, Op::Data, OPEN_PORT, b"last");
+        vsock
+            .notify(TX, &mut tx, &ram)
+            .expect("take the last bytes");
+        assert_eq!(&*landed.taken.lock().unwrap(), b"last");
+        guest_offers(&ram, 2);
+        vsock.notify(RX, &mut rx, &ram).expect("credit the bytes");
+        assert_eq!(guest_given(&ram, 2).op, Op::CreditUpdate);
+
+        // Guest shuts its send direction too. Neither end sends, so both
+        // directions are shut, and reset from the guest drops it.
+        let mut shutdown = from_guest(Op::Shutdown, 0, WINDOW);
+        shutdown.flags = SHUTDOWN_SEND;
+        vsock.took(&shutdown, &[]);
+        vsock.carry();
         assert_eq!(
-            guest_given(&ram, 1).op,
-            Op::Reset,
-            "no reset after host end closed"
+            &*landed.shut.lock().unwrap(),
+            &[Shutdown::Write],
+            "host end not shut for writing"
         );
+        guest_offers(&ram, 3);
+        vsock.notify(RX, &mut rx, &ram).expect("shut both ways");
+        let both = guest_given(&ram, 3);
+        assert_eq!(both.op, Op::Shutdown);
+        assert_eq!(both.flags, SHUTDOWN_RECEIVE | SHUTDOWN_SEND);
+        vsock.took(&from_guest(Op::Reset, 0, WINDOW), &[]);
         assert!(vsock.open.is_empty(), "connection still open");
+    }
+
+    #[test]
+    fn test_last_bytes_before_host_shutdown() {
+        // Last bytes of the guest reach the host end before its shutdown
+        // does, no matter how long the host end takes them.
+        let backed = Backed::default();
+        *backed.full.lock().unwrap() = true;
+        let mut vsock = Vsock::new(GUEST_CID, Box::new(Backs(backed.clone())));
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("take the request");
+        guest_sends(&ram, 1, Op::Data, OPEN_PORT, b"bye");
+        vsock.notify(TX, &mut tx, &ram).expect("take the data");
+        let mut shutdown = from_guest(Op::Shutdown, 0, WINDOW);
+        shutdown.flags = SHUTDOWN_SEND;
+        vsock.took(&shutdown, &[]);
+        vsock.carry();
+        assert!(
+            backed.shut.lock().unwrap().is_empty(),
+            "host end shut with bytes still waiting"
+        );
+        assert_eq!(vsock.open.len(), 1);
+
+        // Host end takes the bytes, shutdown follows them.
+        *backed.full.lock().unwrap() = false;
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("carry the bytes");
+        assert_eq!(&*backed.taken.lock().unwrap(), b"bye");
+        assert_eq!(&*backed.shut.lock().unwrap(), &[Shutdown::Write]);
+        assert_eq!(vsock.open.len(), 1, "half-closed connection dropped");
+    }
+
+    #[test]
+    fn test_reset_after_pending_written() {
+        // Guest which shuts both directions is reset once its bytes are
+        // written, not before.
+        let backed = Backed::default();
+        *backed.full.lock().unwrap() = true;
+        let mut vsock = Vsock::new(GUEST_CID, Box::new(Backs(backed.clone())));
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("take the request");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("answer the request");
+        guest_sends(&ram, 1, Op::Data, OPEN_PORT, b"bye");
+        vsock.notify(TX, &mut tx, &ram).expect("take the data");
+        let mut shutdown = from_guest(Op::Shutdown, 0, WINDOW);
+        shutdown.flags = SHUTDOWN_RECEIVE | SHUTDOWN_SEND;
+        vsock.took(&shutdown, &[]);
+        vsock.carry();
+        assert_eq!(vsock.open.len(), 1, "reset with bytes still waiting");
+        assert!(vsock.waiting.is_empty(), "packet queued before bytes moved");
+
+        *backed.full.lock().unwrap() = false;
+        vsock.carry();
+        assert_eq!(&*backed.taken.lock().unwrap(), b"bye");
+        assert!(vsock.open.is_empty(), "closed connection kept");
+        assert_eq!(
+            vsock.waiting.last().map(|(header, _)| header.op),
+            Some(Op::Reset),
+            "connection not closed by reset"
+        );
     }
 
     #[test]
@@ -1156,6 +1284,7 @@ mod tests {
                     connection: Connection::asking(GUEST_CID, port, OPEN_PORT),
                     stream: Box::new(Landed::default()),
                     since: None,
+                    write_shut: false,
                 },
             );
         }
@@ -1189,6 +1318,7 @@ mod tests {
                 connection: Connection::asking(GUEST_CID, GUEST_PORT, OPEN_PORT),
                 stream: Box::new(landed.clone()),
                 since: None,
+                write_shut: false,
             },
         );
 
@@ -1481,6 +1611,7 @@ mod tests {
                 connection: Connection::asking(GUEST_CID, GUEST_PORT + 1, OPEN_PORT),
                 stream: Box::new(Landed::default()),
                 since: Some(start - PATIENCE / 2),
+                write_shut: false,
             },
         );
         let left = vsock.wake_after().expect("deadline");

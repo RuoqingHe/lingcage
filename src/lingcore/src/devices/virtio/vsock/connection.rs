@@ -14,19 +14,19 @@ use crate::devices::virtio::vsock::packet::{HOST_CID, Header, Op, STREAM};
 /// them, sent to the guest as `buf_alloc`.
 pub const WINDOW: u32 = 64 * 1024;
 
-/// Shutdown directions, `VIRTIO_VSOCK_SHUTDOWN_RCV` and `_SEND`.
-const SHUTDOWN_RECEIVE: u32 = 1;
-const SHUTDOWN_SEND: u32 = 2;
+/// Shutdown directions, `VIRTIO_VSOCK_SHUTDOWN_RCV` and `_SEND`. Sender
+/// receives no more, or sends no more.
+pub const SHUTDOWN_RECEIVE: u32 = 1;
+pub const SHUTDOWN_SEND: u32 = 2;
+const SHUTDOWN_BOTH: u32 = SHUTDOWN_RECEIVE | SHUTDOWN_SEND;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
     /// Requested by this end, no `Response` from the guest yet.
     Asking,
-    /// Open at both ends, data is taken.
+    /// Open at both ends. Data is taken in the directions not shut.
     Open,
-    /// Shut down by the guest in one direction, data is refused.
-    Closing,
-    /// Closed by either end, device drops the connection.
+    /// Closed by either end. Device drops the connection.
     Closed,
 }
 
@@ -53,6 +53,11 @@ pub struct Connection {
     host_port: u32,
     guest_cid: u64,
     stage: Stage,
+    /// Directions shut by the guest, as `SHUTDOWN_*` bits.
+    guest_shut: u32,
+    /// Directions shut by the host end, as `SHUTDOWN_*` bits, each one is
+    /// told to the guest in a `Shutdown`.
+    host_shut: u32,
     /// `buf_alloc` of the guest.
     peer_window: u32,
     /// `fwd_cnt` of the guest.
@@ -75,6 +80,8 @@ impl Connection {
             host_port: asked.dst_port,
             guest_cid,
             stage: Stage::Open,
+            guest_shut: 0,
+            host_shut: 0,
             peer_window: asked.buf_alloc,
             peer_taken: asked.fwd_cnt,
             sent: 0,
@@ -91,6 +98,8 @@ impl Connection {
             host_port,
             guest_cid,
             stage: Stage::Asking,
+            guest_shut: 0,
+            host_shut: 0,
             // `buf_alloc` of the guest arrives with its `Response`, `room`
             // is zero until then.
             peer_window: 0,
@@ -123,9 +132,22 @@ impl Connection {
     }
 
     /// Returns whether the connection is waiting for a packet from the
-    /// guest, either the `Response` to a request or the rest of a shutdown.
+    /// guest, either the `Response` to a request or the `Reset` after a
+    /// `Shutdown` of both directions.
     pub fn waiting_on_guest(&self) -> bool {
-        matches!(self.stage, Stage::Asking | Stage::Closing)
+        self.stage == Stage::Asking || self.host_shut == SHUTDOWN_BOTH
+    }
+
+    /// Returns whether the guest has shut its send direction. No more data
+    /// comes from it, and its waiting bytes are the last ones.
+    pub fn guest_sends_no_more(&self) -> bool {
+        self.guest_shut & SHUTDOWN_SEND != 0
+    }
+
+    /// Returns whether the guest has shut both directions. Device closes
+    /// with a `Reset` once the waiting bytes are written.
+    pub fn guest_closed(&self) -> bool {
+        self.guest_shut == SHUTDOWN_BOTH
     }
 
     /// Returns a header for `op` addressed to the guest, with the credit
@@ -158,18 +180,15 @@ impl Connection {
                 self.stage = Stage::Closed;
                 Answer::Drop
             }
+            // Shutdown itself closes nothing. Bytes sent by the guest before
+            // it still go to the host end, and the other direction stays
+            // open until its own end shuts it.
             Op::Shutdown => {
-                let both = SHUTDOWN_RECEIVE | SHUTDOWN_SEND;
-                if header.flags & both == both {
-                    self.stage = Stage::Closed;
-                    Answer::Reply(self.to_guest(Op::Reset))
-                } else {
-                    self.stage = Stage::Closing;
-                    Answer::Nothing
-                }
+                self.guest_shut |= header.flags & SHUTDOWN_BOTH;
+                Answer::Nothing
             }
             Op::Data => {
-                if self.stage != Stage::Open {
+                if self.stage != Stage::Open || self.guest_sends_no_more() {
                     return Answer::Reply(self.to_guest(Op::Reset));
                 }
                 // Serving the shorter one of `len` and payload would leave the
@@ -215,8 +234,12 @@ impl Connection {
     }
 
     /// Returns bytes the guest can take, which is its `buf_alloc` minus the
-    /// bytes sent past its `fwd_cnt` (`virtio_transport_has_space`).
+    /// bytes sent past its `fwd_cnt` (`virtio_transport_has_space`). Zero
+    /// once the guest receives no more or the host end sends no more.
     pub fn room(&self) -> u32 {
+        if self.guest_shut & SHUTDOWN_RECEIVE != 0 || self.host_shut & SHUTDOWN_SEND != 0 {
+            return 0;
+        }
         self.peer_window
             .saturating_sub(self.sent.wrapping_sub(self.peer_taken))
     }
@@ -230,8 +253,45 @@ impl Connection {
         header
     }
 
-    /// Returns the reset sent when the host end closes, connection is done
-    /// after this.
+    /// Returns the shutdown of send direction of the host end, at its end of
+    /// stream. No more bytes reach the guest, while bytes of the guest still
+    /// reach the host end.
+    pub fn host_sends_no_more(&mut self) -> Header {
+        self.host_shut |= SHUTDOWN_SEND;
+        self.to_guest_shutdown()
+    }
+
+    /// Returns the shutdown of receive direction of the host end, after a
+    /// write to it failed. Waiting bytes are dropped since nothing takes
+    /// them.
+    pub fn host_receives_no_more(&mut self) -> Header {
+        self.host_shut |= SHUTDOWN_RECEIVE;
+        self.pending.clear();
+        self.to_guest_shutdown()
+    }
+
+    /// Returns the shutdown of both directions once neither end sends and
+    /// the waiting bytes are written, only sent once. `Reset` from the guest
+    /// then drops the connection.
+    pub fn finished(&mut self) -> Option<Header> {
+        let neither_sends = self.guest_sends_no_more() && self.host_shut & SHUTDOWN_SEND != 0;
+        if !neither_sends || !self.pending.is_empty() || self.host_shut == SHUTDOWN_BOTH {
+            return None;
+        }
+        self.host_shut = SHUTDOWN_BOTH;
+        Some(self.to_guest_shutdown())
+    }
+
+    /// Returns a `Shutdown` carrying the directions shut by the host end.
+    fn to_guest_shutdown(&self) -> Header {
+        let mut header = self.to_guest(Op::Shutdown);
+        header.flags = self.host_shut;
+        header
+    }
+
+    /// Returns the reset which closes the connection, for a host end which
+    /// refused an incoming connection, a guest which shut both directions,
+    /// or a guest which sends nothing. Connection is done after this.
     pub fn host_done(&mut self) -> Header {
         self.stage = Stage::Closed;
         self.to_guest(Op::Reset)
@@ -356,22 +416,120 @@ mod tests {
     }
 
     #[test]
-    fn test_no_data_after_shutdown() {
+    fn test_no_data_after_send_shutdown() {
         let mut open = opened();
         let mut shutdown = from_guest(Op::Shutdown, 0);
         shutdown.flags = SHUTDOWN_SEND;
         assert_eq!(open.guest_sent(&shutdown, &[]), Answer::Nothing);
+        assert!(open.guest_sends_no_more());
         let answer = open.guest_sent(&from_guest(Op::Data, 2), b"hi");
-        assert_eq!(replied(&answer).op, Op::Reset, "data taken after shutdown");
+        assert_eq!(
+            replied(&answer).op,
+            Op::Reset,
+            "data taken after shutdown of send direction"
+        );
     }
 
     #[test]
-    fn test_done_after_shutdown_both_ways() {
+    fn test_guest_still_sends_after_recv_shutdown() {
+        // Guest which receives no more still sends. Its bytes are taken,
+        // and nothing is sent to it.
         let mut open = opened();
         let mut shutdown = from_guest(Op::Shutdown, 0);
+        shutdown.flags = SHUTDOWN_RECEIVE;
+        assert_eq!(open.guest_sent(&shutdown, &[]), Answer::Nothing);
+        assert_eq!(
+            open.room(),
+            0,
+            "room to send to guest which receives no more"
+        );
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, 2), b"hi"),
+            Answer::Took
+        );
+        assert!(!open.done());
+    }
+
+    #[test]
+    fn test_last_bytes_kept_after_shutdown() {
+        // Guest shutting both directions closes nothing by itself. Bytes
+        // it sent before still go to the host end.
+        let mut open = opened();
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, 3), b"bye"),
+            Answer::Took
+        );
+        let mut shutdown = from_guest(Op::Shutdown, 0);
         shutdown.flags = SHUTDOWN_RECEIVE | SHUTDOWN_SEND;
-        assert_eq!(replied(&open.guest_sent(&shutdown, &[])).op, Op::Reset);
+        assert_eq!(open.guest_sent(&shutdown, &[]), Answer::Nothing);
+        assert!(open.guest_closed());
+        assert!(!open.done(), "closed before the bytes were written");
+        assert_eq!(open.waiting(), b"bye", "last bytes dropped");
+        assert_eq!(open.host_done().op, Op::Reset);
         assert!(open.done());
+    }
+
+    #[test]
+    fn test_host_send_shutdown() {
+        // End of stream on the host end only shuts its send direction.
+        // Guest reads no more but still sends.
+        let mut open = opened();
+        let shutdown = open.host_sends_no_more();
+        assert_eq!(shutdown.op, Op::Shutdown);
+        assert_eq!(shutdown.flags, SHUTDOWN_SEND);
+        assert_eq!(open.room(), 0, "room to send after the end of stream");
+        assert!(!open.done(), "end of stream closed the connection");
+        assert!(!open.waiting_on_guest());
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, 2), b"hi"),
+            Answer::Took
+        );
+    }
+
+    #[test]
+    fn test_finished_shuts_both_ways() {
+        // Once neither end sends and waiting bytes are written, both
+        // directions are shut, only once. `Reset` from the guest then
+        // drops it.
+        let mut open = opened();
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, 2), b"hi"),
+            Answer::Took
+        );
+        open.host_sends_no_more();
+        assert_eq!(open.finished(), None, "finished with bytes waiting");
+        let mut shutdown = from_guest(Op::Shutdown, 0);
+        shutdown.flags = SHUTDOWN_SEND;
+        assert_eq!(open.guest_sent(&shutdown, &[]), Answer::Nothing);
+        assert_eq!(open.finished(), None, "finished with bytes waiting");
+        open.forwarded(2);
+        let both = open.finished().expect("shutdown of both directions");
+        assert_eq!(both.op, Op::Shutdown);
+        assert_eq!(both.flags, SHUTDOWN_RECEIVE | SHUTDOWN_SEND);
+        assert_eq!(open.finished(), None, "shut both ways twice");
+        assert!(open.waiting_on_guest(), "not waiting for reset from guest");
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Reset, 0), &[]),
+            Answer::Drop
+        );
+        assert!(open.done());
+    }
+
+    #[test]
+    fn test_host_recv_shutdown_drops_pending() {
+        // Host end which takes no more bytes has the waiting ones dropped.
+        let mut open = opened();
+        assert_eq!(
+            open.guest_sent(&from_guest(Op::Data, 2), b"hi"),
+            Answer::Took
+        );
+        let shutdown = open.host_receives_no_more();
+        assert_eq!(shutdown.flags, SHUTDOWN_RECEIVE);
+        assert!(
+            open.waiting().is_empty(),
+            "bytes kept with nobody to take them"
+        );
+        assert_eq!(open.room(), WINDOW, "other direction was shut too");
     }
 
     #[test]
@@ -464,7 +622,10 @@ mod tests {
         let mut shutdown = from_guest(Op::Shutdown, 0);
         shutdown.flags = SHUTDOWN_SEND;
         assert_eq!(half.guest_sent(&shutdown, &[]), Answer::Nothing);
-        assert!(half.waiting_on_guest(), "half shutdown is still waiting");
+        assert!(
+            !half.waiting_on_guest(),
+            "half shutdown waits on nothing, other direction is open"
+        );
 
         let mut answered = incoming();
         assert_eq!(

@@ -9,6 +9,7 @@
 //! replies `OK <port>` once the connection is open.
 
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -36,11 +37,20 @@ pub trait Stream: Read + Write + Send {
     /// Returns the descriptor which the connection is carried over. Stream
     /// not carried over a descriptor returns `None`.
     fn descriptor(&self) -> Option<RawFd>;
+
+    /// Shut the stream in one direction or both, like `shutdown(2)` does.
+    /// `Write` is shut once the last bytes of the guest are written, so
+    /// that the host process reads end of stream.
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
 }
 
 impl Stream for UnixStream {
     fn descriptor(&self) -> Option<RawFd> {
         Some(self.as_raw_fd())
+    }
+
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        UnixStream::shutdown(self, how)
     }
 }
 
