@@ -8,5 +8,15 @@ name = "lingcage"
 repository.workspace = true
 version.workspace = true
 
+[dependencies]
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+
+[features]
+default = []
+# Guest protocol, framing and messages, shared by host and guest.
+lcp = ["dep:serde", "dep:serde_json", "dep:thiserror"]
+
 [lints]
 workspace = true
