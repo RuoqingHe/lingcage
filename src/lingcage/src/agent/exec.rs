@@ -3,17 +3,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Running a command in the guest: stream connections opened with
-//! nonce, then fork and exec.
+//! nonce, optional PTY set up, then fork and exec.
 
 #![cfg(target_os = "linux")]
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use crate::lcp::{Exec, ExecFailed, Failure, Stream};
+use crate::lcp::{Exec, ExecFailed, Failure, PtySize, Stream};
 
 /// Errors thrown while starting a command.
 #[derive(Debug)]
@@ -65,6 +66,26 @@ pub struct Child {
     pub kill_at: Option<Instant>,
     /// Set to true once the command is killed by its timeout.
     pub timed_out: bool,
+    /// Terminal side of the command, `None` if it is not run under a PTY.
+    pub pty: Option<Pty>,
+}
+
+/// Agent side of a PTY exec, including the master, the streams and
+/// buffered bytes not yet forwarded.
+pub struct Pty {
+    /// Master side of the terminal, set to `None` once it is finished.
+    pub master: Option<File>,
+    /// Stdin stream of the command, `None` if not given or already ended.
+    pub input: Option<File>,
+    /// Stdout stream of the command, `None` once it fails or is drained.
+    pub output: Option<File>,
+    /// Bytes read from `input` which are not yet written to master.
+    pub in_buf: VecDeque<u8>,
+    /// Bytes read from the master and pending to be written to `output`.
+    pub out_buf: VecDeque<u8>,
+    /// Set once master is no longer served. The fd is closed at reap time,
+    /// since closing it earlier would SIGHUP an exiting session.
+    pub master_done: bool,
 }
 
 /// Connect streams of the command and fork it, parent side is tracked in
@@ -92,20 +113,27 @@ pub fn start(
             open_stream(connect, stream).map_err(|err| SpawnError::connect(stream.port, err))
         })
         .transpose()?;
-    // Use /dev/null as stdin if stdin is not given.
-    let devnull = match &stdin {
-        None => Some(open_devnull().map_err(|err| SpawnError::spawn("/dev/null", err))?),
-        Some(_) => None,
+    let pty = match exec.pty {
+        Some(size) => Some(openpty(size).map_err(|err| SpawnError::spawn("the pty", err))?),
+        None => None,
     };
-    let stdio: [RawFd; 3] = [
-        stdin
-            .as_ref()
-            .or(devnull.as_ref())
-            .expect("stdin or /dev/null")
-            .as_raw_fd(),
-        stdout.as_raw_fd(),
-        stderr.as_raw_fd(),
-    ];
+    // Use /dev/null as stdin if stdin is not given and no PTY is used.
+    let devnull = match (&pty, &stdin) {
+        (None, None) => Some(open_devnull().map_err(|err| SpawnError::spawn("/dev/null", err))?),
+        _ => None,
+    };
+    let stdio: [RawFd; 3] = match &pty {
+        Some((_, slave)) => [slave.as_raw_fd(); 3],
+        None => [
+            stdin
+                .as_ref()
+                .or(devnull.as_ref())
+                .expect("stdin or /dev/null")
+                .as_raw_fd(),
+            stdout.as_raw_fd(),
+            stderr.as_raw_fd(),
+        ],
+    };
     let mut spec = Spec {
         program: cstring(&exec.program, "the program")?,
         args: exec
@@ -129,6 +157,7 @@ pub fn start(
             .map(|cwd| cstring(cwd, "working directory"))
             .transpose()?,
         stdio,
+        controlling: pty.is_some(),
         report: None,
     };
     let (read_fd, write_fd) =
@@ -143,6 +172,34 @@ pub fn start(
         reap_now(pid);
         return Err(SpawnError::Failed(failed));
     }
+    let pty = match pty {
+        Some((master, slave)) => {
+            drop(slave);
+            drop(stderr);
+            let mut pumping = vec![&master, &stdout];
+            if let Some(input) = &stdin {
+                pumping.push(input);
+            }
+            for file in pumping {
+                if let Err(err) = set_nonblocking(file) {
+                    // SAFETY: no pointer is passed to kill, negative pid
+                    // means the process group, and the pid is reaped below.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    reap_now(pid);
+                    return Err(SpawnError::spawn("pump setup", err));
+                }
+            }
+            Some(Pty {
+                master: Some(master),
+                input: stdin,
+                output: Some(stdout),
+                in_buf: VecDeque::new(),
+                out_buf: VecDeque::new(),
+                master_done: false,
+            })
+        }
+        None => None,
+    };
     Ok(Child {
         id,
         pid,
@@ -150,6 +207,7 @@ pub fn start(
             .timeout_ms
             .map(|within| Instant::now() + Duration::from_millis(within)),
         timed_out: false,
+        pty,
     })
 }
 
@@ -161,7 +219,8 @@ struct Spec {
     env: Vec<(CString, CString)>,
     cwd: Option<CString>,
     stdio: [RawFd; 3],
-    /// Write end of the failure pipe, which is closed on successful exec.
+    controlling: bool,
+    /// Write end of failure pipe, which gets closed by a successful exec.
     report: Option<RawFd>,
 }
 
@@ -220,6 +279,12 @@ fn child_main(spec: &Spec, argv: &[*const libc::c_char]) -> ! {
     // SAFETY: setsid has no pointer argument.
     if unsafe { libc::setsid() } == -1 {
         die(spec, &spec.program, "could not start a new session");
+    }
+    if spec.controlling {
+        // SAFETY: fd 0 is the slave side and the child is session leader.
+        if unsafe { libc::ioctl(0, libc::TIOCSCTTY, std::ptr::null::<libc::c_void>()) } == -1 {
+            die(spec, &spec.program, "could not set controlling terminal");
+        }
     }
     if let Some(cwd) = &spec.cwd {
         // SAFETY: `cwd` is a valid C string.
@@ -314,9 +379,61 @@ fn reap_now(pid: libc::pid_t) {
     }
 }
 
+/// Open a (master, slave) terminal pair with given `size`.
+fn openpty(size: PtySize) -> io::Result<(File, File)> {
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: both are valid out-pointers, other arguments accept null.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let winsize = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `slave` is an open terminal and `winsize` is a valid struct.
+    if unsafe { libc::ioctl(slave, libc::TIOCSWINSZ, &winsize) } == -1 {
+        let err = io::Error::last_os_error();
+        // SAFETY: both descriptors are owned here, not yet wrapped in File.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        return Err(err);
+    }
+    // SAFETY: both descriptors are open and owned by this function.
+    Ok(unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) })
+}
+
 /// Open /dev/null, used as stdin if none is given and by helper children.
 fn open_devnull() -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open("/dev/null")
+}
+
+/// Set O_NONBLOCK. The loop polls before touching a pump descriptor.
+fn set_nonblocking(file: &File) -> io::Result<()> {
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is open, F_GETFL needs no third argument.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is open, and the new flags only add O_NONBLOCK.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Convert `text` to C string for exec, a NUL inside is a spawn error.
