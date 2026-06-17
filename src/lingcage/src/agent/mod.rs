@@ -8,6 +8,7 @@
 
 pub mod connect;
 pub mod diag;
+pub mod exec;
 pub mod guest;
 
 /// Start time of the process, `guest::ready` measures `init_ms` from it.
