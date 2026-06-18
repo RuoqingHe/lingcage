@@ -8,6 +8,11 @@ name = "lingcage"
 repository.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "lingcage-agent"
+path = "src/bin/lingcage-agent.rs"
+required-features = ["agent"]
+
 [dependencies]
 libc = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
