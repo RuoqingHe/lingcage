@@ -303,10 +303,78 @@ fn child_main(spec: &Spec, argv: &[*const libc::c_char]) -> ! {
             die(spec, &spec.program, "could not set environment");
         }
     }
+    if let Err(err) = deny_vsock() {
+        let what = format!("could not deny vsock for command: {err}");
+        die(spec, &spec.program, &what);
+    }
     // SAFETY: `argv` is NUL-terminated, its strings are alive during the call.
     unsafe { libc::execvp(spec.program.as_ptr(), argv.as_ptr()) };
     let reason = io::Error::last_os_error().to_string();
     die(spec, &spec.program, &reason);
+}
+
+/// `AUDIT_ARCH_*` of this build, which the filter checks first. It is
+/// composed of ELF machine number plus 64-bit and little-endian bits
+/// according to `include/uapi/linux/audit.h`.
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
+#[cfg(target_arch = "riscv64")]
+const AUDIT_ARCH: u32 = 243 | 0x8000_0000 | 0x4000_0000;
+
+/// Offsets of syscall number, architecture and low word of the first
+/// argument in `struct seccomp_data`.
+const DATA_NR: u32 = 0;
+const DATA_ARCH: u32 = 4;
+const DATA_ARG0: u32 = 16;
+
+/// Keep the command away from vsock. The filter fails
+/// `socket(AF_VSOCK, ..)` with `EAFNOSUPPORT` and is installed under
+/// `no_new_privs`, so the exec and all its children inherit it. Control
+/// port and stream ports are then only accessible to agent.
+fn deny_vsock() -> io::Result<()> {
+    let stmt = |code: u16, k: u32| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k,
+    };
+    let load = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+    let ret = (libc::BPF_RET | libc::BPF_K) as u16;
+    let refused = libc::SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32;
+    let filter = [
+        // Do not interpret syscall numbers of another architecture, kill
+        // the process on mismatch instead.
+        stmt(load, DATA_ARCH),
+        jump(AUDIT_ARCH, 1, 0),
+        stmt(ret, libc::SECCOMP_RET_KILL_PROCESS),
+        stmt(load, DATA_NR),
+        jump(libc::SYS_socket as u32, 0, 3),
+        stmt(load, DATA_ARG0),
+        jump(libc::AF_VSOCK as u32, 0, 1),
+        stmt(ret, refused),
+        stmt(ret, libc::SECCOMP_RET_ALLOW),
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    // SAFETY: setting the flag involves no pointer.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `program` points to `filter`, which lives through the call.
+    if unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Report `what` on fd 2 and errno on the report pipe, then exit the
@@ -454,7 +522,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use crate::agent::exec::{SpawnError, report_pipe, reported, start};
+    use crate::agent::exec::{SpawnError, deny_vsock, report_pipe, reported, start};
     use crate::lcp::{Exec, Failure, Stream};
 
     /// Create stream pairs for given ports. Agent ends are returned via the
@@ -554,6 +622,40 @@ mod tests {
             Err(other) => panic!("expected Other error, got {other:?}"),
             Ok(_) => panic!("command started with unbound stream"),
         }
+    }
+
+    #[test]
+    fn test_deny_vsock() {
+        // The filter refuses a vsock socket and leaves a Unix one alone.
+        // SAFETY: no pointer is passed to fork, and the child does not
+        // allocate before it exits.
+        let pid = unsafe { libc::fork() };
+        assert_ne!(pid, -1, "fork failed");
+        if pid == 0 {
+            let code = match deny_vsock() {
+                Err(_) => 3,
+                // SAFETY: socket needs no pointer, errno is read right after.
+                Ok(()) => unsafe {
+                    let vsock = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
+                    let refused = vsock == -1 && *libc::__errno_location() == libc::EAFNOSUPPORT;
+                    let unix = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                    match (refused, unix != -1) {
+                        (true, true) => 0,
+                        (false, _) => 1,
+                        (true, false) => 2,
+                    }
+                },
+            };
+            // SAFETY: _exit terminates the child process.
+            unsafe { libc::_exit(code) };
+        }
+        let status = reap(pid);
+        assert!(libc::WIFEXITED(status), "child was killed");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "1: vsock was not refused, 2: unix was refused, 3: filter failed"
+        );
     }
 
     #[test]
