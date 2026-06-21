@@ -35,3 +35,7 @@ pub mod mem;
 pub mod seccomp;
 #[cfg(feature = "vcpu")]
 pub mod vcpu;
+
+/// Version of this crate as built by Cargo. A template records the
+/// version which captured it.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
