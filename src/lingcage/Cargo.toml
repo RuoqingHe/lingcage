@@ -15,8 +15,14 @@ required-features = ["agent"]
 
 [dependencies]
 libc = { workspace = true, optional = true }
+lingcore = { path = "../lingcore", features = [
+  "kvm",
+  "machine",
+], optional = true }
+log = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 
 [features]
@@ -26,7 +32,7 @@ lcp = ["dep:serde", "dep:serde_json", "dep:thiserror"]
 # Guest agent, connect, identity, exec. Linux only.
 agent = ["dep:libc", "lcp"]
 # Templates, sealed and verified spawn sources. x86_64 and riscv64 Linux only.
-template = ["dep:thiserror"]
+template = ["dep:libc", "dep:lingcore", "dep:log", "dep:sha2", "lcp"]
 
 [lints]
 workspace = true

@@ -13,12 +13,49 @@ pub enum Error {
     /// Failed to perform host IO operation.
     #[error("host IO operation failed")]
     Io(#[source] std::io::Error),
+    /// Failed calling into `lingcore`.
+    #[error("`lingcore` call failed")]
+    Lingcore(#[source] lingcore::machine::Error),
+    /// Error occurred in guest protocol.
+    #[error("guest protocol failed")]
+    Protocol(#[source] crate::lcp::Error),
+    /// No template registered with given id.
+    #[error("no template named {id}")]
+    TemplateMissing {
+        /// Template id looked up.
+        id: String,
+    },
+    /// Template failed verification at registration time, with the reason
+    /// attached.
+    #[error("template failed verification at registration time: {what}")]
+    TemplateBad {
+        /// Reason of the failure, together with suggested action.
+        what: String,
+    },
+    /// Template is still in use by a live sandbox.
+    #[error("template is in use")]
+    TemplateInUse {
+        /// Id of the template requested for removal.
+        id: String,
+    },
     /// Image contains files not allowed in a template.
     #[error("image contains files not allowed in template: {found:?}")]
     Sanitize {
         /// Paths found which are not allowed in a template.
         found: Vec<String>,
     },
+    /// Requested feature is not implemented in this build.
+    #[error("feature not implemented in this build: {0}")]
+    Unsupported(&'static str),
+    /// Error reported by agent, or a frame received out of sequence.
+    #[error("error reported by agent, or frame out of sequence: {what}")]
+    Agent {
+        /// Report sent by agent.
+        what: String,
+    },
+    /// Operation did not finish before deadline.
+    #[error("operation did not finish before deadline: {0}")]
+    Timeout(&'static str),
 }
 
 /// Result alias for the crate.

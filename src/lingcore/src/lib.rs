@@ -37,5 +37,6 @@ pub mod seccomp;
 pub mod vcpu;
 
 /// Version of this crate as built by Cargo. A template records the
-/// version which captured it.
+/// version which captured it, and is refused at registration by another
+/// version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
