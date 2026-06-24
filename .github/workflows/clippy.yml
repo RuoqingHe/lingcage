@@ -13,4 +13,4 @@ jobs:
           - --target x86_64-unknown-linux-gnu
     uses: ./.github/workflows/per-commit.yml
     with:
-      run: cargo clippy --workspace --all-targets --locked ${{ matrix.platform }} --features lingcage/agent,lingcage/template,lingcore/machine,lingcore/kvm -- -D warnings
+      run: cargo clippy --workspace --all-targets --locked ${{ matrix.platform }} --features lingcage/agent,lingcage/sandbox,lingcore/machine,lingcore/kvm -- -D warnings

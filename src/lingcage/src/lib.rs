@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! VMM built on top of `lingcore`. `lcp` is the guest protocol shared
-//! between host and guest agent, `agent` is the agent itself and
-//! `template` holds the sealed spawn sources. Process model, control API
-//! and policy are placed in this crate.
+//! between host and guest agent, `agent` is the agent itself, `template`
+//! holds the sealed spawn sources and `sandbox` the guests cloned from
+//! them. Process model, control API and policy are placed in this crate.
 
 // Machine layer of `lingcore` only supports Linux on x86_64 and riscv64,
 // modules built on top of it are gated accordingly.
@@ -31,6 +31,12 @@ pub mod error;
 pub mod hv;
 #[cfg(feature = "lcp")]
 pub mod lcp;
+#[cfg(all(
+    feature = "sandbox",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub mod sandbox;
 #[cfg(all(
     feature = "template",
     target_os = "linux",

@@ -33,6 +33,9 @@ lcp = ["dep:serde", "dep:serde_json", "dep:thiserror"]
 agent = ["dep:libc", "lcp"]
 # Templates, sealed and verified spawn sources. x86_64 and riscv64 Linux only.
 template = ["dep:libc", "dep:lingcore", "dep:log", "dep:sha2", "lcp"]
+# Sandboxes, guests cloned from templates in this process. x86_64 and
+# riscv64 Linux only.
+sandbox = ["template"]
 
 [lints]
 workspace = true
