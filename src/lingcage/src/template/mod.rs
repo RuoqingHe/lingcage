@@ -182,7 +182,7 @@ pub struct TemplatePlan {
     pub memory: u64,
     /// Number of vCPUs.
     pub vcpus: u16,
-    /// Device set of the template.
+    /// Device set. `disk` and `network` are rejected at build time.
     pub devices: DeviceSet,
     /// Name to register the template with. Digest is used if not set.
     pub name: Option<String>,

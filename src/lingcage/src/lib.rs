@@ -16,7 +16,19 @@ pub mod agent;
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "riscv64")
 ))]
+mod deadline;
+#[cfg(all(
+    feature = "template",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
 pub mod error;
+#[cfg(all(
+    feature = "template",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+pub mod hv;
 #[cfg(feature = "lcp")]
 pub mod lcp;
 #[cfg(all(
