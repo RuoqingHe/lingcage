@@ -141,10 +141,10 @@ impl<W: Write> Serial<W> {
         self.ask_for_attention(IIR_DATA_READY)
     }
 
-    /// Queue `bytes` for the guest to read from `DATA` and raise the line
-    /// for them. Bytes beyond `INPUT_BOUND` are dropped and the fill is
-    /// logged once, a full queue is not an error.
-    pub fn receive(&mut self, bytes: &[u8]) -> io::Result<()> {
+    /// Queue `bytes` for the guest to read from `DATA`, raise the line for
+    /// them and return the count queued. Bytes beyond `INPUT_BOUND` are
+    /// dropped and the fill is logged once. A full queue is not an error.
+    pub fn receive(&mut self, bytes: &[u8]) -> io::Result<usize> {
         // Room ends the fill, so the next fill logs again.
         if self.input.len() < INPUT_BOUND {
             self.drop_logged = false;
@@ -160,7 +160,8 @@ impl<W: Write> Serial<W> {
             self.drop_logged = true;
         }
         self.input.extend(taken);
-        self.ask_about_input()
+        self.ask_about_input()?;
+        Ok(taken.len())
     }
 
     fn latched(&self) -> bool {
@@ -280,9 +281,9 @@ struct SerialState {
 }
 
 impl<W: Write + Send> crate::devices::Receive for crate::devices::Shared<Serial<W>> {
-    /// Queue `bytes` without waiting for the guest to read them, bytes
-    /// beyond `INPUT_BOUND` are dropped.
-    fn receive(&self, bytes: &[u8]) -> io::Result<()> {
+    /// Queue `bytes` without waiting for the guest to read them. Bytes
+    /// beyond `INPUT_BOUND` are dropped, count queued is returned.
+    fn receive(&self, bytes: &[u8]) -> io::Result<usize> {
         self.with(|uart| uart.receive(bytes))
     }
 }

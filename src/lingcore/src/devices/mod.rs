@@ -111,8 +111,9 @@ pub struct Blob {
 /// Device taking bytes from outside of the guest, console input for
 /// example.
 pub trait Receive: Send + Sync {
-    /// Queue `bytes` for the guest to read.
-    fn receive(&self, bytes: &[u8]) -> io::Result<()>;
+    /// Queue `bytes` for the guest to read, returns the count queued. Count
+    /// less than the length means the queue has no room for the rest.
+    fn receive(&self, bytes: &[u8]) -> io::Result<usize>;
 }
 
 /// Device behind a mutex, which is reached from outside the bus as well
