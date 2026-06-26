@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Read as _;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -36,6 +37,10 @@ const WRITE_WITHIN: Duration = Duration::from_secs(5);
 /// listener does not make the accept thread spin.
 const ACCEPT_AGAIN: Duration = Duration::from_millis(100);
 
+/// Maximum time one accept or read in the log drain blocks before
+/// checking the stop flag again.
+const DRAIN_ROUND: Duration = Duration::from_millis(200);
+
 /// Live connection, holding the stream read by reader thread, the file
 /// frames are written to, and the generation set during handshake.
 struct Link {
@@ -57,16 +62,24 @@ pub struct Demux {
     listener: UnixListener,
     /// Path of control socket, connecting to it wakes up the accept loop.
     at: PathBuf,
+    /// Log port of the agent, drained into host log if one is bound.
+    log_listener: Mutex<Option<UnixListener>>,
     stop: AtomicBool,
     acceptor: Mutex<Option<JoinHandle<()>>>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    drainer: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Demux {
-    /// Create a demux on the control listener bound at `at`. The first
-    /// connection is accepted by `identify_first`, and reconnects by the
-    /// accept loop.
-    pub fn new(listener: UnixListener, at: PathBuf, identity: Identity) -> Demux {
+    /// Create a demux on the control listener bound at `at`. First
+    /// connection is accepted by `identify_first`, reconnects by the accept
+    /// loop, and log connections are accepted on `log_listener`.
+    pub fn new(
+        listener: UnixListener,
+        at: PathBuf,
+        identity: Identity,
+        log_listener: Option<UnixListener>,
+    ) -> Demux {
         Demux {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(FIRST_ID),
@@ -74,9 +87,11 @@ impl Demux {
             identity,
             listener,
             at,
+            log_listener: Mutex::new(log_listener),
             stop: AtomicBool::new(false),
             acceptor: Mutex::new(None),
             reader: Mutex::new(None),
+            drainer: Mutex::new(None),
         }
     }
 
@@ -172,9 +187,9 @@ impl Demux {
         }
     }
 
-    /// Accept the first connection and run the handshake as generation 1,
-    /// then start the accept loop for reconnects. Returns the hostname
-    /// reported in IDENTIFIED frame.
+    /// Accept the first connection and run handshake as generation 1, then
+    /// spawn accept loop for reconnects and log drain thread. Returns the
+    /// hostname read back from guest.
     pub fn identify_first(self: &Arc<Self>, deadline: Instant) -> Result<String> {
         let stream = accept_within(&self.listener, deadline, "incoming connection from agent")?;
         let hostname = identify(&stream, &self.identity, 1, deadline)?;
@@ -184,6 +199,12 @@ impl Demux {
             move || demux.accept_loop()
         });
         *self.acceptor.lock().unwrap() = Some(accept_loop);
+        if let Some(log_listener) = self.log_listener.lock().unwrap().take() {
+            let demux = Arc::clone(self);
+            *self.drainer.lock().unwrap() = Some(std::thread::spawn(move || {
+                drain_logs(&demux, &log_listener)
+            }));
+        }
         Ok(hostname)
     }
 
@@ -292,6 +313,11 @@ impl Demux {
     /// Stop the threads and close remaining answer channels.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(drainer) = self.drainer.lock().unwrap().take()
+            && drainer.join().is_err()
+        {
+            log::warn!("log drainer panicked");
+        }
         // Connect to our own socket to wake up the accept loop.
         if let Err(err) = UnixStream::connect(&self.at) {
             log::debug!("wakeup connect failed: {err}");
@@ -313,6 +339,60 @@ impl Demux {
         }
         self.pending.lock().unwrap().clear();
     }
+}
+
+/// Accept log connections until `stop` is set, one connection at a
+/// time. Each line received is written to host log at debug level.
+fn drain_logs(demux: &Demux, listener: &UnixListener) {
+    while !demux.stop.load(Ordering::SeqCst) {
+        let Ok(conn) = accept_within(
+            listener,
+            Instant::now() + DRAIN_ROUND,
+            "log connection from agent",
+        ) else {
+            continue;
+        };
+        drain_log_conn(demux, conn);
+    }
+}
+
+/// Drain one log connection into host log at debug level, line by line,
+/// and check `stop` flag at least once per `DRAIN_ROUND`.
+fn drain_log_conn(demux: &Demux, mut conn: UnixStream) {
+    let mut text = String::new();
+    let mut buf = [0u8; 4096];
+    while !demux.stop.load(Ordering::SeqCst) {
+        if !readable_within(&conn, DRAIN_ROUND) {
+            continue;
+        }
+        match conn.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                text.push_str(&String::from_utf8_lossy(&buf[..n]));
+                while let Some((line, rest)) = text.split_once('\n') {
+                    log::debug!(target: "agent", "{line}");
+                    text = rest.to_string();
+                }
+            }
+        }
+    }
+    if !text.is_empty() {
+        log::debug!(target: "agent", "{text}");
+    }
+}
+
+/// Poll `fd` for input, waiting at most `within`. Returns `false` on
+/// timeout or error.
+fn readable_within(fd: &impl AsRawFd, within: Duration) -> bool {
+    let mut polled = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(within.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: `polled` is a valid pollfd and stays alive during the call.
+    let ready = unsafe { libc::poll(&mut polled, 1, ms) };
+    ready > 0 && polled.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
 }
 
 /// Accept one connection on `listener`, returns `Error::Timeout` if
@@ -448,7 +528,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create test dir");
         let at = dir.join("vs_1");
         let listener = UnixListener::bind(&at).expect("bind control socket");
-        (Arc::new(Demux::new(listener, at, identity())), dir)
+        (Arc::new(Demux::new(listener, at, identity(), None)), dir)
     }
 
     /// READY frame of an agent with protocol version `protocol`.
