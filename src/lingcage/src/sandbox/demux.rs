@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -22,10 +23,18 @@ use crate::sandbox::{Identity, draw};
 /// First request id. Host side uses odd ids, incremented by 2.
 const FIRST_ID: u32 = 1;
 
+/// Maximum time for the handshake of a reconnect. The first connection
+/// uses the deadline given by caller instead.
+const RECONNECT_WITHIN: Duration = Duration::from_secs(5);
+
 /// Maximum time a frame write may take. The write holds the connection
 /// lock, without this timeout a guest which stops reading would block
 /// other callers indefinitely.
 const WRITE_WITHIN: Duration = Duration::from_secs(5);
+
+/// Time to sleep after a failed accept, so that a permanently broken
+/// listener does not make the accept thread spin.
+const ACCEPT_AGAIN: Duration = Duration::from_millis(100);
 
 /// Live connection, holding the stream read by reader thread, the file
 /// frames are written to, and the generation set during handshake.
@@ -46,21 +55,27 @@ pub struct Demux {
     /// Identity sent to guest on each connection.
     identity: Identity,
     listener: UnixListener,
+    /// Path of control socket, connecting to it wakes up the accept loop.
+    at: PathBuf,
     stop: AtomicBool,
+    acceptor: Mutex<Option<JoinHandle<()>>>,
     reader: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Demux {
-    /// Create a demux on the control listener. First connection is accepted
-    /// by `identify_first`.
-    pub fn new(listener: UnixListener, identity: Identity) -> Demux {
+    /// Create a demux on the control listener bound at `at`. The first
+    /// connection is accepted by `identify_first`, and reconnects by the
+    /// accept loop.
+    pub fn new(listener: UnixListener, at: PathBuf, identity: Identity) -> Demux {
         Demux {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(FIRST_ID),
             link: Mutex::new(None),
             identity,
             listener,
+            at,
             stop: AtomicBool::new(false),
+            acceptor: Mutex::new(None),
             reader: Mutex::new(None),
         }
     }
@@ -68,6 +83,16 @@ impl Demux {
     /// Allocate a new request id.
     fn next(&self) -> u32 {
         self.next_id.fetch_add(2, Ordering::Relaxed)
+    }
+
+    /// Returns the generation number for the next connection.
+    fn generation(&self) -> u64 {
+        self.link
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|link| link.generation + 1)
+            .unwrap_or(1)
     }
 
     /// Send `frame` with a new id, returns the id and the answer channel.
@@ -147,12 +172,18 @@ impl Demux {
         }
     }
 
-    /// Accept the first connection and run the handshake as generation 1.
-    /// Returns hostname from IDENTIFIED frame of guest.
+    /// Accept the first connection and run the handshake as generation 1,
+    /// then start the accept loop for reconnects. Returns the hostname
+    /// reported in IDENTIFIED frame.
     pub fn identify_first(self: &Arc<Self>, deadline: Instant) -> Result<String> {
         let stream = accept_within(&self.listener, deadline, "incoming connection from agent")?;
         let hostname = identify(&stream, &self.identity, 1, deadline)?;
         self.install(stream, 1)?;
+        let accept_loop = std::thread::spawn({
+            let demux = Arc::clone(self);
+            move || demux.accept_loop()
+        });
+        *self.acceptor.lock().unwrap() = Some(accept_loop);
         Ok(hostname)
     }
 
@@ -192,6 +223,44 @@ impl Demux {
         Ok(())
     }
 
+    /// Accept reconnects until stopped. A connection which passes the
+    /// handshake replaces the live one, otherwise it is dropped and the live
+    /// one is kept.
+    fn accept_loop(self: &Arc<Self>) {
+        loop {
+            if self.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            let (stream, _) = match self.listener.accept() {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    log::warn!("control listener failed to accept: {err}");
+                    std::thread::sleep(ACCEPT_AGAIN);
+                    continue;
+                }
+            };
+            if self.stop.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Err(err) = self.adopt(stream) {
+                log::warn!("reconnect refused: {err}");
+            }
+        }
+    }
+
+    /// Run the handshake on a reconnect, then install the connection.
+    fn adopt(self: &Arc<Self>, stream: UnixStream) -> Result<()> {
+        let generation = self.generation();
+        let hostname = identify(
+            &stream,
+            &self.identity,
+            generation,
+            Instant::now() + RECONNECT_WITHIN,
+        )?;
+        log::debug!("{hostname} reconnected, connection generation {generation}");
+        self.install(stream, generation)
+    }
+
     /// Route incoming frames until the connection ends, then close answer
     /// channels of requests made on this connection.
     fn read_loop(&self, stream: &UnixStream, generation: u64) {
@@ -223,6 +292,15 @@ impl Demux {
     /// Stop the threads and close remaining answer channels.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Connect to our own socket to wake up the accept loop.
+        if let Err(err) = UnixStream::connect(&self.at) {
+            log::debug!("wakeup connect failed: {err}");
+        }
+        if let Some(acceptor) = self.acceptor.lock().unwrap().take()
+            && acceptor.join().is_err()
+        {
+            log::warn!("accept thread panicked");
+        }
         if let Some(link) = self.link.lock().unwrap().take()
             && let Err(err) = link.stream.shutdown(std::net::Shutdown::Both)
         {
@@ -344,7 +422,6 @@ fn identify(
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
-    use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
 
     use crate::sandbox::demux::*;
@@ -371,7 +448,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create test dir");
         let at = dir.join("vs_1");
         let listener = UnixListener::bind(&at).expect("bind control socket");
-        (Arc::new(Demux::new(listener, identity())), dir)
+        (Arc::new(Demux::new(listener, at, identity())), dir)
     }
 
     /// READY frame of an agent with protocol version `protocol`.
@@ -389,6 +466,28 @@ mod tests {
             },
         )
         .expect("build ready frame")
+    }
+
+    /// Act as agent, send READY on `stream` and reply to the IDENTIFY.
+    fn play_agent(stream: &mut UnixStream, generation: u64) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        ready(lcp::PROTOCOL).write_to(stream).expect("send ready");
+        let answer = lcp::Frame::read_from(stream).expect("read identify");
+        let told: lcp::Identify = answer.payload().expect("decode identify");
+        assert_eq!(told.generation, generation);
+        lcp::Frame::with_payload(
+            7,
+            lcp::kind::IDENTIFIED,
+            0,
+            &lcp::Identified {
+                hostname: "test".to_string(),
+            },
+        )
+        .expect("build identified frame")
+        .write_to(stream)
+        .expect("send identified");
     }
 
     #[test]
@@ -427,6 +526,48 @@ mod tests {
             .expect("receive first answer");
         assert_eq!(second.payload, b"second");
         assert_eq!(first.payload, b"first");
+
+        demux.stop();
+        std::fs::remove_dir_all(&dir).expect("remove test dir");
+    }
+
+    #[test]
+    fn test_reconnect_fails_pending_requests() {
+        // Requests pending on old connection fail after reconnect.
+        let (demux, dir) = demux("reconnect");
+        let (old_ours, _old_theirs) = UnixStream::pair().expect("socket pair");
+        demux
+            .install(old_ours, 1)
+            .expect("install first connection");
+        let (_id, waiting) = demux
+            .request(lcp::Frame::new(0, lcp::kind::PING, Vec::new()))
+            .expect("send request on first connection");
+
+        let (new_ours, mut new_theirs) = UnixStream::pair().expect("second pair");
+        let connecting = Arc::clone(&demux);
+        let reconnect = std::thread::spawn(move || connecting.adopt(new_ours));
+        play_agent(&mut new_theirs, 2);
+        reconnect
+            .join()
+            .expect("join reconnect thread")
+            .expect("adopt reconnect");
+
+        assert!(
+            waiting.recv_timeout(Duration::from_secs(5)).is_err(),
+            "request on replaced connection left hanging"
+        );
+
+        // New requests should be sent over the new connection.
+        let (id, rx) = demux
+            .request(lcp::Frame::new(0, lcp::kind::PING, Vec::new()))
+            .expect("send request on new connection");
+        let sent = lcp::Frame::read_from(&mut new_theirs).expect("read request");
+        assert_eq!(sent.id, id);
+        lcp::Frame::new(id, lcp::kind::PONG, Vec::new())
+            .write_to(&mut new_theirs)
+            .expect("answer on new connection");
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("receive answer on new connection");
 
         demux.stop();
         std::fs::remove_dir_all(&dir).expect("remove test dir");
