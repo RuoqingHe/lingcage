@@ -7,6 +7,8 @@
 
 pub mod console;
 pub mod demux;
+pub mod exec;
+pub mod spec;
 
 use std::io::Read as _;
 
