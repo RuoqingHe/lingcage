@@ -73,6 +73,14 @@ pub enum Error {
         /// Shape used when the template was baked.
         shape: String,
     },
+    /// Command could not start, according to `execve` result from the agent.
+    #[error("the command could not start: {reason:?}, errno {errno}")]
+    ExecFailed {
+        /// Failure reason mapped from the errno.
+        reason: crate::lcp::Failure,
+        /// Errno of the step which failed.
+        errno: i32,
+    },
 }
 
 /// Result alias for the crate.

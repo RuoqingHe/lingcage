@@ -4,7 +4,7 @@
 
 //! Sandbox in this process, a guest cloned from template and driven
 //! through its control connection, with console attached. [`Starting`]
-//! and [`Sandbox`] are separate types, only the latter drives a guest.
+//! and [`Sandbox`] are separate types, only the latter runs commands.
 //! Teardown consumes the sandbox, `shutdown` and `kill` take `self` and
 //! dropping a sandbox tears it down as `kill` does.
 
@@ -15,9 +15,10 @@ pub mod spec;
 
 use std::fs::File;
 use std::io::Read as _;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use lingcore::hv::backend::kvm::hypervisor::KvmHv;
@@ -29,7 +30,8 @@ use crate::error::{Error, Result};
 use crate::hv::Hv;
 use crate::lcp;
 use crate::sandbox::console::{Console, Sink};
-use crate::sandbox::demux::Demux;
+use crate::sandbox::demux::{Demux, accept_within};
+use crate::sandbox::exec::{Command, ExitWatch, Process};
 use crate::sandbox::spec::{Limits, SandboxSpec};
 use crate::template::Template;
 
@@ -38,6 +40,15 @@ const CONTROL_PORT: u32 = 1;
 
 /// Host port the agent connects to for log connection.
 const LOG_PORT: u32 = 2;
+
+/// Lowest host port assigned to a stream, ports below are fixed.
+const FIRST_STREAM_PORT: u32 = 1024;
+
+/// Number of tries to draw a free stream port before `exec` fails.
+const PORT_DRAWS: u32 = 8;
+
+/// Maximum time `exec` waits for the start report and stream connections.
+const EXEC_WITHIN: Duration = Duration::from_secs(10);
 
 /// Maximum time `ping` waits for the reply.
 const PING_WITHIN: Duration = Duration::from_secs(5);
@@ -190,6 +201,67 @@ impl Sandbox {
         self.inner.console.clone()
     }
 
+    /// Run a command. Its three streams are separate connections, each of
+    /// them is opened by the guest with the nonce given in the request.
+    pub fn exec(&self, command: Command) -> Result<Process> {
+        let prefix = &self.inner.vsock_prefix;
+        let stdin = bind_stream(prefix)?;
+        let stdout = bind_stream(prefix)?;
+        let stderr = bind_stream(prefix)?;
+        let timeout = command.timeout;
+        let exec = lcp::Exec {
+            program: command.program,
+            args: command.args,
+            env: command.env,
+            cwd: command.cwd,
+            user: command.user,
+            pty: command.pty,
+            timeout_ms: timeout.map(|within| u64::try_from(within.as_millis()).unwrap_or(u64::MAX)),
+            stdin: Some(stdin.stream),
+            stdout: stdout.stream,
+            stderr: stderr.stream,
+        };
+        let frame = lcp::Frame::with_payload(0, lcp::kind::EXEC, lcp::flags::SESSION_START, &exec)
+            .map_err(Error::Protocol)?;
+        let started = Instant::now();
+        let deadline = started + EXEC_WITHIN;
+        let demux = &self.inner.demux;
+        let (id, watch) = demux.request(frame)?;
+        let pid = match read_started(&watch, deadline) {
+            Ok(pid) => pid,
+            Err(err) => {
+                // Missing start report does not mean the command is not
+                // running, kill it anyway to cover both cases.
+                kill_command(demux, id);
+                return Err(err);
+            }
+        };
+        let accepted = accept_stream(&stdin, deadline).and_then(|stdin| {
+            Ok((
+                stdin,
+                accept_stream(&stdout, deadline)?,
+                accept_stream(&stderr, deadline)?,
+            ))
+        });
+        match accepted {
+            Ok((stdin, stdout, stderr)) => Ok(Process {
+                stdin: Some(stdin),
+                stdout: Some(stdout),
+                stderr: Some(stderr),
+                pid,
+                exit: watch,
+                demux: Arc::clone(demux),
+                id,
+            }),
+            Err(err) => {
+                // Command is already running in the guest but the host side
+                // of its streams is not connected, kill it.
+                kill_command(demux, id);
+                Err(err)
+            }
+        }
+    }
+
     /// Round-trip a nonce through the agent and return the time it took. A
     /// wedged guest which holds the connection open without replying costs
     /// `PING_WITHIN`, detecting such guest is the purpose of this call.
@@ -255,6 +327,8 @@ struct Inner {
     demux: Arc<Demux>,
     console: Console,
     run_dir: PathBuf,
+    /// Socket prefix of the channel, socket of a port is `<prefix>_<port>`.
+    vsock_prefix: PathBuf,
     /// Set by teardown, which holds the lock till it finishes, so that a
     /// second caller waits for the first one to complete.
     torn: Mutex<bool>,
@@ -373,9 +447,138 @@ fn assemble(
             demux,
             console,
             run_dir,
+            vsock_prefix,
             torn: Mutex::new(false),
         },
     })
+}
+
+/// Kill the command of `id` and remove its request from demux, used by
+/// paths which give up on a command possibly still running in the guest.
+fn kill_command(demux: &Demux, id: u32) {
+    let kill = lcp::Frame::with_payload(
+        id,
+        lcp::kind::EXEC_SIGNAL,
+        0,
+        &lcp::Signal {
+            signal: libc::SIGKILL,
+        },
+    )
+    .map_err(Error::Protocol)
+    .and_then(|frame| demux.tell(frame));
+    if let Err(err) = kill {
+        log::warn!("failed to send kill for abandoned command: {err}");
+    }
+    demux.complete(id);
+}
+
+/// Read start report of a command from `watch` before `deadline`. Returns
+/// pid of the command, or the failure reported by agent.
+fn read_started(watch: &ExitWatch, deadline: Instant) -> Result<u32> {
+    let frame = watch
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|err| match err {
+            mpsc::RecvTimeoutError::Timeout => Error::Timeout("command start report"),
+            mpsc::RecvTimeoutError::Disconnected => Error::Protocol(lcp::Error::Truncated),
+        })?;
+    match frame.kind {
+        lcp::kind::EXEC_STARTED => {
+            let started: lcp::ExecStarted = frame.payload().map_err(Error::Protocol)?;
+            Ok(started.pid)
+        }
+        lcp::kind::EXEC_FAILED => {
+            let failed: lcp::ExecFailed = frame.payload().map_err(Error::Protocol)?;
+            Err(Error::ExecFailed {
+                reason: failed.reason,
+                errno: failed.errno,
+            })
+        }
+        lcp::kind::ERROR => {
+            let report: lcp::ErrorPayload = frame.payload().map_err(Error::Protocol)?;
+            Err(Error::Agent {
+                what: format!("{}: {}", report.code, report.message),
+            })
+        }
+        other => Err(Error::Agent {
+            what: format!("unexpected reply of kind {other} to command"),
+        }),
+    }
+}
+
+/// Stream port bound to a single command, its socket file is unlinked
+/// on drop.
+struct Bound {
+    stream: lcp::Stream,
+    listener: UnixListener,
+    path: PathBuf,
+}
+
+impl Drop for Bound {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            log::warn!("failed to remove {}: {err}", self.path.display());
+        }
+    }
+}
+
+/// Bind a listener on a randomly picked stream port, and generate the
+/// nonce for the guest to open the connection with.
+fn bind_stream(prefix: &Path) -> Result<Bound> {
+    for _ in 0..PORT_DRAWS {
+        let mut bytes = [0u8; 12];
+        draw(&mut bytes)?;
+        let (port, nonce) = bytes.split_at(4);
+        let port = FIRST_STREAM_PORT
+            + u32::from_be_bytes(port.try_into().expect("four bytes"))
+                % (u32::MAX - FIRST_STREAM_PORT);
+        let path = at(prefix, port);
+        match UnixListener::bind(&path) {
+            Ok(listener) => {
+                return Ok(Bound {
+                    stream: lcp::Stream {
+                        port,
+                        nonce: u64::from_be_bytes(nonce.try_into().expect("eight bytes")),
+                    },
+                    listener,
+                    path,
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(err) => return Err(Error::Io(err)),
+        }
+    }
+    Err(Error::Io(std::io::Error::from(
+        std::io::ErrorKind::AddrInUse,
+    )))
+}
+
+/// Accept the guest's connection on `bound` before `deadline`. Only the
+/// connection which sends the correct nonce is returned as the stream,
+/// others are closed.
+fn accept_stream(bound: &Bound, deadline: Instant) -> Result<File> {
+    loop {
+        let conn = accept_within(&bound.listener, deadline, "incoming stream connection")?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Error::Timeout("a stream's nonce"));
+        }
+        conn.set_read_timeout(Some(left)).map_err(Error::Io)?;
+        let mut nonce = [0u8; lcp::NONCE];
+        match (&conn).read_exact(&mut nonce) {
+            Ok(()) if u64::from_be_bytes(nonce) == bound.stream.nonce => {
+                conn.set_read_timeout(None).map_err(Error::Io)?;
+                return Ok(File::from(OwnedFd::from(conn)));
+            }
+            Ok(()) => log::warn!(
+                "connection on port {} sent unexpected nonce, closed",
+                bound.stream.port
+            ),
+            Err(err) => log::warn!(
+                "connection on port {} closed before sending nonce: {err}",
+                bound.stream.port
+            ),
+        }
+    }
 }
 
 /// Fill `bytes` with random data read from `/dev/urandom`.
@@ -450,6 +653,22 @@ mod tests {
         spec.labels
             .insert("hostname".to_string(), "worker".to_string());
         assert_eq!(hostname_of(&spec, &id), "worker");
+    }
+
+    #[test]
+    fn test_stream_port_bind_unlink() {
+        // Stream port is above fixed ports and unlinked on drop.
+        let dir = std::env::temp_dir().join(format!("lingcage-bind-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let prefix = dir.join("vs");
+        let bound = bind_stream(&prefix).expect("bind stream port");
+        assert!(bound.stream.port >= FIRST_STREAM_PORT);
+        let path = bound.path.clone();
+        assert_eq!(path, at(&prefix, bound.stream.port));
+        assert!(path.exists(), "socket not present on disk");
+        drop(bound);
+        assert!(!path.exists(), "socket not removed after drop");
+        std::fs::remove_dir_all(&dir).expect("remove test dir");
     }
 
     #[test]
