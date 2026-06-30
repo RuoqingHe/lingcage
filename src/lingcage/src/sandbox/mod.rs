@@ -18,7 +18,7 @@ use std::io::Read as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use lingcore::hv::backend::kvm::hypervisor::KvmHv;
@@ -296,8 +296,13 @@ impl Sandbox {
     /// so `within` the given time, then tear down. This consumes the
     /// sandbox, sockets are unlinked and run directory is removed.
     pub fn shutdown(self, within: Duration) -> Result<Exit> {
-        // If the request failed to be sent, the guest can not power off, the
-        // wait below then runs out the deadline and the forced stop follows.
+        if *self.inner.torn.lock().unwrap() {
+            return Ok(Exit::Killed {
+                after: Duration::ZERO,
+            });
+        }
+        // If shutdown request is not sent, the guest would not power off
+        // and the wait below just times out, then the guest gets stopped.
         if let Err(err) = self
             .inner
             .demux
@@ -316,6 +321,31 @@ impl Sandbox {
         Ok(Exit::Killed {
             after: Duration::ZERO,
         })
+    }
+
+    /// Returns a handle to stop the sandbox from another thread.
+    pub fn stopper(&self) -> Stopper {
+        Stopper {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+}
+
+/// Handle to stop a sandbox from another thread, which has the same effect
+/// as `kill` but leaves the sandbox itself to its owner.
+#[derive(Clone)]
+pub struct Stopper {
+    inner: Weak<Inner>,
+}
+
+impl Stopper {
+    /// Stop the guest and tear down as `Sandbox::kill` does. No-op if the
+    /// sandbox is already dropped.
+    pub fn kill(&self) -> Result<()> {
+        match self.inner.upgrade() {
+            Some(inner) => inner.teardown(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -632,6 +662,12 @@ mod tests {
         check::<Sandbox>();
         check::<Starting>();
         check::<Console>();
+    }
+
+    #[test]
+    fn test_stopper_noop_after_sandbox_gone() {
+        let stopper = Stopper { inner: Weak::new() };
+        stopper.kill().expect("kill on stopper of gone sandbox");
     }
 
     #[test]

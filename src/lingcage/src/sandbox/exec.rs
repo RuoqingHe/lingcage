@@ -139,8 +139,8 @@ impl Process {
     ///
     /// There is no deadline for this wait since the command's own timeout
     /// bounds it. If the agent stops responding, this thread is held until
-    /// the sandbox is ended from another thread. Use `wait_timeout` to wait
-    /// with a deadline.
+    /// `Stopper::kill` is called on another thread to end the sandbox. Use
+    /// `wait_timeout` to wait with a deadline.
     pub fn wait(mut self) -> Result<ExitStatus> {
         let status = self.wait_until(None)?;
         Ok(status.expect("wait without deadline ends with a status"))
