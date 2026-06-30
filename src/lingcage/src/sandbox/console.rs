@@ -72,8 +72,9 @@ impl Console {
 }
 
 /// Console output of the machine, which is written into the ring and
-/// the taps. Default is an empty ring with no taps.
-#[derive(Default)]
+/// the taps. Default is an empty ring with no taps, a clone writes to
+/// the same ring.
+#[derive(Clone, Default)]
 pub struct Sink {
     shared: Arc<Shared>,
 }

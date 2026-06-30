@@ -56,6 +56,23 @@ pub enum Error {
     /// Operation did not finish before deadline.
     #[error("operation did not finish before deadline: {0}")]
     Timeout(&'static str),
+    /// Guest did not become ready in time, console tail attached.
+    #[error("guest not ready in time, console tail: {console_tail}")]
+    NotReady {
+        /// Last bytes of guest console output.
+        console_tail: String,
+        /// Handshake error which caused the failure.
+        #[source]
+        source: Box<Error>,
+    },
+    /// Requested limits do not match the shape of the template.
+    #[error("limits {asked} do not match template shape {shape}")]
+    Shape {
+        /// Limits specified in the spec.
+        asked: String,
+        /// Shape used when the template was baked.
+        shape: String,
+    },
 }
 
 /// Result alias for the crate.

@@ -217,6 +217,7 @@ pub struct Template {
     pub(crate) ram: std::fs::File,
     /// State document, parsed at first clone and cached afterwards.
     pub(crate) state: std::sync::OnceLock<Snapshot>,
+    pub(crate) run_root: PathBuf,
 }
 
 impl Template {
@@ -258,6 +259,12 @@ impl Template {
     pub fn kernel_path(&self) -> PathBuf {
         self.dir.join("kernel.img")
     }
+
+    /// Returns runtime directory of the store, which holds run directory of
+    /// each sandbox cloned from this template.
+    pub fn run_root(&self) -> &Path {
+        &self.run_root
+    }
 }
 
 /// Root directory which holds templates and the runtime directory.
@@ -266,7 +273,7 @@ pub struct TemplateStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::template::*;
 
     /// Build a meta with a stamp accepted by current build.
