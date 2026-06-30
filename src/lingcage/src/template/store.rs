@@ -314,8 +314,8 @@ impl TemplateStore {
             dir,
             meta,
             ram,
-            state: std::sync::OnceLock::new(),
             run_root: self.run_dir(),
+            state: std::sync::OnceLock::new(),
         })
     }
 

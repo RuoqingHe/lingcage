@@ -359,8 +359,12 @@ struct Inner {
     run_dir: PathBuf,
     /// Socket prefix of the channel, socket of a port is `<prefix>_<port>`.
     vsock_prefix: PathBuf,
-    /// Set by teardown, which holds the lock till it finishes, so that a
-    /// second caller waits for the first one to complete.
+    /// Dup of the template's RAM image. Shared flock on it prevents the
+    /// store from removing the template while the sandbox is using it,
+    /// until teardown.
+    image: Mutex<Option<File>>,
+    /// Set by teardown, the lock is held for the entire teardown so that a
+    /// second caller would wait for the first one to finish.
     torn: Mutex<bool>,
 }
 
@@ -402,6 +406,7 @@ impl Inner {
         .map_err(Error::Lingcore);
         self.demux.stop();
         let removed = std::fs::remove_dir_all(&self.run_dir).map_err(Error::Io);
+        drop(self.image.lock().unwrap().take());
         let done = stopped.and(removed);
         *torn = done.is_ok();
         done
@@ -444,6 +449,7 @@ fn assemble(
         confine: Some(Refusal::Trap),
     };
     let sink = Sink::default();
+    let image = template.ram().try_clone().map_err(Error::Io)?;
     let mut machine = Machine::cloned(hv.core(), &config, sink.clone(), template.ram())
         .map_err(Error::Lingcore)?;
     // State document is read through a buffer, since JSON reader reads one
@@ -478,6 +484,7 @@ fn assemble(
             console,
             run_dir,
             vsock_prefix,
+            image: Mutex::new(Some(image)),
             torn: Mutex::new(false),
         },
     })

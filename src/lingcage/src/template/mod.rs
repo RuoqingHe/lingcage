@@ -215,9 +215,9 @@ pub struct Template {
     pub(crate) dir: PathBuf,
     pub(crate) meta: TemplateMeta,
     pub(crate) ram: std::fs::File,
+    pub(crate) run_root: PathBuf,
     /// State document, parsed at first clone and cached afterwards.
     pub(crate) state: std::sync::OnceLock<Snapshot>,
-    pub(crate) run_root: PathBuf,
 }
 
 impl Template {
