@@ -18,8 +18,11 @@ pub(crate) fn next_cid() -> u64 {
 pub struct Hv(lingcore::hv::backend::kvm::hypervisor::KvmHv);
 
 impl Hv {
-    /// Open the hypervisor of this host.
+    /// Open the hypervisor of this host. On glibc host, heap trimming of
+    /// the process is disabled, since the trim path opens a `/proc` file
+    /// and that syscall is outside the allowlists of confined threads.
     pub fn open() -> Result<Self> {
+        keep_heap();
         let hv = lingcore::hv::backend::kvm::hypervisor::KvmHv::new()
             .map_err(lingcore::machine::Error::from)
             .map_err(crate::error::Error::Lingcore)?;
@@ -31,3 +34,14 @@ impl Hv {
         &self.0
     }
 }
+
+/// Disable malloc trim, since heap of a VMM is not returned page by page
+/// anyway.
+#[cfg(target_env = "gnu")]
+fn keep_heap() {
+    // SAFETY: no pointer is passed to `mallopt`, only integer arguments.
+    unsafe { libc::mallopt(libc::M_TRIM_THRESHOLD, -1) };
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn keep_heap() {}

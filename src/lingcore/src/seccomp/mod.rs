@@ -6,7 +6,12 @@
 //!
 //! Filter is installed from inside a thread and stays until the thread
 //! exits. It only bounds syscalls of that thread, descriptors and memory
-//! still belong to the process.
+//! still belong to the process. On a glibc host, the trim path of
+//! malloc reads `/proc/sys/vm/overcommit_memory`, and a confined thread
+//! is not allowed to `openat`. `Refusal::Trap` ends the process for it.
+//! An embedder on glibc should disable trimming
+//! (`mallopt(M_TRIM_THRESHOLD, -1)`) or accept `Refusal::Errno`, since
+//! under it malloc treats the read as absent.
 
 use std::collections::BTreeMap;
 
