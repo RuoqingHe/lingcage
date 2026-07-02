@@ -22,8 +22,14 @@ There are two crates in this repository:
   - per-thread seccomp filters
   - `Machine`, which assembles them into one guest, started, paused, captured and cloned
 
-- **lingcage** is the VMM on top of it, with process model, jailer and command line. Not implemented
-  yet, coming soon.
+- **lingcage** is the VMM on top of it:
+
+  - templates captured from booted guest
+  - sandboxes cloned from them in calling process
+  - guest agent which host runs commands through
+  - `lingcage` command line
+
+  Process model and jailer are next.
 
 ## Getting started
 
@@ -115,6 +121,73 @@ them, and neither reports an error.
   the machine.
 - `wait` joins the threads and returns exit reason of the first vCPU thread joined.
 
+### Using lingcage
+
+`lingcage` runs a command in a guest cloned from a template, which is a captured boot of a kernel
+and a guest image carrying `lingcage-agent`. Build the image first, then build the front end:
+
+```console
+cargo build --release -p lingcage --features cli --bin lingcage
+```
+
+`lingcage check` lists host prerequisites, `template build` boots the guest once and registers the
+capture, and `run` clones it, runs the command and exits with status of the command:
+
+```console
+$ lingcage check --kernel bzImage
+$ lingcage template build --kernel bzImage --initrd initramfs.cpio.gz --memory 256M --vcpus 1 \
+      --name base
+$ lingcage run --template base -- sh -c 'echo hello from $(hostname)'
+```
+
+Store defaults to `/var/lib/lingcage`, use `--store DIR` or `LINGCAGE_STORE` for another one.
+
+Exit codes follow convention of shell:
+
+- 126, command is not executable.
+- 127, command not found.
+- 137, command killed by timeout.
+- 1, usage error.
+- 2, operational failure.
+
+To do the same from a Rust program, enable the `sandbox` feature:
+
+```toml
+[dependencies]
+lingcage = { version = "0.1", features = ["sandbox"] }
+```
+
+```rust
+use std::io::Write as _;
+use std::time::Duration;
+
+use lingcage::hv::Hv;
+use lingcage::sandbox::Sandbox;
+use lingcage::sandbox::exec::Command;
+use lingcage::sandbox::spec::SandboxSpec;
+use lingcage::template::TemplateStore;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let hv = Hv::open()?;
+    let store = TemplateStore::open("/var/lib/lingcage")?;
+    let template = store.get(&"base".into())?;
+    let spec = SandboxSpec::for_template(&template);
+    // A started sandbox runs no command until its agent has connected.
+    let sandbox = Sandbox::start(&hv, &template, &spec)?.ready(Duration::from_secs(5))?;
+
+    let mut process = sandbox.exec(Command::new("sh").args(["-c", "read line; echo got $line"]))?;
+    // The stream closes with the handle, and the command reads EOF.
+    process.stdin.take().expect("a stdin stream").write_all(b"hello\n")?;
+    let output = process.wait_with_output()?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+
+    // The guest is asked to power off, and stopped after five seconds if it has not.
+    let exit = sandbox.shutdown(Duration::from_secs(5))?;
+    println!("{exit:?}");
+    Ok(())
+}
+```
+
 ## Objectives
 
 Generic VMM is not a goal. Firmware boot, Windows guests, device hotplug and PCI are out of scope.
@@ -124,16 +197,21 @@ of `lingcage`, not `lingcore`.
 ## Building and testing
 
 ```console
-cargo build --workspace --all-targets
-cargo test --workspace --all-features
+features=lingcage/agent,lingcage/cli,lingcore/machine,lingcore/kvm
+cargo build --workspace --all-targets --features $features
+cargo test --workspace --features $features
 ```
 
-Unit tests under `hv`, `boot` and `machine` open `/dev/kvm` and run guest code, so a KVM host is
-needed. `cargo check --target aarch64-unknown-linux-gnu` and `--target x86_64-apple-darwin` make
-sure the `cfg` gates are correct. Only x86_64 and riscv64 Linux build the `machine` feature.
+`--all-features` is not used anywhere. Unit tests under `hv`, `boot` and `machine` of `lingcore` and
+under `sandbox` of `lingcage` open `/dev/kvm` and run guest code, so a KVM host is needed.
+`cargo check --target aarch64-unknown-linux-gnu` and `--target x86_64-apple-darwin` make sure the
+`cfg` gates are correct. Only x86_64 and riscv64 Linux build the `machine` feature and parts of
+`lingcage` on top of it.
 
 ## Status
 
 `lingcore` boots a Linux guest with the devices above, captures and clones it. KVM is the only
 backend, `x86_64` boots a bzImage with ACPI tables and `riscv64` boots an Image with device tree.
-`lingcage` is coming soon.
+`lingcage` builds a template from a kernel and a guest image, clones it into a sandbox, runs
+commands through its agent over vsock and powers the guest off. `lingcage run` is the front end.
+Isolation, storage and networking are next milestones.
