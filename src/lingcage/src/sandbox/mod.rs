@@ -353,7 +353,9 @@ impl Stopper {
 struct Inner {
     id: SandboxId,
     identity: Identity,
-    machine: Mutex<Machine<KvmHv>>,
+    /// The guest machine. Teardown drops it together with its RAM and the
+    /// device ends of the streams.
+    machine: Mutex<Option<Machine<KvmHv>>>,
     demux: Arc<Demux>,
     console: Console,
     run_dir: PathBuf,
@@ -372,7 +374,12 @@ impl Inner {
     /// Wait at most `within` for a vCPU to leave `run`, stop the guest if
     /// none did, and return the corresponding `Exit`.
     fn await_exit(&self, within: Duration) -> Result<Exit> {
-        let mut machine = self.machine.lock().unwrap();
+        let mut guard = self.machine.lock().unwrap();
+        let Some(machine) = guard.as_mut() else {
+            return Ok(Exit::Killed {
+                after: Duration::ZERO,
+            });
+        };
         match machine.wait_timeout(within).map_err(Error::Lingcore)? {
             Some(VmExit::Shutdown) => Ok(Exit::PoweredOff),
             Some(VmExit::Reboot) => Ok(Exit::Rebooted),
@@ -395,13 +402,11 @@ impl Inner {
         if *torn {
             return Ok(());
         }
-        let stopped = {
-            let mut machine = self.machine.lock().unwrap();
-            if matches!(machine.state(), State::Running | State::Paused) {
+        let stopped = match self.machine.lock().unwrap().take() {
+            Some(mut machine) if matches!(machine.state(), State::Running | State::Paused) => {
                 machine.stop().and_then(|()| machine.wait().map(drop))
-            } else {
-                Ok(())
             }
+            _ => Ok(()),
         }
         .map_err(Error::Lingcore);
         self.demux.stop();
@@ -479,7 +484,7 @@ fn assemble(
         inner: Inner {
             id,
             identity,
-            machine: Mutex::new(machine),
+            machine: Mutex::new(Some(machine)),
             demux,
             console,
             run_dir,

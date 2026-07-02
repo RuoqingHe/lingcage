@@ -11,15 +11,26 @@
     any(target_arch = "x86_64", target_arch = "riscv64")
 ))]
 mod imp {
+    use std::io::Write;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicI32, Ordering};
     use std::time::{Duration, SystemTime};
 
+    use lingcage::hv::Hv;
+    use lingcage::lcp::Failure;
+    use lingcage::sandbox::exec::{Command, ExitStatus};
+    use lingcage::sandbox::spec::SandboxSpec;
+    use lingcage::sandbox::{Exit, Sandbox, Stopper};
     use lingcage::template::{
         DeviceSet, Digest, TemplateId, TemplateMeta, TemplatePlan, TemplateStore,
     };
 
     /// Store root used when neither `--store` nor `LINGCAGE_STORE` is set.
     const DEFAULT_STORE: &str = "/var/lib/lingcage";
+
+    /// Maximum time `run` waits for the sandbox to power off after the
+    /// command exits.
+    const SHUTDOWN_WITHIN: Duration = Duration::from_secs(5);
 
     /// Maximum size of socket address path in bytes, NUL included.
     const SUN_PATH: usize = 108;
@@ -59,11 +70,16 @@ mod imp {
     }
 
     impl CliError {
-        /// Returns exit code of the error: 1 for usage error, 2 for other
-        /// failures.
+        /// Returns exit code of the error: 1 for usage error, 127 for command
+        /// not found, 126 for command not executable, 2 for other failures.
         fn code(&self) -> i32 {
             match self {
                 CliError::Usage { .. } => 1,
+                CliError::Engine(lingcage::Error::ExecFailed { reason, .. }) => match reason {
+                    Failure::NotFound => 127,
+                    Failure::Permission | Failure::Format => 126,
+                    Failure::Other => 2,
+                },
                 _ => 2,
             }
         }
@@ -192,6 +208,34 @@ mod imp {
             run: template_rm,
         },
         Verb {
+            words: "run",
+            args: "-- CMD ARGS...",
+            about: "run command in a fresh sandbox, exit with its status",
+            flags: &[
+                Flag {
+                    name: "template",
+                    value: "ID",
+                    required: true,
+                    help: "template id or alias to clone",
+                },
+                Flag {
+                    name: "timeout",
+                    value: "SECS",
+                    required: false,
+                    help: "timeout of the command in seconds",
+                },
+                Flag {
+                    name: "ready-timeout",
+                    value: "DUR",
+                    required: false,
+                    help: "readiness deadline of the sandbox; bare seconds or an s/m/h suffix \
+                           (default 5s)",
+                },
+                STORE,
+            ],
+            run: run_verb,
+        },
+        Verb {
             words: "check",
             args: "",
             about: "check host prerequisites, one per line",
@@ -261,7 +305,11 @@ mod imp {
         }
         out.push_str("\n`lingcage <verb> --help` prints flags of a specific verb.\n");
         out.push_str(
-            "\nexit codes:\n  0    success\n  1    usage\n  2    an operational failure\n",
+            "\nexit codes:\n  0    success; for run, the command's own status\n  \
+             1    usage\n  2    an operational failure\n  \
+             126  the command is not executable\n  127  the command is not found\n  \
+             137  the command was killed by its timeout\n  \
+             128+N  the command died of signal N\n",
         );
         out
     }
@@ -629,6 +677,161 @@ mod imp {
         Ok(0)
     }
 
+    /// `run` runs a command in a fresh sandbox and exits with the command's
+    /// exit code. Local stdin is copied to the command and closed on EOF.
+    /// SIGTERM, SIGINT or SIGHUP would tear down the sandbox.
+    fn run_verb(verb: &Verb, parsed: &Parsed) -> Result<i32> {
+        let Some(program) = parsed.positional.first() else {
+            return Err(usage_err(verb, "command after -- is required".to_string()));
+        };
+        let mut command =
+            Command::new(program.as_str()).args(parsed.positional[1..].iter().map(String::as_str));
+        if let Some(secs) = parsed.value("timeout") {
+            let secs = secs.parse::<u64>().map_err(|_| {
+                usage_err(verb, format!("invalid timeout {secs}, use bare seconds"))
+            })?;
+            command = command.timeout(Duration::from_secs(secs));
+        }
+        let within = match parsed.value("ready-timeout") {
+            Some(text) => parse_duration(text).map_err(|what| usage_err(verb, what))?,
+            None => Duration::from_secs(5),
+        };
+        let store = open_store(&store_root(parsed))?;
+        let template = store.get(&TemplateId::from(
+            parsed.value("template").expect("required flag"),
+        ))?;
+        let spec = SandboxSpec::for_template(&template);
+        let hv = Hv::open()?;
+        let sandbox = Sandbox::start(&hv, &template, &spec)?.ready(within)?;
+        arm_signals(sandbox.stopper())?;
+        // A signal arriving here tears down the sandbox under exec, the exec
+        // error is then caused by teardown, not by the command. Report the
+        // signal in that case.
+        let mut process = match sandbox.exec(command) {
+            Ok(process) => process,
+            Err(err) => return signalled().ok_or(err.into()),
+        };
+        if let Some(mut stdin) = process.stdin.take() {
+            // Copier thread ends on EOF of local stdin or when the command
+            // exits, a terminal kept open only ends with the process.
+            std::thread::spawn(move || std::io::copy(&mut std::io::stdin().lock(), &mut stdin));
+        }
+        let mut stdout = process.stdout.take();
+        let mut stderr = process.stderr.take();
+        // Failure to write local output is reported, exit code of the command
+        // is still returned, since a broken pipe is normal for `| head`.
+        let copied = std::thread::scope(|scope| {
+            let err = scope.spawn(move || copy_out(stderr.as_mut(), &mut std::io::stderr()));
+            let out = copy_out(stdout.as_mut(), &mut std::io::stdout());
+            out.and(err.join().expect("stderr copier panicked"))
+        });
+        if let Err(err) = copied {
+            eprintln!("lingcage: failed to copy command output: {err}");
+        }
+        let status = process.wait();
+        if let Some(code) = signalled() {
+            // Teardown on the signal thread may still be running, `kill`
+            // here waits for it to complete.
+            sandbox.kill()?;
+            return Ok(code);
+        }
+        let code = match status? {
+            ExitStatus::Exited(code) => code,
+            ExitStatus::Signalled(signal) => 128 + signal,
+            ExitStatus::TimedOut => 137,
+        };
+        match sandbox.shutdown(SHUTDOWN_WITHIN)? {
+            Exit::PoweredOff => {}
+            other => eprintln!("lingcage: sandbox did not power off: {}", exit_line(&other)),
+        }
+        Ok(code)
+    }
+
+    /// Copy an output stream of the command to local stdout or stderr until
+    /// EOF.
+    fn copy_out(from: Option<&mut std::fs::File>, to: &mut impl Write) -> Result<()> {
+        if let Some(from) = from {
+            std::io::copy(from, to)?;
+        }
+        Ok(())
+    }
+
+    /// Write end of the pipe for signal handler to report signals, -1 until
+    /// armed.
+    static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+    /// Signal which tore down the sandbox, 0 if no signal is received yet.
+    static SIGNALLED: AtomicI32 = AtomicI32::new(0);
+
+    /// Set up handlers for SIGTERM, SIGINT and SIGHUP. Handler writes the
+    /// signal number to a pipe, and a thread reading the pipe kills the
+    /// sandbox through `stopper`.
+    fn arm_signals(stopper: Stopper) -> Result<()> {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a valid array of two file descriptors.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let (reader, writer) = (fds[0], fds[1]);
+        SIGNAL_PIPE.store(writer, Ordering::SeqCst);
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            // SAFETY: a zeroed sigaction is a valid empty sigaction.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
+            // SAFETY: `action` is properly initialized with a valid handler.
+            if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } == -1 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                // SAFETY: `byte` is a valid one-byte buffer.
+                let read = unsafe { libc::read(reader, byte.as_mut_ptr().cast(), 1) };
+                if read == 1 {
+                    break;
+                }
+                // Read is interrupted if a handler runs on this thread. Other
+                // results mean the pipe is gone, exit the thread accordingly.
+                if read == 0 || std::io::Error::last_os_error().kind() != interrupted() {
+                    return;
+                }
+            }
+            SIGNALLED.store(i32::from(byte[0]), Ordering::SeqCst);
+            if let Err(err) = stopper.kill() {
+                eprintln!(
+                    "lingcage: failed to tear down sandbox on signal {}: {err}",
+                    byte[0]
+                );
+            }
+        });
+        Ok(())
+    }
+
+    /// Helper to get `ErrorKind` of an interrupted syscall.
+    fn interrupted() -> std::io::ErrorKind {
+        std::io::ErrorKind::Interrupted
+    }
+
+    /// Returns exit code for the signal which tore down the sandbox, if any.
+    /// The code is 128 plus signal number, same as shell does.
+    fn signalled() -> Option<i32> {
+        match SIGNALLED.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(128 + signal),
+        }
+    }
+
+    extern "C" fn on_signal(signal: libc::c_int) {
+        let fd = SIGNAL_PIPE.load(Ordering::SeqCst);
+        if fd < 0 {
+            return;
+        }
+        let byte = [u8::try_from(signal).unwrap_or(0)];
+        // SAFETY: `byte` is one valid byte, write is async-signal-safe.
+        unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+    }
+
     /// `check` checks host prerequisites and prints one line for each,
     /// exits with 2 at the first failure.
     fn check_verb(verb: &Verb, parsed: &Parsed) -> Result<i32> {
@@ -712,6 +915,16 @@ mod imp {
             return plain;
         }
         root.join("templates").join("aliases").join(id)
+    }
+
+    /// Returns a human readable line for given sandbox exit.
+    fn exit_line(exit: &Exit) -> String {
+        match exit {
+            Exit::PoweredOff => "powered off".to_string(),
+            Exit::Rebooted => "rebooted".to_string(),
+            Exit::Killed { after } => format!("killed after {} s", after.as_secs()),
+            Exit::Failed { what } => format!("failed: {what}"),
+        }
     }
 
     /// Print ok line for a passed check, otherwise fail the verb with the
@@ -812,7 +1025,7 @@ mod imp {
         use std::time::Duration;
 
         use crate::imp::{
-            VERBS, Verb, check_socket_room, cli_help, find_verb, parse, parse_duration,
+            CliError, VERBS, Verb, check_socket_room, cli_help, find_verb, parse, parse_duration,
             parse_memory, verb_help,
         };
 
@@ -839,10 +1052,32 @@ mod imp {
         }
 
         #[test]
+        fn test_dispatch_run_and_check() {
+            let args = strings(&["run", "--template", "x", "--", "true"]);
+            let (verb, _) = find_verb(&args).expect("dispatch");
+            assert_eq!(verb.words, "run");
+            let args = strings(&["check"]);
+            let (verb, _) = find_verb(&args).expect("dispatch");
+            assert_eq!(verb.words, "check");
+        }
+
+        #[test]
         fn test_reject_unknown_verb() {
             assert!(find_verb(&strings(&["frob"])).is_none());
             assert!(find_verb(&strings(&["template"])).is_none());
             assert!(find_verb(&strings(&["template", "frob"])).is_none());
+        }
+
+        #[test]
+        fn test_double_dash_ends_flag_parsing() {
+            let parsed = parse(
+                verb("run"),
+                &strings(&["--template", "x", "--", "echo", "--format", "json"]),
+            )
+            .expect("parse");
+            assert_eq!(parsed.positional, strings(&["echo", "--format", "json"]));
+            assert_eq!(parsed.value("format"), None);
+            assert_eq!(parsed.value("template"), Some("x"));
         }
 
         #[test]
@@ -916,6 +1151,25 @@ mod imp {
         }
 
         #[test]
+        fn test_reject_format_on_other_verbs() {
+            for words in ["template verify", "template rm", "run", "check"] {
+                let err =
+                    parse(verb(words), &strings(&["--format", "json"])).expect_err("a usage error");
+                assert!(
+                    format!("{err}").contains("unknown flag --format"),
+                    "{words}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_inline_flag_value() {
+            let parsed =
+                parse(verb("run"), &strings(&["--template=x", "--", "true"])).expect("parse");
+            assert_eq!(parsed.value("template"), Some("x"));
+        }
+
+        #[test]
         fn test_cli_help_lists_verbs_and_exit_codes() {
             let help = cli_help();
             for verb in VERBS {
@@ -939,6 +1193,18 @@ mod imp {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn test_exec_failure_exit_codes() {
+            // Exec failures map to shell exit codes 127, 126 and 2.
+            let failed =
+                |reason| CliError::Engine(lingcage::Error::ExecFailed { reason, errno: 0 });
+            assert_eq!(failed(lingcage::lcp::Failure::NotFound).code(), 127);
+            assert_eq!(failed(lingcage::lcp::Failure::Permission).code(), 126);
+            assert_eq!(failed(lingcage::lcp::Failure::Format).code(), 126);
+            assert_eq!(failed(lingcage::lcp::Failure::Other).code(), 2);
+            assert_eq!(CliError::Check("x".to_string()).code(), 2);
         }
 
         #[test]
