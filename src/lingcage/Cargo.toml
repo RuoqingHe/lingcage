@@ -9,6 +9,11 @@ repository.workspace = true
 version.workspace = true
 
 [[bin]]
+name = "lingcage"
+path = "src/bin/lingcage.rs"
+required-features = ["cli"]
+
+[[bin]]
 name = "lingcage-agent"
 path = "src/bin/lingcage-agent.rs"
 required-features = ["agent"]
@@ -36,6 +41,8 @@ template = ["dep:libc", "dep:lingcore", "dep:log", "dep:sha2", "lcp"]
 # Sandboxes, guests cloned from templates in this process. x86_64 and
 # riscv64 Linux only.
 sandbox = ["template"]
+# Operator front end, the `lingcage` binary.
+cli = ["sandbox"]
 
 [lints]
 workspace = true

@@ -13,4 +13,4 @@ jobs:
           - --target x86_64-unknown-linux-gnu
     uses: ./.github/workflows/per-commit.yml
     with:
-      run: RUSTFLAGS='-D warnings' cargo build --workspace --all-targets --locked ${{ matrix.platform }} --features lingcage/agent,lingcage/sandbox,lingcore/machine,lingcore/kvm
+      run: RUSTFLAGS='-D warnings' cargo build --workspace --all-targets --locked ${{ matrix.platform }} --features lingcage/agent,lingcage/cli,lingcore/machine,lingcore/kvm
