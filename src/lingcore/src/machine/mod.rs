@@ -665,6 +665,14 @@ impl<H: Hypervisor> Machine<H> {
         })
     }
 
+    /// Returns whether a page of the RAM image mapped by a clone went
+    /// missing, which happens when the image is truncated. The guest runs
+    /// on over a zero page, so the owner stops it and reports the loss.
+    #[cfg(target_os = "linux")]
+    pub fn faulted(&self) -> bool {
+        self.ram.faulted()
+    }
+
     /// Returns current state of the guest.
     pub fn state(&self) -> State {
         self.state

@@ -12,6 +12,11 @@
 //! An embedder on glibc should disable trimming
 //! (`mallopt(M_TRIM_THRESHOLD, -1)`) or accept `Refusal::Errno`, since
 //! under it malloc treats the read as absent.
+//!
+//! The `SIGBUS` handler of a file-backed guest mapping also runs on
+//! these threads. It calls `mmap` and returns, both are on each list
+//! below, so a page truncated out of a RAM image is repaired under the
+//! allowlist instead of refused by it.
 
 use std::collections::BTreeMap;
 

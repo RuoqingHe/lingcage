@@ -58,6 +58,9 @@ pub enum Error {
 /// Result alias for guest RAM.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[cfg(target_os = "linux")]
+mod fault;
+
 /// One region of guest RAM, the guest physical range and the host
 /// virtual address behind it, the arguments taken by
 /// `VmMemory::mem_map`.
@@ -77,6 +80,10 @@ pub struct Region {
 pub struct GuestRam {
     /// Shared with each vCPU thread. Unmapped when the last clone drops.
     inner: Arc<GuestMemoryMmap>,
+    /// Watch taken by a file-backed mapping, so that a page truncated out of
+    /// the image becomes a marked fault instead of a dead process.
+    #[cfg(target_os = "linux")]
+    watched: Option<Arc<fault::Watched>>,
 }
 
 impl GuestRam {
@@ -99,6 +106,8 @@ impl GuestRam {
         })?;
         Ok(GuestRam {
             inner: Arc::new(inner),
+            #[cfg(target_os = "linux")]
+            watched: None,
         })
     }
 
@@ -140,9 +149,24 @@ impl GuestRam {
             GuestRegionCollectionError::MemoryRegionOverlap => Error::Overlap,
             _ => Error::Take,
         })?;
+        let inner = Arc::new(inner);
+        let watched = fault::Watched::of(
+            inner
+                .iter()
+                .map(|region| (region.as_ptr() as usize, region.len() as usize)),
+        );
         Ok(GuestRam {
-            inner: Arc::new(inner),
+            inner,
+            watched: Some(Arc::new(watched)),
         })
+    }
+
+    /// Returns whether a page of the RAM image went missing under the
+    /// mapping. Handler put a zero page in its place, so the guest runs on
+    /// over memory it no longer owns and the caller should end it.
+    #[cfg(target_os = "linux")]
+    pub fn faulted(&self) -> bool {
+        self.watched.as_ref().is_some_and(|watched| watched.hit())
     }
 
     /// Returns the regions in ascending address order.
