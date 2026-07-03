@@ -73,6 +73,9 @@ pub enum Error {
         /// Shape used when the template was baked.
         shape: String,
     },
+    /// RAM image lost pages while sandbox is running.
+    #[error("RAM image lost pages while sandbox is running")]
+    Image,
     /// Command could not start, according to `execve` result from the agent.
     #[error("the command could not start: {reason:?}, errno {errno}")]
     ExecFailed {

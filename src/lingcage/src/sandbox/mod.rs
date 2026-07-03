@@ -121,6 +121,12 @@ impl Starting {
                     inner: Arc::new(self.inner),
                 })
             }
+            Err(_) if self.inner.faulted() => {
+                if let Err(err) = self.inner.teardown() {
+                    log::warn!("teardown of guest with lost image failed: {err}");
+                }
+                Err(Error::Image)
+            }
             Err(source) => {
                 let console_tail = self.inner.console.tail(CONSOLE_TAIL);
                 if let Err(err) = self.inner.teardown() {
@@ -187,6 +193,26 @@ impl Sandbox {
         }
     }
 
+    /// Returns `Error::Image` if a page of the RAM image is lost under the
+    /// guest, which happens with a truncated image. The guest reads zeros
+    /// for its memory in that case, caller should end the sandbox on this.
+    fn sound(&self) -> Result<()> {
+        if self.inner.faulted() {
+            return Err(Error::Image);
+        }
+        Ok(())
+    }
+
+    /// Returns `Error::Image` in place of `err` if the RAM image is lost,
+    /// since a command not started on a guest reading zeros for its memory
+    /// has only one reason worth reporting.
+    fn blame(&self, err: Error) -> Error {
+        match self.sound() {
+            Err(image) => image,
+            Ok(()) => err,
+        }
+    }
+
     pub fn id(&self) -> &SandboxId {
         &self.inner.id
     }
@@ -204,6 +230,7 @@ impl Sandbox {
     /// Run a command. Its three streams are separate connections, each of
     /// them is opened by the guest with the nonce given in the request.
     pub fn exec(&self, command: Command) -> Result<Process> {
+        self.sound()?;
         let prefix = &self.inner.vsock_prefix;
         let stdin = bind_stream(prefix)?;
         let stdout = bind_stream(prefix)?;
@@ -233,7 +260,7 @@ impl Sandbox {
                 // Missing start report does not mean the command is not
                 // running, kill it anyway to cover both cases.
                 kill_command(demux, id);
-                return Err(err);
+                return Err(self.blame(err));
             }
         };
         let accepted = accept_stream(&stdin, deadline).and_then(|stdin| {
@@ -266,6 +293,7 @@ impl Sandbox {
     /// wedged guest which holds the connection open without replying costs
     /// `PING_WITHIN`, detecting such guest is the purpose of this call.
     pub fn ping(&self) -> Result<Duration> {
+        self.sound()?;
         let mut nonce = [0u8; 8];
         draw(&mut nonce)?;
         let nonce = u64::from_be_bytes(nonce);
@@ -277,7 +305,11 @@ impl Sandbox {
         )
         .map_err(Error::Protocol)?;
         let start = Instant::now();
-        let answer = self.inner.demux.ask(frame, PING_WITHIN)?;
+        let answer = self
+            .inner
+            .demux
+            .ask(frame, PING_WITHIN)
+            .map_err(|err| self.blame(err))?;
         if answer.kind != lcp::kind::PONG {
             return Err(Error::Agent {
                 what: format!("unexpected reply of kind {} to ping", answer.kind),
@@ -371,6 +403,15 @@ struct Inner {
 }
 
 impl Inner {
+    /// Returns whether a page of the RAM image mapped by the guest is lost.
+    fn faulted(&self) -> bool {
+        self.machine
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|machine| machine.faulted())
+    }
+
     /// Wait at most `within` for a vCPU to leave `run`, stop the guest if
     /// none did, and return the corresponding `Exit`.
     fn await_exit(&self, within: Duration) -> Result<Exit> {
@@ -410,7 +451,10 @@ impl Inner {
         }
         .map_err(Error::Lingcore);
         self.demux.stop();
-        let removed = std::fs::remove_dir_all(&self.run_dir).map_err(Error::Io);
+        let removed = match std::fs::remove_dir_all(&self.run_dir) {
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other.map_err(Error::Io),
+        };
         drop(self.image.lock().unwrap().take());
         let done = stopped.and(removed);
         *torn = done.is_ok();
