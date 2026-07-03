@@ -7,7 +7,7 @@
 //! while a sandbox is still using it.
 
 use std::collections::VecDeque;
-use std::io::{Read as _, Write};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::symlink;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -21,6 +21,7 @@ use lingcore::seccomp::Refusal;
 
 use crate::error::{Error, Result};
 use crate::hv::Hv;
+use crate::random::draw;
 use crate::template::{
     BuildStamp, Digest, GuestShape, Template, TemplateId, TemplateMeta, TemplatePlan,
     TemplateStore, layout_digest, sanitize,
@@ -472,10 +473,9 @@ fn build_identity() -> Result<crate::lcp::Identify> {
     let mut entropy = [0u8; 32];
     let mut machine_id = [0u8; 16];
     let mut generation = [0u8; 8];
-    let mut source = std::fs::File::open("/dev/urandom").map_err(Error::Io)?;
-    source.read_exact(&mut entropy).map_err(Error::Io)?;
-    source.read_exact(&mut machine_id).map_err(Error::Io)?;
-    source.read_exact(&mut generation).map_err(Error::Io)?;
+    draw(&mut entropy)?;
+    draw(&mut machine_id)?;
+    draw(&mut generation)?;
     Ok(crate::lcp::Identify {
         hostname: BUILD_HOSTNAME.to_string(),
         machine_id: hex_of(&machine_id),

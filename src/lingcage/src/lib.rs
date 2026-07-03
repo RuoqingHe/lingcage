@@ -32,6 +32,12 @@ pub mod hv;
 #[cfg(feature = "lcp")]
 pub mod lcp;
 #[cfg(all(
+    feature = "template",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "riscv64")
+))]
+mod random;
+#[cfg(all(
     feature = "sandbox",
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "riscv64")

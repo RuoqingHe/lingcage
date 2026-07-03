@@ -29,6 +29,7 @@ use lingcore::seccomp::Refusal;
 use crate::error::{Error, Result};
 use crate::hv::Hv;
 use crate::lcp;
+use crate::random::draw;
 use crate::sandbox::console::{Console, Sink};
 use crate::sandbox::demux::{Demux, accept_within};
 use crate::sandbox::exec::{Command, ExitWatch, Process};
@@ -665,12 +666,6 @@ fn accept_stream(bound: &Bound, deadline: Instant) -> Result<File> {
             ),
         }
     }
-}
-
-/// Fill `bytes` with random data read from `/dev/urandom`.
-pub(crate) fn draw(bytes: &mut [u8]) -> Result<()> {
-    let mut source = File::open("/dev/urandom").map_err(Error::Io)?;
-    source.read_exact(bytes).map_err(Error::Io)
 }
 
 /// Returns lowercase hex string of `bytes`.
