@@ -8,6 +8,11 @@ name = "lingcore"
 repository.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "lingcore"
+path = "src/bin/lingcore.rs"
+required-features = ["cli"]
+
 [features]
 default = ["hv"]
 # ACPI tables in guest RAM. x86_64 only.
@@ -42,6 +47,9 @@ mem = ["dep:libc", "dep:vm-memory"]
 seccomp = ["dep:libc", "dep:seccompiler"]
 # vCPU run loop and the bus which it dispatches to.
 vcpu = ["hv"]
+# The `lingcore` binary, boots a guest with KVM. x86_64 and riscv64 Linux
+# only.
+cli = ["kvm", "machine"]
 # Virtio devices and the split virtqueue.
 virtio = ["devices", "mem"]
 # KVM backend.
