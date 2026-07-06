@@ -11,13 +11,20 @@
     any(target_arch = "x86_64", target_arch = "riscv64")
 ))]
 mod imp {
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
+    use std::os::fd::AsRawFd;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
+    use lingcore::devices::Receive;
     use lingcore::hv::backend::kvm::hypervisor::KvmHv;
     use lingcore::hv::vcpu::VmExit;
-    use lingcore::machine::{Config, Machine};
+    use lingcore::machine::{Config, Machine, StopHandle};
     use lingcore::seccomp::Refusal;
+
+    /// Byte typed on the terminal to end the guest, `Ctrl-]`.
+    const ESCAPE: u8 = 0x1d;
 
     /// Exit code for a usage error.
     const EXIT_USAGE: i32 = 1;
@@ -25,6 +32,9 @@ mod imp {
     const EXIT_FAILURE: i32 = 2;
     /// Exit code for a reboot asked by guest, which is not served.
     const EXIT_REBOOT: i32 = 3;
+
+    /// Time to wait before retrying if console input queue is full.
+    const INPUT_RETRY: Duration = Duration::from_millis(5);
 
     /// Errors thrown by the command line.
     #[derive(Debug, thiserror::Error)]
@@ -156,8 +166,9 @@ mod imp {
             out.push_str(&format!("  {name:<18} {}\n", flag.help));
         }
         out.push_str(
-            "\nlingcore --version prints the version.\n\nexit codes:\n  0    guest powered off\n  \
-             1    usage error\n  2    failure on host side\n  3    guest asked for a reboot\n",
+            "\nlingcore --version prints the version.\n\nexit codes:\n  0    guest powered off, \
+             or was ended from the terminal with Ctrl-]\n  1    usage error\n  2    failure on \
+             host side\n  3    guest asked for a reboot\n",
         );
         out
     }
@@ -311,13 +322,108 @@ mod imp {
         }
     }
 
+    /// Terminal settings of stdin saved before raw mode, restored on drop.
+    /// Holds `None` if stdin is not a terminal.
+    struct Terminal(Option<libc::termios>);
+
+    impl Terminal {
+        /// Put stdin into raw mode if it is a terminal, so that each key
+        /// reaches the guest as typed and `Ctrl-C` is not a signal here.
+        fn raw() -> io::Result<Terminal> {
+            let fd = io::stdin().as_raw_fd();
+            // SAFETY: `isatty` takes a descriptor and touches no memory.
+            if unsafe { libc::isatty(fd) } == 0 {
+                return Ok(Terminal(None));
+            }
+            // SAFETY: a zeroed termios is filled by `tcgetattr` before use.
+            let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `saved` is a valid termios to fill.
+            if unsafe { libc::tcgetattr(fd, &mut saved) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut raw = saved;
+            // SAFETY: `raw` is a valid termios copied from the terminal.
+            unsafe { libc::cfmakeraw(&mut raw) };
+            // SAFETY: `raw` is a valid termios.
+            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Terminal(Some(saved)))
+        }
+
+        /// Returns true if stdin is a terminal in raw mode.
+        fn is_tty(&self) -> bool {
+            self.0.is_some()
+        }
+    }
+
+    impl Drop for Terminal {
+        fn drop(&mut self) {
+            if let Some(saved) = self.0.take() {
+                // SAFETY: `saved` is the termios read from this terminal.
+                unsafe { libc::tcsetattr(io::stdin().as_raw_fd(), libc::TCSANOW, &saved) };
+            }
+        }
+    }
+
+    /// Set to true once `Ctrl-]` ended the guest from the terminal.
+    static ESCAPED: AtomicBool = AtomicBool::new(false);
+
+    /// Forward stdin to the guest console on a separate thread. On a
+    /// terminal `Ctrl-]` stops the guest, otherwise bytes are forwarded until
+    /// EOF and the guest keeps running.
+    fn forward_input(console: std::sync::Arc<dyn Receive>, stop: StopHandle, tty: bool) {
+        std::thread::spawn(move || {
+            let mut stdin = io::stdin().lock();
+            let mut buf = [0u8; 256];
+            loop {
+                let count = match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(count) => count,
+                };
+                let bytes = &buf[..count];
+                let bytes = match (tty, bytes.iter().position(|byte| *byte == ESCAPE)) {
+                    (true, Some(at)) => {
+                        queue(&*console, &bytes[..at]);
+                        ESCAPED.store(true, Ordering::SeqCst);
+                        if let Err(err) = stop.stop() {
+                            eprintln!("lingcore: failed to stop the guest: {err}");
+                        }
+                        return;
+                    }
+                    _ => bytes,
+                };
+                queue(&*console, bytes);
+            }
+        });
+    }
+
+    /// Queue `bytes` on the console, waiting for room if the guest has not
+    /// read the earlier ones yet.
+    fn queue(console: &dyn Receive, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            match console.receive(bytes) {
+                Ok(0) => std::thread::sleep(INPUT_RETRY),
+                Ok(taken) => bytes = &bytes[taken..],
+                Err(_) => return,
+            }
+        }
+    }
+
     /// Boot the guest and attach its console, returns the exit code.
     fn boot(parsed: &Parsed) -> Result<i32> {
         let config = config_of(parsed)?;
         let hv = KvmHv::new().map_err(lingcore::machine::Error::from)?;
         let mut machine = Machine::new(&hv, &config, Sink)?;
+        let stop = machine.stop_handle();
+        let terminal = Terminal::raw()?;
         machine.start()?;
+        forward_input(machine.console(), stop.clone(), terminal.is_tty());
         let exit = machine.wait()?;
+        drop(terminal);
+        if ESCAPED.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
         Ok(match exit {
             VmExit::Shutdown => 0,
             VmExit::Reboot => {
