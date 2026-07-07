@@ -171,6 +171,11 @@ impl Device for Net {
             _ => Ok(()),
         }
     }
+
+    /// Returns deadline of the carrier.
+    fn wake_after(&self) -> Option<std::time::Duration> {
+        self.carrier.wake_after()
+    }
 }
 
 /// Read readable buffers of `chain` into `into`, header and frame in one

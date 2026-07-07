@@ -38,6 +38,13 @@ pub trait Carrier: Send {
     /// Returns the descriptor frames go through and the readiness to wait
     /// on it for.
     fn outside(&self) -> Vec<(RawFd, Interest)>;
+
+    /// Returns longest time the host end can wait before it has work no
+    /// descriptor reports, a timer of a stack for example. Default has
+    /// none.
+    fn wake_after(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// Carrier over a stream socket, each frame has a length prefix ahead.
