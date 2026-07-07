@@ -121,6 +121,48 @@ them, and neither reports an error.
   the machine.
 - `wait` joins the threads and returns exit reason of the first vCPU thread joined.
 
+### Booting a guest with the lingcore binary
+
+`lingcore` binary boots a plain guest from a kernel image with its serial console on the terminal.
+It is built with the `cli` feature:
+
+```console
+cargo build --release -p lingcore --features cli --bin lingcore
+```
+
+`lingcore` boots the kernel, guest output goes to stdout and keys typed on the terminal go to the
+guest. Terminal is put into raw mode, so `Ctrl-C` goes to the guest and `Ctrl-]` ends it instead.
+When stdin is not a terminal, it is forwarded to the guest until EOF:
+
+```console
+$ lingcore --kernel bzImage --initrd initramfs.cpio.gz --vcpus 2 --memory 1G
+```
+
+Flags, only `--kernel` is required:
+
+- `--kernel K`, kernel image, bzImage on x86_64 or Image on riscv64.
+- `--initrd I`, initramfs, a cpio archive.
+- `--cmdline C`, kernel command line, `console=ttyS0` by default.
+- `--memory SIZE`, guest RAM in MiB or with K/M/G suffix, 512M by default.
+- `--vcpus N`, number of vCPUs, 1 by default.
+- `--disk FILE`, file attached as virtio-blk device, `/dev/vda` in the guest.
+- `--network SOCK`, host socket carrying Ethernet frames of a virtio-net device.
+- `--mac ADDR`, MAC address of the virtio-net device, needs `--network`.
+- `--seccomp MODE`, syscall allowlist of guest threads, `trap` by default, `errno` or `none`.
+- `--timeout SECS`, stop the guest after SECS seconds.
+
+Exit codes:
+
+- 0, guest powered off, or ended with `Ctrl-]`.
+- 1, usage error.
+- 2, failure on host side.
+- 3, guest asked for reboot.
+- 124, `--timeout` elapsed.
+- 128 plus signal number, SIGTERM, SIGINT or SIGHUP stopped the guest.
+
+`lingcore --help` prints the same, `lingcore --version` prints the crate version. No environment
+variable is read.
+
 ### Using lingcage
 
 `lingcage` runs a command in a guest cloned from a template, which is a captured boot of a kernel
