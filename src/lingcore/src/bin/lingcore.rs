@@ -14,7 +14,7 @@ mod imp {
     use std::io::{self, Read, Write};
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::time::Duration;
 
     use lingcore::devices::Receive;
@@ -168,7 +168,7 @@ mod imp {
         out.push_str(
             "\nlingcore --version prints the version.\n\nexit codes:\n  0    guest powered off, \
              or was ended from the terminal with Ctrl-]\n  1    usage error\n  2    failure on \
-             host side\n  3    guest asked for a reboot\n",
+             host side\n  3    guest asked for a reboot\n  128+N ended by signal N\n",
         );
         out
     }
@@ -410,17 +410,93 @@ mod imp {
         }
     }
 
+    /// Write end of the pipe for signal handler to report signals, -1 until
+    /// armed.
+    static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+    /// Signal which stopped the guest, 0 if no signal is received yet.
+    static SIGNALLED: AtomicI32 = AtomicI32::new(0);
+
+    /// Set up handlers for SIGTERM, SIGINT and SIGHUP. Handler writes the
+    /// signal number to a pipe, and a thread reading the pipe stops the
+    /// guest through `stop`.
+    fn arm_signals(stop: StopHandle) -> Result<()> {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a valid array of two file descriptors.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let (reader, writer) = (fds[0], fds[1]);
+        SIGNAL_PIPE.store(writer, Ordering::SeqCst);
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            // SAFETY: a zeroed sigaction is a valid empty sigaction.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
+            // SAFETY: `action` is properly initialized with a valid handler.
+            if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } == -1 {
+                return Err(io::Error::last_os_error().into());
+            }
+        }
+        std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                // SAFETY: `byte` is a valid one-byte buffer.
+                let read = unsafe { libc::read(reader, byte.as_mut_ptr().cast(), 1) };
+                if read == 1 {
+                    break;
+                }
+                // Read is interrupted if a handler runs on this thread. Other
+                // results mean the pipe is gone, exit the thread accordingly.
+                if read == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    return;
+                }
+            }
+            SIGNALLED.store(i32::from(byte[0]), Ordering::SeqCst);
+            if let Err(err) = stop.stop() {
+                eprintln!(
+                    "lingcore: failed to stop the guest on signal {}: {err}",
+                    byte[0]
+                );
+            }
+        });
+        Ok(())
+    }
+
+    /// Returns exit code for the signal which stopped the guest, if any. The
+    /// code is 128 plus signal number, same as shell does.
+    fn signalled() -> Option<i32> {
+        match SIGNALLED.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(128 + signal),
+        }
+    }
+
+    extern "C" fn on_signal(signal: libc::c_int) {
+        let fd = SIGNAL_PIPE.load(Ordering::SeqCst);
+        if fd < 0 {
+            return;
+        }
+        let byte = [signal as u8];
+        // SAFETY: `byte` is a valid one-byte buffer and `write` is
+        // async-signal-safe.
+        unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+    }
+
     /// Boot the guest and attach its console, returns the exit code.
     fn boot(parsed: &Parsed) -> Result<i32> {
         let config = config_of(parsed)?;
         let hv = KvmHv::new().map_err(lingcore::machine::Error::from)?;
         let mut machine = Machine::new(&hv, &config, Sink)?;
         let stop = machine.stop_handle();
+        arm_signals(stop.clone())?;
         let terminal = Terminal::raw()?;
         machine.start()?;
         forward_input(machine.console(), stop.clone(), terminal.is_tty());
         let exit = machine.wait()?;
         drop(terminal);
+        if let Some(code) = signalled() {
+            return Ok(code);
+        }
         if ESCAPED.load(Ordering::SeqCst) {
             return Ok(0);
         }
