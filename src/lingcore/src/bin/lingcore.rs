@@ -20,7 +20,7 @@ mod imp {
     use lingcore::devices::Receive;
     use lingcore::hv::backend::kvm::hypervisor::KvmHv;
     use lingcore::hv::vcpu::VmExit;
-    use lingcore::machine::{Config, Machine, StopHandle};
+    use lingcore::machine::{Config, Machine, Network, StopHandle};
     use lingcore::seccomp::Refusal;
 
     /// Byte typed on the terminal to end the guest, `Ctrl-]`.
@@ -116,6 +116,30 @@ mod imp {
             value: "N",
             required: false,
             help: "number of vCPUs (default 1)",
+        },
+        Flag {
+            name: "disk",
+            value: "FILE",
+            required: false,
+            help: "file attached as virtio-blk disk, /dev/vda in guest",
+        },
+        Flag {
+            name: "network",
+            value: "SOCK",
+            required: false,
+            help: "host socket carrying Ethernet frames of a virtio-net device",
+        },
+        Flag {
+            name: "mac",
+            value: "ADDR",
+            required: false,
+            help: "MAC address of the virtio-net device, aa:bb:cc:dd:ee:ff",
+        },
+        Flag {
+            name: "seccomp",
+            value: "MODE",
+            required: false,
+            help: "syscall allowlist of guest threads, trap, errno or none (default trap)",
         },
     ];
 
@@ -280,6 +304,32 @@ mod imp {
         }
     }
 
+    /// Parse a MAC address written as six hex bytes with colons.
+    fn parse_mac(text: &str) -> std::result::Result<[u8; 6], String> {
+        let mut mac = [0u8; 6];
+        let parts: Vec<&str> = text.split(':').collect();
+        if parts.len() != 6 {
+            return Err(format!("invalid MAC address {text}, use aa:bb:cc:dd:ee:ff"));
+        }
+        for (slot, part) in mac.iter_mut().zip(parts) {
+            *slot = u8::from_str_radix(part, 16)
+                .map_err(|_| format!("invalid MAC address {text}, use aa:bb:cc:dd:ee:ff"))?;
+        }
+        Ok(mac)
+    }
+
+    /// Parse `--seccomp` mode, `None` means no allowlist.
+    fn parse_seccomp(text: &str) -> std::result::Result<Option<Refusal>, String> {
+        match text {
+            "trap" => Ok(Some(Refusal::Trap)),
+            "errno" => Ok(Some(Refusal::Errno)),
+            "none" => Ok(None),
+            other => Err(format!(
+                "unknown seccomp mode {other}, use trap, errno or none"
+            )),
+        }
+    }
+
     /// Build guest `Config` from the parsed flags.
     fn config_of(parsed: &Parsed) -> Result<Config> {
         let mut config = Config {
@@ -290,6 +340,7 @@ mod imp {
                 .unwrap_or("console=ttyS0")
                 .to_string(),
             memory: 512 << 20,
+            disk: parsed.value("disk").map(PathBuf::from),
             confine: Some(Refusal::Trap),
             ..Default::default()
         };
@@ -301,6 +352,22 @@ mod imp {
                 Ok(count) if count > 0 => count,
                 _ => return Err(usage_err(format!("invalid vCPU count {vcpus}"))),
             };
+        }
+        if let Some(at) = parsed.value("network") {
+            let mac = parsed
+                .value("mac")
+                .map(parse_mac)
+                .transpose()
+                .map_err(usage_err)?;
+            config.network = Some(Network {
+                at: PathBuf::from(at),
+                mac,
+            });
+        } else if parsed.value("mac").is_some() {
+            return Err(usage_err("--mac needs --network".to_string()));
+        }
+        if let Some(mode) = parsed.value("seccomp") {
+            config.confine = parse_seccomp(mode).map_err(usage_err)?;
         }
         Ok(config)
     }
@@ -547,6 +614,8 @@ mod imp {
                 vec!["--kernel"],
                 vec!["--kernel", "k", "--vcpus", "0"],
                 vec!["--kernel", "k", "--memory", "0"],
+                vec!["--kernel", "k", "--seccomp", "maybe"],
+                vec!["--kernel", "k", "--mac", "aa:bb:cc:dd:ee:ff"],
                 vec!["--kernel", "k", "extra"],
                 vec!["--kernel", "k", "--flag"],
             ] {
@@ -565,6 +634,13 @@ mod imp {
             assert_eq!(parse_memory("64k"), Ok(64 << 10));
             assert_eq!(parse_memory("2G"), Ok(2 << 30));
             assert!(parse_memory("lots").is_err());
+        }
+
+        #[test]
+        fn test_parse_mac() {
+            assert_eq!(parse_mac("02:00:00:00:00:01"), Ok([2, 0, 0, 0, 0, 1]));
+            assert!(parse_mac("02:00:00:00:00").is_err());
+            assert!(parse_mac("zz:00:00:00:00:01").is_err());
         }
 
         #[test]
