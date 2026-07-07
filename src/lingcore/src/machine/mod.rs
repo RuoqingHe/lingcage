@@ -22,7 +22,7 @@ use crate::devices::serial::Serial;
 use crate::devices::virtio::block::Block;
 use crate::devices::virtio::entropy::Entropy;
 use crate::devices::virtio::mmio::{self, Transport};
-use crate::devices::virtio::net::carrier::Framed;
+use crate::devices::virtio::net::carrier::{Carrier, Framed};
 use crate::devices::virtio::net::device::Net;
 use crate::devices::virtio::vsock::device::Vsock;
 use crate::devices::virtio::vsock::host::Sockets;
@@ -102,8 +102,8 @@ pub enum Error {
     /// Failed to write the RAM image.
     #[error("failed to write RAM image")]
     Ram(#[source] std::io::Error),
-    /// Failed to connect the network socket.
-    #[error("failed to connect network socket")]
+    /// Failed to set up the network link.
+    #[error("failed to set up network link")]
     Network(#[source] std::io::Error),
     /// Failed to bind the channel socket.
     #[error("failed to bind channel socket")]
@@ -183,13 +183,20 @@ pub struct Channel {
     pub at: PathBuf,
 }
 
-/// Network link of a guest, Ethernet frames over a host stream socket.
-/// The stack behind the socket belongs to the caller.
+/// Host end of the network link of a guest.
+#[derive(Debug, Clone)]
+pub enum Link {
+    /// Ethernet frames over the host stream socket at this path, a 4-byte
+    /// length ahead of each. The stack behind the socket belongs to the
+    /// caller, and a listener is on it before the machine is assembled.
+    Socket(PathBuf),
+}
+
+/// Network link of a guest, a virtio-net device over `Link`.
 #[derive(Debug, Clone)]
 pub struct Network {
-    /// Path of the host socket. A listener is on it before the machine is
-    /// assembled.
-    pub at: PathBuf,
+    /// Host end of the link.
+    pub link: Link,
     /// MAC address in configuration space. `None` offers no `F_MAC` and the
     /// driver assigns a random one.
     pub mac: Option<[u8; 6]>,
@@ -622,8 +629,10 @@ impl<H: Hypervisor> Machine<H> {
             devices.push(Box::new(Vsock::new(channel.cid, Box::new(sockets))));
         }
         if let Some(network) = &config.network {
-            let carrier = Framed::connect(&network.at).map_err(Error::Network)?;
-            devices.push(Box::new(Net::new(network.mac, Box::new(carrier))));
+            let carrier: Box<dyn Carrier> = match &network.link {
+                Link::Socket(at) => Box::new(Framed::connect(at).map_err(Error::Network)?),
+            };
+            devices.push(Box::new(Net::new(network.mac, carrier)));
         }
         let mut wired = Vec::with_capacity(devices.len());
         for (slot, device) in devices.into_iter().enumerate() {

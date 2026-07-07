@@ -20,7 +20,7 @@ mod imp {
     use lingcore::devices::Receive;
     use lingcore::hv::backend::kvm::hypervisor::KvmHv;
     use lingcore::hv::vcpu::VmExit;
-    use lingcore::machine::{Config, Machine, Network, StopHandle};
+    use lingcore::machine::{Config, Link, Machine, Network, StopHandle};
     use lingcore::seccomp::Refusal;
 
     /// Byte typed on the terminal to end the guest, `Ctrl-]`.
@@ -370,7 +370,7 @@ mod imp {
                 .transpose()
                 .map_err(usage_err)?;
             config.network = Some(Network {
-                at: PathBuf::from(at),
+                link: Link::Socket(PathBuf::from(at)),
                 mac,
             });
         } else if parsed.value("mac").is_some() {
