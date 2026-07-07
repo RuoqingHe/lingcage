@@ -212,14 +212,14 @@ pub fn write_boot_params(
     }
 
     let ranges = ram_ranges(ram);
-    if ranges.len() > E820_MAX_ENTRIES_ZEROPAGE as usize {
+    if ranges.len() > E820_MAX_ENTRIES_ZEROPAGE {
         return Err(Error::TooManyRanges);
     }
     for (slot, &(addr, size)) in params.e820_table.iter_mut().zip(&ranges) {
         *slot = boot_e820_entry {
             addr,
             size,
-            type_: E820_RAM,
+            r#type: E820_RAM,
         };
     }
     params.e820_entries = ranges.len() as u8;
@@ -408,7 +408,7 @@ pub(crate) mod tests {
         let high = params.e820_table[1];
         assert_eq!({ low.addr }, 0);
         assert_eq!({ low.size }, LOW_MEMORY_END);
-        assert_eq!({ low.type_ }, E820_RAM);
+        assert_eq!({ low.r#type }, E820_RAM);
         assert_eq!({ high.addr }, LOAD_ADDRESS);
 
         // Command line is at CMDLINE, NUL terminated.

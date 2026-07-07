@@ -17,7 +17,7 @@ use vm_memory::mmap::FromRangesError;
 #[cfg(target_os = "linux")]
 use vm_memory::mmap::MmapRegion;
 use vm_memory::region::GuestRegionCollectionError;
-use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 #[cfg(target_os = "linux")]
 use vm_memory::{FileOffset, GuestRegionMmap};
 
