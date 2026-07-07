@@ -32,6 +32,9 @@ mod imp {
     const EXIT_FAILURE: i32 = 2;
     /// Exit code for a reboot asked by guest, which is not served.
     const EXIT_REBOOT: i32 = 3;
+    /// Exit code if `--timeout` elapsed before guest powered off, same as
+    /// `timeout(1)`.
+    const EXIT_TIMEOUT: i32 = 124;
 
     /// Time to wait before retrying if console input queue is full.
     const INPUT_RETRY: Duration = Duration::from_millis(5);
@@ -141,6 +144,12 @@ mod imp {
             required: false,
             help: "syscall allowlist of guest threads, trap, errno or none (default trap)",
         },
+        Flag {
+            name: "timeout",
+            value: "SECS",
+            required: false,
+            help: "stop the guest after SECS seconds and exit with 124",
+        },
     ];
 
     /// Flags parsed from the command line.
@@ -192,7 +201,8 @@ mod imp {
         out.push_str(
             "\nlingcore --version prints the version.\n\nexit codes:\n  0    guest powered off, \
              or was ended from the terminal with Ctrl-]\n  1    usage error\n  2    failure on \
-             host side\n  3    guest asked for a reboot\n  128+N ended by signal N\n",
+             host side\n  3    guest asked for a reboot\n  124  --timeout elapsed\n  128+N ended \
+             by signal N\n",
         );
         out
     }
@@ -370,6 +380,19 @@ mod imp {
             config.confine = parse_seccomp(mode).map_err(usage_err)?;
         }
         Ok(config)
+    }
+
+    /// Parse `--timeout`, `None` if not given.
+    fn timeout_of(parsed: &Parsed) -> Result<Option<Duration>> {
+        match parsed.value("timeout") {
+            None => Ok(None),
+            Some(text) => match text.parse::<u64>() {
+                Ok(secs) => Ok(Some(Duration::from_secs(secs))),
+                Err(_) => Err(usage_err(format!(
+                    "invalid timeout {text}, use bare seconds"
+                ))),
+            },
+        }
     }
 
     /// Console sink writing guest output to stdout right away. Stdout is line
@@ -552,6 +575,7 @@ mod imp {
     /// Boot the guest and attach its console, returns the exit code.
     fn boot(parsed: &Parsed) -> Result<i32> {
         let config = config_of(parsed)?;
+        let timeout = timeout_of(parsed)?;
         let hv = KvmHv::new().map_err(lingcore::machine::Error::from)?;
         let mut machine = Machine::new(&hv, &config, Sink)?;
         let stop = machine.stop_handle();
@@ -559,7 +583,19 @@ mod imp {
         let terminal = Terminal::raw()?;
         machine.start()?;
         forward_input(machine.console(), stop.clone(), terminal.is_tty());
-        let exit = machine.wait()?;
+        let exit = match timeout {
+            Some(within) => match machine.wait_timeout(within)? {
+                Some(exit) => exit,
+                None => {
+                    stop.stop()?;
+                    machine.wait()?;
+                    drop(terminal);
+                    eprintln!("lingcore: guest stopped after {} seconds", within.as_secs());
+                    return Ok(EXIT_TIMEOUT);
+                }
+            },
+            None => machine.wait()?,
+        };
         drop(terminal);
         if let Some(code) = signalled() {
             return Ok(code);
@@ -588,7 +624,7 @@ mod imp {
         fn test_help_lists_flags_and_exit_codes() {
             let help = cli_help();
             assert!(help.contains("--kernel K"), "help: {help}");
-            assert!(help.contains("exit codes"), "help: {help}");
+            assert!(help.contains("124"), "help: {help}");
         }
 
         #[test]
@@ -616,11 +652,15 @@ mod imp {
                 vec!["--kernel", "k", "--memory", "0"],
                 vec!["--kernel", "k", "--seccomp", "maybe"],
                 vec!["--kernel", "k", "--mac", "aa:bb:cc:dd:ee:ff"],
+                vec!["--kernel", "k", "--timeout", "soon"],
                 vec!["--kernel", "k", "extra"],
                 vec!["--kernel", "k", "--flag"],
             ] {
                 let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-                let outcome = parse(&args).and_then(|parsed| config_of(&parsed));
+                let outcome = parse(&args).and_then(|parsed| {
+                    config_of(&parsed)?;
+                    timeout_of(&parsed)
+                });
                 assert!(
                     matches!(outcome, Err(CliError::Usage { .. })),
                     "accepted {args:?}: {outcome:?}"
