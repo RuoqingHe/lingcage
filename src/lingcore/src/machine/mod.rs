@@ -24,6 +24,7 @@ use crate::devices::virtio::entropy::Entropy;
 use crate::devices::virtio::mmio::{self, Transport};
 use crate::devices::virtio::net::carrier::{Carrier, Framed};
 use crate::devices::virtio::net::device::Net;
+use crate::devices::virtio::net::stack::{Stack, StackConfig};
 use crate::devices::virtio::vsock::device::Vsock;
 use crate::devices::virtio::vsock::host::Sockets;
 use crate::devices::{Blob, Receive, Shared};
@@ -190,6 +191,9 @@ pub enum Link {
     /// length ahead of each. The stack behind the socket belongs to the
     /// caller, and a listener is on it before the machine is assembled.
     Socket(PathBuf),
+    /// The stack in this process, frames are translated to host sockets
+    /// and no privilege is needed.
+    User(StackConfig),
 }
 
 /// Network link of a guest, a virtio-net device over `Link`.
@@ -535,6 +539,9 @@ pub struct Machine<H: Hypervisor> {
     genid: VmGenId,
     /// `Config::confine`, read when the threads start.
     confine: Option<Refusal>,
+    /// Set if the network link is the stack in this process, the device
+    /// thread then takes the wider allowlist.
+    host_stack: bool,
     state: State,
 }
 
@@ -631,6 +638,7 @@ impl<H: Hypervisor> Machine<H> {
         if let Some(network) = &config.network {
             let carrier: Box<dyn Carrier> = match &network.link {
                 Link::Socket(at) => Box::new(Framed::connect(at).map_err(Error::Network)?),
+                Link::User(stack) => Box::new(Stack::new(stack.clone()).map_err(Error::Network)?),
             };
             devices.push(Box::new(Net::new(network.mac, carrier)));
         }
@@ -670,6 +678,13 @@ impl<H: Hypervisor> Machine<H> {
             orders: Arc::new(Orders::default()),
             genid,
             confine: config.confine,
+            host_stack: matches!(
+                config.network,
+                Some(Network {
+                    link: Link::User(_),
+                    ..
+                })
+            ),
             state: State::Created,
         })
     }
@@ -840,7 +855,12 @@ impl<H: Hypervisor> Machine<H> {
         self.state.valid_transition(State::Running)?;
         let confine = |thread| self.confine.map(|how| Filter::new(thread, how)).transpose();
         let driving = confine(Thread::Vcpu)?;
-        let working = confine(Thread::Device)?;
+        // Device thread with the stack opens host sockets, its list is wider.
+        let working = confine(if self.host_stack {
+            Thread::Stack
+        } else {
+            Thread::Device
+        })?;
         self.threads = self
             .vcpus
             .iter()
