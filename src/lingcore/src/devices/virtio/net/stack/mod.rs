@@ -10,23 +10,24 @@
 //! addresses, with `any_ip` on so that it accepts packets for any
 //! destination. A TCP SYN from the guest opens a listening socket for its
 //! destination and a host connection towards it, and bytes are pumped
-//! between the two. DHCP is answered by `dhcp` before smoltcp sees it.
-//! Connections do not survive a restore, same as the socket carrier.
+//! between the two. UDP is mapped flow by flow onto host sockets. DHCP is
+//! answered by `dhcp` before smoltcp sees it. Connections do not survive a
+//! restore, same as the socket carrier.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 use log::warn;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as Tick;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-    IpListenEndpoint, IpProtocol, Ipv4Cidr, Ipv4Packet, TcpPacket, UdpPacket,
+    IpEndpoint, IpListenEndpoint, IpProtocol, Ipv4Cidr, Ipv4Packet, TcpPacket, UdpPacket,
 };
 
 use crate::devices::virtio::net::carrier::Carrier;
@@ -44,11 +45,20 @@ const TCP_BUFFER: usize = 64 * 1024;
 /// Bytes moved between a host socket and a TCP connection in one go.
 const CHUNK: usize = 16 * 1024;
 
+/// Datagrams one UDP flow holds in each direction.
+const UDP_PACKETS: usize = 16;
+
+/// Bytes of datagram buffer of one UDP flow, each direction.
+const UDP_BUFFER: usize = UDP_PACKETS * 2048;
+
 /// Most TCP connections open at the same time. A SYN past it is reset.
 const CONNECTIONS: usize = 1024;
 
 /// Frames from the guest held for smoltcp. Past it a frame is dropped.
 const QUEUE: usize = 64;
+
+/// Time a UDP flow without traffic is kept.
+const UDP_IDLE: Duration = Duration::from_secs(60);
 
 /// Addresses and MTU of the stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +180,13 @@ struct Proxy {
     guest_closed: bool,
 }
 
+/// One UDP destination of the guest, with a host socket per guest port
+/// talking to it.
+struct Flow {
+    to: SocketAddrV4,
+    senders: BTreeMap<u16, (UdpSocket, Instant)>,
+}
+
 /// Stack, a `Carrier` translating guest frames to host sockets.
 pub struct Stack {
     config: StackConfig,
@@ -184,6 +201,10 @@ pub struct Stack {
     /// Listening sockets by their endpoint, taken out once a SYN moved
     /// them on.
     listening: HashMap<(Ipv4Addr, u16), SocketHandle>,
+    /// UDP flows by handle of their smoltcp socket.
+    flows: HashMap<SocketHandle, Flow>,
+    /// Sockets bound for UDP by their endpoint.
+    bound: HashMap<(Ipv4Addr, u16), SocketHandle>,
     started: Instant,
     /// Next moment smoltcp wants a poll, computed by `poll`.
     due: Option<Tick>,
@@ -228,6 +249,8 @@ impl Stack {
             resolvers: host::resolvers(),
             proxies: HashMap::new(),
             listening: HashMap::new(),
+            flows: HashMap::new(),
+            bound: HashMap::new(),
             started,
             due: None,
         })
@@ -256,7 +279,8 @@ impl Stack {
 
     /// Look at a frame from the guest before smoltcp gets it. DHCP is
     /// answered here, a TCP SYN opens the listener and host connection it
-    /// needs. Returns `false` for a frame smoltcp should not see.
+    /// needs, and a UDP datagram opens its flow. Returns `false` for a
+    /// frame smoltcp should not see.
     fn inspect(&mut self, frame: &[u8]) -> bool {
         let Ok(layer2) = EthernetFrame::new_checked(frame) else {
             return true;
@@ -279,6 +303,7 @@ impl Stack {
                     }
                     return false;
                 }
+                self.flow_for(dst, layer4.dst_port());
                 true
             }
             IpProtocol::Tcp => {
@@ -343,13 +368,49 @@ impl Stack {
         );
     }
 
+    /// Make sure a UDP socket is bound on `ip:port`, destination of the
+    /// datagram just seen.
+    fn flow_for(&mut self, ip: Ipv4Addr, port: u16) {
+        if self.bound.contains_key(&(ip, port)) {
+            return;
+        }
+        let mut socket = udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
+                vec![0; UDP_BUFFER],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_PACKETS],
+                vec![0; UDP_BUFFER],
+            ),
+        );
+        if socket
+            .bind(IpListenEndpoint {
+                addr: Some(IpAddress::Ipv4(ip)),
+                port,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let handle = self.sockets.add(socket);
+        self.bound.insert((ip, port), handle);
+        self.flows.insert(
+            handle,
+            Flow {
+                to: self.host_address(ip, port),
+                senders: BTreeMap::new(),
+            },
+        );
+    }
+
     /// Run smoltcp and move bytes between its sockets and host sockets
     /// until no byte moves any more, then note the next deadline.
     fn poll(&mut self) {
         let now = self.now();
         for _ in 0..8 {
             self.iface.poll(now, &mut self.pipe, &mut self.sockets);
-            let moved = self.pump_tcp();
+            let moved = self.pump_tcp() | self.pump_udp();
             if !moved {
                 break;
             }
@@ -381,6 +442,98 @@ impl Stack {
             self.sockets.remove(handle);
             self.listening.retain(|_, held| *held != handle);
             moved = true;
+        }
+        moved
+    }
+
+    /// Move datagrams of each UDP flow. Returns `true` if any moved.
+    fn pump_udp(&mut self) -> bool {
+        let mut moved = false;
+        let mut gone = Vec::new();
+        let ip = self.config.ip;
+        for (handle, flow) in &mut self.flows {
+            let socket = self.sockets.get_mut::<udp::Socket>(*handle);
+            // Guest to host, one host socket per guest port.
+            while socket.can_recv() {
+                let Ok((data, meta)) = socket.recv() else {
+                    break;
+                };
+                let data = data.to_vec();
+                let port = meta.endpoint.port;
+                let sender = match flow.senders.get_mut(&port) {
+                    Some(sender) => sender,
+                    None => {
+                        let bound = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+                            Ok(bound) => bound,
+                            Err(err) => {
+                                warn!("stack could not bind a UDP socket: {err}");
+                                continue;
+                            }
+                        };
+                        if let Err(err) = bound.set_nonblocking(true) {
+                            warn!("stack could not make a UDP socket non-blocking: {err}");
+                            continue;
+                        }
+                        flow.senders.entry(port).or_insert((bound, Instant::now()))
+                    }
+                };
+                sender.1 = Instant::now();
+                if let Err(err) = sender.0.send_to(&data, flow.to)
+                    && err.kind() != io::ErrorKind::WouldBlock
+                {
+                    warn!("stack could not send a datagram to {}: {err}", flow.to);
+                }
+                moved = true;
+            }
+            // Host to guest, replies go back to the guest port they belong
+            // to, from address the guest sent to.
+            let local = socket.endpoint().addr;
+            let mut buf = [0u8; 2048];
+            let mut idle = Vec::new();
+            for (port, (sender, last)) in &mut flow.senders {
+                while socket.can_send() {
+                    match sender.recv_from(&mut buf) {
+                        Ok((len, _)) => {
+                            *last = Instant::now();
+                            let meta = udp::UdpMetadata {
+                                endpoint: IpEndpoint::new(IpAddress::Ipv4(ip), *port),
+                                local_address: local,
+                                meta: Default::default(),
+                            };
+                            if socket.send_slice(&buf[..len], meta).is_err() {
+                                break;
+                            }
+                            moved = true;
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(err) => {
+                            warn!("stack drops a UDP flow to {}: {err}", flow.to);
+                            idle.push(*port);
+                            break;
+                        }
+                    }
+                }
+                if last.elapsed() > UDP_IDLE {
+                    idle.push(*port);
+                }
+            }
+            for port in idle {
+                flow.senders.remove(&port);
+            }
+            if flow.senders.is_empty() && socket.recv_queue() == 0 && socket.send_queue() == 0 {
+                gone.push(*handle);
+            }
+        }
+        for handle in gone {
+            // A flow without senders is only dropped once idle, a datagram
+            // still to be sent keeps it.
+            if let Some(flow) = self.flows.get(&handle)
+                && flow.senders.is_empty()
+            {
+                self.flows.remove(&handle);
+                self.sockets.remove(handle);
+                self.bound.retain(|_, held| *held != handle);
+            }
         }
         moved
     }
@@ -515,8 +668,9 @@ impl Carrier for Stack {
         Ok(true)
     }
 
-    /// Returns the host sockets, a connection for reading while the guest
-    /// has room and for writing while its connect or bytes are pending.
+    /// Returns host sockets, a connection for reading while the guest has
+    /// room and for writing while its connect or bytes are pending, a UDP
+    /// sender for reading.
     fn outside(&self) -> Vec<(RawFd, Interest)> {
         let mut waited = Vec::new();
         for (handle, proxy) in &self.proxies {
@@ -531,21 +685,30 @@ impl Carrier for Stack {
             };
             waited.push((proxy.host.as_raw_fd(), interest));
         }
+        for flow in self.flows.values() {
+            for (sender, _) in flow.senders.values() {
+                waited.push((sender.as_raw_fd(), Interest::Read));
+            }
+        }
         waited
     }
 
-    /// Returns zero while frames wait for the guest, otherwise the time to
-    /// the next deadline of smoltcp.
+    /// Returns zero while frames wait for the guest, otherwise time to the
+    /// next deadline of smoltcp, capped to the UDP idle check.
     fn wake_after(&self) -> Option<Duration> {
         if !self.pipe.to_guest.is_empty() {
             return Some(Duration::ZERO);
         }
         let now = self.now();
-        match self.due {
+        let mut after = match self.due {
             Some(due) if due <= now => Some(Duration::ZERO),
             Some(due) => Some(Duration::from_micros((due - now).total_micros())),
             None => None,
+        };
+        if !self.flows.is_empty() {
+            after = Some(after.map_or(UDP_IDLE, |held| held.min(UDP_IDLE)));
         }
+        after
     }
 }
 
@@ -750,6 +913,7 @@ mod tests {
         let offer = dhcp::tests::unwrap(&into[..len]);
         assert_eq!(offer.kind, DhcpMessageType::Offer);
         assert_eq!(offer.your_ip, lease.ip);
+        assert!(stack.bound.is_empty(), "DHCP opened a UDP flow");
     }
 
     #[test]
@@ -811,6 +975,56 @@ mod tests {
         }
         assert!(stack.proxies.is_empty(), "connection left behind");
         assert!(stack.listening.is_empty(), "listener left behind");
+    }
+
+    #[test]
+    fn test_udp_datagram_reaches_host_and_back() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        server
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let echo = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (len, from) = server.recv_from(&mut buf).unwrap();
+            server.send_to(&buf[..len], from).unwrap();
+            buf[..len].to_vec()
+        });
+        let config = StackConfig::default();
+        let mut stack = stack();
+        let mut guest = Guest::new(&config);
+        let socket = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 4096]),
+        );
+        let handle = guest.sockets.add(socket);
+        guest
+            .sockets
+            .get_mut::<udp::Socket>(handle)
+            .bind(50000)
+            .unwrap();
+        guest
+            .sockets
+            .get_mut::<udp::Socket>(handle)
+            .send_slice(
+                b"ping",
+                IpEndpoint::new(IpAddress::Ipv4(config.gateway), port),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut got = None;
+        while Instant::now() < deadline && got.is_none() {
+            guest.exchange(&mut stack, 4);
+            let socket = guest.sockets.get_mut::<udp::Socket>(handle);
+            if socket.can_recv() {
+                let (data, meta) = socket.recv().unwrap();
+                got = Some((data.to_vec(), meta.endpoint));
+            }
+        }
+        let (data, from) = got.expect("no reply reached the guest");
+        assert_eq!(data, b"ping");
+        assert_eq!(from, IpEndpoint::new(IpAddress::Ipv4(config.gateway), port));
+        assert_eq!(echo.join().unwrap(), b"ping");
     }
 
     #[test]
