@@ -56,6 +56,10 @@ pub enum Thread {
     /// Waits on an ioeventfd, serves the rings and raises the line of the
     /// device.
     Device,
+    /// Same as `Device`, plus the host sockets opened by the network stack
+    /// running in this process.
+    #[cfg(feature = "netstack")]
+    Stack,
 }
 
 /// Action on a syscall outside of the allowlist.
@@ -127,6 +131,8 @@ impl Thread {
         match self {
             Thread::Vcpu => "vcpu",
             Thread::Device => "device",
+            #[cfg(feature = "netstack")]
+            Thread::Stack => "stack",
         }
     }
 
@@ -134,19 +140,14 @@ impl Thread {
     /// conditions on their arguments. Empty rule list allows the syscall
     /// unconditionally.
     fn extras(self) -> Result<BTreeMap<i64, Vec<SeccompRule>>> {
-        // `socket` for `AF_UNIX` only. Other family is refused.
-        let unix_only = vec![
+        // `socket` for the address family `family` only.
+        let family = |family: libc::c_int| -> Result<SeccompRule> {
             SeccompRule::new(vec![
-                SeccompCondition::new(
-                    0,
-                    SeccompCmpArgLen::Dword,
-                    SeccompCmpOp::Eq,
-                    libc::AF_UNIX as u64,
-                )
-                .map_err(Error::Assemble)?,
+                SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, family as u64)
+                    .map_err(Error::Assemble)?,
             ])
-            .map_err(Error::Assemble)?,
-        ];
+            .map_err(Error::Assemble)
+        };
         // `ioctl` for `request` only. Other request is refused.
         let request = |request: u64| -> Result<SeccompRule> {
             SeccompRule::new(vec![
@@ -180,7 +181,8 @@ impl Thread {
             // written and flushed, the channel accepts incoming connections and
             // opens, connects, sends on, receives on, shuts and closes a host
             // socket per connection. `ioctl` is for `FIONBIO`, and on riscv64
-            // for `KVM_IRQ_LINE` which raises the line of a device.
+            // for `KVM_IRQ_LINE` which raises the line of a device. `socket`
+            // is for `AF_UNIX` only, other family is refused.
             Thread::Device => Ok(BTreeMap::from([
                 (libc::SYS_accept4, Vec::new()),
                 (libc::SYS_close, Vec::new()),
@@ -201,8 +203,25 @@ impl Thread {
                         request(KVM_IRQ_LINE)?,
                     ],
                 ),
-                (libc::SYS_socket, unix_only),
+                (libc::SYS_socket, vec![family(libc::AF_UNIX)?]),
             ])),
+            // The stack opens `AF_INET` sockets as well, binds the UDP ones,
+            // asks a connect how it went through `getpeername` and
+            // `getsockopt`, and its hash maps draw their keys from
+            // `getrandom`.
+            #[cfg(feature = "netstack")]
+            Thread::Stack => {
+                let mut list = Thread::Device.extras()?;
+                list.insert(libc::SYS_bind, Vec::new());
+                list.insert(libc::SYS_getrandom, Vec::new());
+                list.insert(libc::SYS_getpeername, Vec::new());
+                list.insert(libc::SYS_getsockopt, Vec::new());
+                list.insert(
+                    libc::SYS_socket,
+                    vec![family(libc::AF_UNIX)?, family(libc::AF_INET)?],
+                );
+                Ok(list)
+            }
         }
     }
 }
@@ -285,7 +304,12 @@ mod tests {
 
     #[test]
     fn test_extras_disjoint_from_common() {
-        for thread in [Thread::Vcpu, Thread::Device] {
+        for thread in [
+            Thread::Vcpu,
+            Thread::Device,
+            #[cfg(feature = "netstack")]
+            Thread::Stack,
+        ] {
             for number in thread.extras().expect("assemble extras").keys() {
                 assert!(
                     !COMMON.contains(number),
