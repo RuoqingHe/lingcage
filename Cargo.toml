@@ -26,6 +26,15 @@ seccompiler = "0.5.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
+smoltcp = { version = "0.13.1", default-features = false, features = [
+  "auto-icmp-echo-reply",
+  "medium-ethernet",
+  "proto-dhcpv4",
+  "proto-ipv4",
+  "socket-tcp",
+  "socket-udp",
+  "std",
+] }
 thiserror = "2.0.18"
 vm-fdt = "0.3.0"
 vm-memory = { version = "0.18.0", features = ["backend-mmap"] }

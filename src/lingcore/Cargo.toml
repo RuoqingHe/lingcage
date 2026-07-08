@@ -34,6 +34,7 @@ machine = [
   "fdt",
   "hv",
   "mem",
+  "netstack",
   "seccomp",
   "serde",
   "vcpu",
@@ -52,6 +53,9 @@ vcpu = ["hv"]
 cli = ["kvm", "machine"]
 # Virtio devices and the split virtqueue.
 virtio = ["devices", "mem"]
+# Network stack behind the virtio-net device, guest frames are translated
+# to host sockets in this process.
+netstack = ["dep:libc", "dep:smoltcp", "virtio"]
 # KVM backend.
 kvm = [
   "dep:kvm-bindings",
@@ -72,6 +76,7 @@ linux-loader = { workspace = true, optional = true }
 log.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+smoltcp = { workspace = true, optional = true }
 thiserror.workspace = true
 vm-memory = { workspace = true, optional = true }
 
