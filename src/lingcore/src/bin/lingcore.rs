@@ -584,10 +584,23 @@ mod imp {
         unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
     }
 
+    /// Disable heap trimming of glibc. Trim path opens a `/proc` file, a
+    /// syscall outside allowlist of the guest threads, and freeing buffers
+    /// of a connection is enough to trigger it.
+    #[cfg(target_env = "gnu")]
+    fn keep_heap() {
+        // SAFETY: `mallopt` takes no pointer.
+        unsafe { libc::mallopt(libc::M_TRIM_THRESHOLD, -1) };
+    }
+
+    #[cfg(not(target_env = "gnu"))]
+    fn keep_heap() {}
+
     /// Boot the guest and attach its console, returns the exit code.
     fn boot(parsed: &Parsed) -> Result<i32> {
         let config = config_of(parsed)?;
         let timeout = timeout_of(parsed)?;
+        keep_heap();
         let hv = KvmHv::new().map_err(lingcore::machine::Error::from)?;
         let mut machine = Machine::new(&hv, &config, Sink)?;
         let stop = machine.stop_handle();
