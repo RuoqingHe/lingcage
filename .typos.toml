@@ -4,3 +4,7 @@ extend-exclude = ["target/"]
 [default.extend-identifiers]
 # Spelled like this in the kernel headers.
 KVM_CPUID_FLAG_SIGNIFCANT_INDEX = "KVM_CPUID_FLAG_SIGNIFCANT_INDEX"
+
+[default.extend-words]
+# Name of the program, not a misspelling of past.
+passt = "passt"

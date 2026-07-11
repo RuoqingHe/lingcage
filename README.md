@@ -146,7 +146,8 @@ Flags, only `--kernel` is required:
 - `--memory SIZE`, guest RAM in MiB or with K/M/G suffix, 512M by default.
 - `--vcpus N`, number of vCPUs, 1 by default.
 - `--disk FILE`, file attached as virtio-blk device, `/dev/vda` in the guest.
-- `--network SOCK`, host socket carrying Ethernet frames of a virtio-net device.
+- `--network LINK`, `user` for the network stack in this process, or `unix:PATH` for a host socket
+  carrying Ethernet frames of a virtio-net device, a 4-byte length ahead of each frame.
 - `--mac ADDR`, MAC address of the virtio-net device, needs `--network`.
 - `--seccomp MODE`, syscall allowlist of guest threads, `trap` by default, `errno` or `none`.
 - `--timeout SECS`, stop the guest after SECS seconds.
@@ -162,6 +163,12 @@ Exit codes:
 
 `lingcore --help` prints the same, `lingcore --version` prints the crate version. No environment
 variable is read.
+
+With `--network user` nothing is needed on the host. Guest gets 10.0.2.15 by DHCP with gateway
+10.0.2.2 and DNS 10.0.2.3. Its TCP and UDP flows become sockets of the `lingcore` process, gateway
+address goes to loopback of the host and DNS queries go to resolvers of the host. No connection
+comes in from outside and guests do not see each other. With `unix:PATH` a program such as passt
+listens on the socket before the boot and carries frames from there.
 
 ### Using lingcage
 
