@@ -18,6 +18,7 @@ mod imp {
     use std::time::Duration;
 
     use lingcore::devices::Receive;
+    use lingcore::devices::virtio::net::stack::StackConfig;
     use lingcore::hv::backend::kvm::hypervisor::KvmHv;
     use lingcore::hv::vcpu::VmExit;
     use lingcore::machine::{Config, Link, Machine, Network, StopHandle};
@@ -128,9 +129,10 @@ mod imp {
         },
         Flag {
             name: "network",
-            value: "SOCK",
+            value: "LINK",
             required: false,
-            help: "host socket carrying Ethernet frames of a virtio-net device",
+            help: "guest network, user for the stack in this process or unix:PATH for a host \
+                   socket carrying Ethernet frames",
         },
         Flag {
             name: "mac",
@@ -328,6 +330,18 @@ mod imp {
         Ok(mac)
     }
 
+    /// Parse `--network`, `user` for the stack in this process and
+    /// `unix:PATH` for a host socket.
+    fn parse_link(text: &str) -> std::result::Result<Link, String> {
+        if text == "user" {
+            return Ok(Link::User(StackConfig::default()));
+        }
+        match text.strip_prefix("unix:") {
+            Some(path) if !path.is_empty() => Ok(Link::Socket(PathBuf::from(path))),
+            _ => Err(format!("invalid network {text}, use user or unix:PATH")),
+        }
+    }
+
     /// Parse `--seccomp` mode, `None` means no allowlist.
     fn parse_seccomp(text: &str) -> std::result::Result<Option<Refusal>, String> {
         match text {
@@ -363,16 +377,14 @@ mod imp {
                 _ => return Err(usage_err(format!("invalid vCPU count {vcpus}"))),
             };
         }
-        if let Some(at) = parsed.value("network") {
+        if let Some(link) = parsed.value("network") {
             let mac = parsed
                 .value("mac")
                 .map(parse_mac)
                 .transpose()
                 .map_err(usage_err)?;
-            config.network = Some(Network {
-                link: Link::Socket(PathBuf::from(at)),
-                mac,
-            });
+            let link = parse_link(link).map_err(usage_err)?;
+            config.network = Some(Network { link, mac });
         } else if parsed.value("mac").is_some() {
             return Err(usage_err("--mac needs --network".to_string()));
         }
@@ -652,6 +664,8 @@ mod imp {
                 vec!["--kernel", "k", "--memory", "0"],
                 vec!["--kernel", "k", "--seccomp", "maybe"],
                 vec!["--kernel", "k", "--mac", "aa:bb:cc:dd:ee:ff"],
+                vec!["--kernel", "k", "--network", "tap0"],
+                vec!["--kernel", "k", "--network", "unix:"],
                 vec!["--kernel", "k", "--timeout", "soon"],
                 vec!["--kernel", "k", "extra"],
                 vec!["--kernel", "k", "--flag"],
@@ -674,6 +688,17 @@ mod imp {
             assert_eq!(parse_memory("64k"), Ok(64 << 10));
             assert_eq!(parse_memory("2G"), Ok(2 << 30));
             assert!(parse_memory("lots").is_err());
+        }
+
+        #[test]
+        fn test_parse_link() {
+            assert!(matches!(parse_link("user"), Ok(Link::User(_))));
+            assert!(matches!(
+                parse_link("unix:/tmp/net.sock"),
+                Ok(Link::Socket(_))
+            ));
+            assert!(parse_link("/tmp/net.sock").is_err());
+            assert!(parse_link("tcp:1").is_err());
         }
 
         #[test]
