@@ -24,6 +24,7 @@ use crate::devices::virtio::entropy::Entropy;
 use crate::devices::virtio::mmio::{self, Transport};
 use crate::devices::virtio::net::carrier::{Carrier, Framed};
 use crate::devices::virtio::net::device::Net;
+use crate::devices::virtio::net::pcap::Captured;
 use crate::devices::virtio::net::stack::{Stack, StackConfig};
 use crate::devices::virtio::vsock::device::Vsock;
 use crate::devices::virtio::vsock::host::Sockets;
@@ -109,6 +110,9 @@ pub enum Error {
     /// Failed to bind the channel socket.
     #[error("failed to bind channel socket")]
     Channel(#[source] std::io::Error),
+    /// Failed to create pcap file of the network link.
+    #[error("failed to create pcap file")]
+    Pcap(#[source] std::io::Error),
     /// `Config::kernel` is empty.
     #[error("guest needs a kernel")]
     NoKernel,
@@ -204,6 +208,9 @@ pub struct Network {
     /// MAC address in configuration space. `None` offers no `F_MAC` and the
     /// driver assigns a random one.
     pub mac: Option<[u8; 6]>,
+    /// File the frames of link are written to in pcap format, both
+    /// directions. `None` keeps no capture.
+    pub pcap: Option<PathBuf>,
 }
 
 /// Guest configuration which a `Machine` is assembled from.
@@ -639,6 +646,15 @@ impl<H: Hypervisor> Machine<H> {
             let carrier: Box<dyn Carrier> = match &network.link {
                 Link::Socket(at) => Box::new(Framed::connect(at).map_err(Error::Network)?),
                 Link::User(stack) => Box::new(Stack::new(stack.clone()).map_err(Error::Network)?),
+            };
+            // Capture wraps the carrier, so frames of either link are
+            // written on their way through.
+            let carrier: Box<dyn Carrier> = match &network.pcap {
+                Some(path) => {
+                    let file = File::create(path).map_err(Error::Pcap)?;
+                    Box::new(Captured::new(carrier, file).map_err(Error::Pcap)?)
+                }
+                None => carrier,
             };
             devices.push(Box::new(Net::new(network.mac, carrier)));
         }

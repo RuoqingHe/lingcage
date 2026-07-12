@@ -384,7 +384,11 @@ mod imp {
                 .transpose()
                 .map_err(usage_err)?;
             let link = parse_link(link).map_err(usage_err)?;
-            config.network = Some(Network { link, mac });
+            config.network = Some(Network {
+                link,
+                mac,
+                pcap: None,
+            });
         } else if parsed.value("mac").is_some() {
             return Err(usage_err("--mac needs --network".to_string()));
         }
