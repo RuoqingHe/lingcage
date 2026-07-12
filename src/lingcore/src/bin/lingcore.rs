@@ -141,6 +141,12 @@ mod imp {
             help: "MAC address of the virtio-net device, aa:bb:cc:dd:ee:ff",
         },
         Flag {
+            name: "pcap",
+            value: "FILE",
+            required: false,
+            help: "write frames of the network link to FILE in pcap format, needs --network",
+        },
+        Flag {
             name: "seccomp",
             value: "MODE",
             required: false,
@@ -387,10 +393,10 @@ mod imp {
             config.network = Some(Network {
                 link,
                 mac,
-                pcap: None,
+                pcap: parsed.value("pcap").map(PathBuf::from),
             });
-        } else if parsed.value("mac").is_some() {
-            return Err(usage_err("--mac needs --network".to_string()));
+        } else if parsed.value("mac").is_some() || parsed.value("pcap").is_some() {
+            return Err(usage_err("--mac and --pcap need --network".to_string()));
         }
         if let Some(mode) = parsed.value("seccomp") {
             config.confine = parse_seccomp(mode).map_err(usage_err)?;
@@ -683,6 +689,7 @@ mod imp {
                 vec!["--kernel", "k", "--mac", "aa:bb:cc:dd:ee:ff"],
                 vec!["--kernel", "k", "--network", "tap0"],
                 vec!["--kernel", "k", "--network", "unix:"],
+                vec!["--kernel", "k", "--pcap", "link.pcap"],
                 vec!["--kernel", "k", "--timeout", "soon"],
                 vec!["--kernel", "k", "extra"],
                 vec!["--kernel", "k", "--flag"],
@@ -716,6 +723,20 @@ mod imp {
             ));
             assert!(parse_link("/tmp/net.sock").is_err());
             assert!(parse_link("tcp:1").is_err());
+        }
+
+        #[test]
+        fn test_parse_pcap_with_network() {
+            let args: Vec<String> = ["--kernel", "k", "--network", "user", "--pcap", "link.pcap"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let config = config_of(&parse(&args).unwrap()).unwrap();
+            let network = config.network.expect("network link");
+            assert_eq!(
+                network.pcap.as_deref(),
+                Some(std::path::Path::new("link.pcap"))
+            );
         }
 
         #[test]

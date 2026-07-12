@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use log::warn;
 
 use crate::devices::virtio::net::carrier::Carrier;
+use crate::devices::virtio::net::frame::MAX_FRAME;
 use crate::hv::Interest;
 
 /// Magic of a pcap file with microsecond timestamps, written in byte
@@ -29,7 +30,7 @@ const LINKTYPE_ETHERNET: u32 = 1;
 
 /// Bytes of a frame a record keeps at most, `MAX_FRAME`, so no frame is
 /// cut.
-const SNAPLEN: u32 = super::frame::MAX_FRAME as u32;
+const SNAPLEN: u32 = MAX_FRAME as u32;
 
 /// Bytes of file header.
 const FILE_HEADER: usize = 24;

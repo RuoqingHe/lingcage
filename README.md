@@ -149,6 +149,7 @@ Flags, only `--kernel` is required:
 - `--network LINK`, `user` for the network stack in this process, or `unix:PATH` for a host socket
   carrying Ethernet frames of a virtio-net device, a 4-byte length ahead of each frame.
 - `--mac ADDR`, MAC address of the virtio-net device, needs `--network`.
+- `--pcap FILE`, write frames of the network link to FILE in pcap format, needs `--network`.
 - `--seccomp MODE`, syscall allowlist of guest threads, `trap` by default, `errno` or `none`.
 - `--timeout SECS`, stop the guest after SECS seconds.
 
