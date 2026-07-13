@@ -15,6 +15,7 @@ pub mod boot;
 pub mod devices;
 #[cfg(feature = "hv")]
 pub mod hv;
+pub mod logging;
 // Boot tables are of a PC or a device tree, and `KVM_IOEVENTFD` is a
 // Linux interface.
 #[cfg(all(
