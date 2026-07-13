@@ -113,6 +113,9 @@ pub enum Error {
     /// Failed to create pcap file of the network link.
     #[error("failed to create pcap file")]
     Pcap(#[source] std::io::Error),
+    /// Failed to start a guest thread.
+    #[error("failed to start thread")]
+    Thread(#[source] std::io::Error),
     /// `Config::kernel` is empty.
     #[error("guest needs a kernel")]
     NoKernel,
@@ -877,17 +880,18 @@ impl<H: Hypervisor> Machine<H> {
         } else {
             Thread::Device
         })?;
-        self.threads = self
-            .vcpus
-            .iter()
-            .map(|vcpu| {
-                let mut devices = self.devices.clone();
-                // The thread keeps the pages mapped after the `Machine` drops.
-                let ram = self.ram.clone();
-                let orders = Arc::clone(&self.orders);
-                let vcpu = Arc::clone(vcpu);
-                let driving = driving.clone();
-                std::thread::spawn(move || {
+        let mut threads = Vec::with_capacity(self.vcpus.len());
+        for (index, vcpu) in self.vcpus.iter().enumerate() {
+            let mut devices = self.devices.clone();
+            // The thread keeps the pages mapped after the `Machine` drops.
+            let ram = self.ram.clone();
+            let orders = Arc::clone(&self.orders);
+            let vcpu = Arc::clone(vcpu);
+            let driving = driving.clone();
+            // Name shows in a log line and in `ps`.
+            let spawned = std::thread::Builder::new()
+                .name(format!("vcpu{index}"))
+                .spawn(move || {
                     let _ram = ram;
                     let _signal = SignalOnDrop(Arc::clone(&orders));
                     // From here on the thread runs the guest and writes the
@@ -913,9 +917,20 @@ impl<H: Hypervisor> Machine<H> {
                             Order::Stop => break Ok(exit),
                         }
                     }
-                })
-            })
-            .collect();
+                });
+            match spawned {
+                Ok(thread) => threads.push(thread),
+                Err(err) => {
+                    // vCPUs started so far are stopped and joined, so
+                    // none runs the guest behind a failed start.
+                    self.threads = threads;
+                    self.orders.tell(Order::Stop);
+                    self.join()?;
+                    return Err(Error::Thread(err));
+                }
+            }
+        }
+        self.threads = threads;
 
         // One thread per machine, waiting on the ioeventfds, host
         // descriptors and deadlines of each device. Fewer threads per
@@ -951,7 +966,8 @@ impl<H: Hypervisor> Machine<H> {
         }
         let orders = Arc::clone(&self.orders);
         let filter = working.clone();
-        self.device_threads = vec![std::thread::spawn(move || {
+        let builder = std::thread::Builder::new().name("device".to_string());
+        let spawned = builder.spawn(move || {
             let _signal = SignalOnDrop(Arc::clone(&orders));
             if let Some(filter) = filter {
                 filter.confine()?;
@@ -1042,7 +1058,15 @@ impl<H: Hypervisor> Machine<H> {
                 }
             }
             Ok(())
-        })];
+        });
+        self.device_threads = match spawned {
+            Ok(thread) => vec![thread],
+            Err(err) => {
+                self.orders.tell(Order::Stop);
+                self.join()?;
+                return Err(Error::Thread(err));
+            }
+        };
 
         self.state = State::Running;
         Ok(())
