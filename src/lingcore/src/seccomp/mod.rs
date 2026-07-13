@@ -73,12 +73,14 @@ pub enum Refusal {
 
 /// Syscalls in each allowlist, `brk` and the `mmap` family for the
 /// allocator, `futex` for a hold, `rt_sigreturn` for a kick, `exit`,
-/// `exit_group` for the `SIGSYS` handler, and `write`.
+/// `exit_group` for the `SIGSYS` handler, `write` for a log line and
+/// `clock_gettime` for its stamp on a host without the vDSO.
 ///
 /// Not listed: process creation, sockets, `ptrace`, `openat`, `mount`
 /// and module loading.
 const COMMON: &[libc::c_long] = &[
     libc::SYS_brk,
+    libc::SYS_clock_gettime,
     libc::SYS_exit,
     libc::SYS_exit_group,
     libc::SYS_futex,
@@ -357,6 +359,38 @@ mod tests {
             (-1, libc::ENOSYS),
             "TIOCGWINSZ was allowed on a vCPU thread"
         );
+    }
+
+    #[test]
+    fn test_logger_writes_under_allowlist() {
+        // The line logged under the vCPU allowlist is read back. It is
+        // returned from the closure, since a drop inside would close the
+        // socket pair with a call the list refuses.
+        use std::io::Read as _;
+        use std::os::unix::net::UnixStream;
+
+        use log::Log as _;
+
+        use crate::logging::Logger;
+
+        let (mut reading, writing) = UnixStream::pair().expect("socket pair");
+        let file = std::fs::File::from(std::os::fd::OwnedFd::from(writing));
+        let logger = Logger::new("test", log::LevelFilter::Debug, Some(file));
+        let logger = under(Thread::Vcpu, move || {
+            logger.log(
+                &log::Record::builder()
+                    .args(format_args!("confined hello"))
+                    .level(log::Level::Warn)
+                    .target("seccomp")
+                    .build(),
+            );
+            logger
+        });
+        drop(logger);
+        let mut text = String::new();
+        reading.read_to_string(&mut text).expect("read the line");
+        assert!(text.starts_with("test: "), "line: {text}");
+        assert!(text.ends_with(" seccomp: confined hello\n"), "line: {text}");
     }
 
     #[test]
