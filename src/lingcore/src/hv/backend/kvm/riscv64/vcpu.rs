@@ -13,7 +13,7 @@ use kvm_bindings::{
     KVM_REG_RISCV_ISA_SINGLE, KVM_REG_RISCV_TIMER, kvm_riscv_config, kvm_riscv_timer, kvm_run,
 };
 use kvm_ioctls::VcpuFd;
-use log::warn;
+use log::debug;
 
 use crate::hv::arch::{ConfigReg, Reg};
 use crate::hv::backend::kvm::riscv64::{
@@ -53,7 +53,8 @@ fn refuse_sbi(run: &mut kvm_run) {
     // SAFETY: the exit was `KVM_EXIT_RISCV_SBI`, so `riscv_sbi` is the
     // union arm filled in by KVM.
     let call = unsafe { &mut run.__bindgen_anon_1.riscv_sbi };
-    warn!(
+    // The guest picks the calls, so this stays at debug.
+    debug!(
         "SBI extension {:#x} function {:#x} not offered, refused",
         call.extension_id, call.function_id
     );
@@ -78,7 +79,7 @@ fn answer_csr(run: &mut kvm_run) {
             SEED_WAIT
         }
     } else {
-        warn!("CSR {:#x} not emulated, read as zero", access.csr_num);
+        debug!("CSR {:#x} not emulated, read as zero", access.csr_num);
         0
     };
 }
