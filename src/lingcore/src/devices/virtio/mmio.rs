@@ -11,7 +11,7 @@
 use std::io;
 use std::time::Duration;
 
-use log::warn;
+use log::{debug, warn};
 
 use crate::devices::virtio::Device;
 use crate::devices::virtio::queue::Queue;
@@ -131,6 +131,13 @@ pub struct Transport {
     queue_sel: u32,
     interrupt_status: u32,
     queues: Vec<Slot>,
+    /// Notifications served, from the ioeventfd or a restore.
+    notified: u64,
+    /// Writes of the driver refused by the transport, a legacy handshake,
+    /// a queue it can not index, a notify of wrong width or a chain the
+    /// device rejected. Each one is logged at debug, since the driver can
+    /// repeat it as fast as it likes.
+    faults: u64,
 }
 
 impl Transport {
@@ -149,7 +156,21 @@ impl Transport {
             queue_sel: 0,
             interrupt_status: 0,
             queues,
+            notified: 0,
+            faults: 0,
         }
+    }
+
+    /// Returns device ID of the device behind transport.
+    pub fn device_id(&self) -> u32 {
+        self.device.device_id()
+    }
+
+    /// Returns counts of the transport, then those of the device.
+    pub fn counts(&self) -> Vec<(&'static str, u64)> {
+        let mut counts = vec![("notified", self.notified), ("faults", self.faults)];
+        counts.extend(self.device.counts());
+        counts
     }
 
     /// Returns the slot selected by `QUEUE_SEL`, if the device has that queue.
@@ -209,7 +230,8 @@ impl Transport {
         // `FEATURES_OK` without `VIRTIO_F_VERSION_1` means legacy driver. Fail
         // the handshake here, before it lays out legacy rings.
         if value & STATUS_FEATURES_OK != 0 && self.driver_features & VERSION_1 == 0 {
-            warn!("FEATURES_OK without VIRTIO_F_VERSION_1, status set to FAILED");
+            debug!("FEATURES_OK without VIRTIO_F_VERSION_1, status set to FAILED");
+            self.faults += 1;
             self.status = value | STATUS_FAILED;
             return;
         }
@@ -252,7 +274,8 @@ impl Transport {
                     // Ring can not be indexed at that size, so it is not read
                     // and `DEVICE_NEEDS_RESET` is set.
                     Err(refused) => {
-                        warn!("failed to build queue, DEVICE_NEEDS_RESET set: {refused}");
+                        debug!("failed to build queue, DEVICE_NEEDS_RESET set: {refused}");
+                        self.faults += 1;
                         self.status |= STATUS_NEEDS_RESET;
                     }
                 }
@@ -272,10 +295,12 @@ impl Transport {
             return Ok(());
         };
         let (_, answered) = queue.cursors();
+        self.notified += 1;
         // Malformed chain sets `DEVICE_NEEDS_RESET`, it does not end the
         // run.
         if let Err(refused) = self.device.notify(index, queue, &self.ram) {
-            warn!("queue {index} not served, DEVICE_NEEDS_RESET set: {refused}");
+            debug!("queue {index} not served, DEVICE_NEEDS_RESET set: {refused}");
+            self.faults += 1;
             self.status |= STATUS_NEEDS_RESET;
             return Ok(());
         }
@@ -378,7 +403,8 @@ impl BusDevice for Transport {
             // allowlist refuses what serving a queue needs. Only the
             // device thread serves the ioeventfd.
             None if offset == QUEUE_NOTIFY && size != 4 => {
-                warn!("{size}-byte QUEUE_NOTIFY store of {value:#x} ignored");
+                debug!("{size}-byte QUEUE_NOTIFY store of {value:#x} ignored");
+                self.faults += 1;
             }
             // Registers are 32 bits wide, wider write carries its low word.
             None => self.write_register(offset, value as u32)?,
@@ -422,7 +448,9 @@ impl BusDevice for Transport {
             let (_, answered) = queue.cursors();
             // Malformed chain sets `DEVICE_NEEDS_RESET` like `notify` does,
             // it does not fail the restore.
+            self.notified += 1;
             if let Err(refused) = self.device.restored(index, queue, &self.ram) {
+                self.faults += 1;
                 warn!(
                     "queue {index} not served after a restore, DEVICE_NEEDS_RESET set: {refused}"
                 );
@@ -857,9 +885,10 @@ mod tests {
 
     #[test]
     fn test_refusals_logged() {
-        // Each refusal is logged at `Warn` with its reason: `FEATURES_OK`
-        // without `VIRTIO_F_VERSION_1`, queue size not supported by the
-        // device, and a chain rejected by the backend.
+        // Each refusal is logged at `Debug` with its reason and counted as
+        // a fault: `FEATURES_OK` without `VIRTIO_F_VERSION_1`, queue size
+        // not supported by the device, and a chain rejected by the
+        // backend.
         recording();
         let line = Counter(Arc::new(AtomicUsize::new(0)));
         let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
@@ -897,8 +926,13 @@ mod tests {
         let said: Vec<&str> = kept.iter().map(|(_, line)| line.as_str()).collect();
         assert_eq!(kept.len(), 3, "records are {said:?}");
         assert!(
-            kept.iter().all(|(level, _)| *level == Level::Warn),
-            "record not at Warn level: {kept:?}"
+            kept.iter().all(|(level, _)| *level == Level::Debug),
+            "record not at Debug level: {kept:?}"
+        );
+        assert_eq!(
+            mmio.counts(),
+            vec![("notified", 1), ("faults", 3)],
+            "counts of the transport"
         );
         assert!(said[0].contains("VERSION_1"), "record was {:?}", said[0]);
         // Size written to `QUEUE_NUM` should be in the record.

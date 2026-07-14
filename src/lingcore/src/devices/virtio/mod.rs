@@ -119,6 +119,12 @@ pub trait Device: Send {
         None
     }
 
+    /// Returns counts kept by the device, each with its name, read for a
+    /// log line at teardown. Default keeps none.
+    fn counts(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
+
     /// Handle a notification on queue `index`. Pop chains from `queue` and
     /// report each of them as used.
     fn notify(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()>;
