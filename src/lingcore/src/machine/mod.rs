@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use log::{debug, error};
+use log::{debug, error, info};
 use thiserror::Error;
 
 use crate::devices::bus::Bus;
@@ -552,6 +552,8 @@ pub struct Machine<H: Hypervisor> {
     /// Set if the network link is the stack in this process, the device
     /// thread then takes the wider allowlist.
     host_stack: bool,
+    /// Moment the assembly began, log lines of the phases count from it.
+    assembled: Instant,
     state: State,
 }
 
@@ -601,19 +603,35 @@ impl<H: Hypervisor> Machine<H> {
         if config.kernel.as_os_str().is_empty() {
             return Err(Error::NoKernel);
         }
+        let assembled = Instant::now();
+        let since = |assembled: Instant| assembled.elapsed().as_secs_f64() * 1e3;
         let vm = hv.create_vm()?;
         let memory = vm.create_vm_memory()?;
         for region in ram.regions() {
             memory.mem_map(region.gpa, region.size, region.hva, MemMapOption::default())?;
         }
+        info!(
+            "{} MiB of guest RAM mapped, {:.1} ms",
+            config.memory >> 20,
+            since(assembled)
+        );
         let loaded = match entry {
             Entry::Boot => Some(load(config, &ram)?),
             Entry::Restored => None,
         };
+        match entry {
+            Entry::Boot => info!(
+                "kernel loaded from {}, {:.1} ms",
+                config.kernel.display(),
+                since(assembled)
+            ),
+            Entry::Restored => info!("RAM cloned from a template, {:.1} ms", since(assembled)),
+        }
 
         // The irqchip goes into the kernel together with vCPUs. Devices come
         // after it, since their lines bind to it.
         let mut vcpus = create_vcpus(hv, &vm, config)?;
+        info!("{} vCPUs created, {:.1} ms", config.vcpus, since(assembled));
 
         let mut bus = Bus::new();
         let line = vm.create_irq_sender(COM1_IRQ)?;
@@ -667,6 +685,11 @@ impl<H: Hypervisor> Machine<H> {
                 &mut bus, &vm, &registry, &ram, slot as u8, device,
             )?);
         }
+        info!(
+            "{} virtio devices placed, {:.1} ms",
+            wired.len(),
+            since(assembled)
+        );
 
         // The description names the devices on the bus with their lines, so
         // command line carries no `virtio_mmio.device=` fragments, and vCPU 0
@@ -704,6 +727,7 @@ impl<H: Hypervisor> Machine<H> {
                     ..
                 })
             ),
+            assembled,
             state: State::Created,
         })
     }
@@ -850,6 +874,10 @@ impl<H: Hypervisor> Machine<H> {
         {
             self.vm.set_clock(blob)?;
         }
+        info!(
+            "guest restored from a snapshot, {:.1} ms after assembly",
+            self.assembled.elapsed().as_secs_f64() * 1e3
+        );
         Ok(())
     }
 
@@ -1069,6 +1097,11 @@ impl<H: Hypervisor> Machine<H> {
         };
 
         self.state = State::Running;
+        info!(
+            "guest started with {} vCPU threads and a device thread, {:.1} ms after assembly",
+            self.threads.len(),
+            self.assembled.elapsed().as_secs_f64() * 1e3
+        );
         Ok(())
     }
 
@@ -1204,7 +1237,12 @@ impl<H: Hypervisor> Machine<H> {
         }
         self.state = State::Shutdown;
         devices?;
-        first.unwrap_or(Ok(VmExit::Shutdown))
+        let exit = first.unwrap_or(Ok(VmExit::Shutdown))?;
+        info!(
+            "guest stopped on {exit:?}, {:.3} s after assembly",
+            self.assembled.elapsed().as_secs_f64()
+        );
+        Ok(exit)
     }
 }
 
