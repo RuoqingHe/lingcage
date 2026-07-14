@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use log::error;
+use log::{debug, error};
 use thiserror::Error;
 
 use crate::devices::bus::Bus;
@@ -1188,6 +1188,18 @@ impl<H: Hypervisor> Machine<H> {
                 .and_then(|ended| ended);
             if devices.is_ok() {
                 devices = ended;
+            }
+        }
+        // Counts are read once no thread serves the devices, the lock is
+        // free and each count is final.
+        if log::log_enabled!(log::Level::Debug) {
+            for (slot, wired) in self.wired.iter().enumerate() {
+                let (id, counts) = wired.transport.with(|t| (t.device_id(), t.counts()));
+                let listed: Vec<String> = counts
+                    .iter()
+                    .map(|(name, count)| format!("{name} {count}"))
+                    .collect();
+                debug!("virtio slot {slot} device {id}: {}", listed.join(", "));
             }
         }
         self.state = State::Shutdown;
