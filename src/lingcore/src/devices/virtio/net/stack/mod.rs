@@ -20,7 +20,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 
-use log::warn;
+use log::{debug, warn};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
@@ -180,6 +180,23 @@ struct Proxy {
     guest_closed: bool,
 }
 
+/// Counts of the stack, read for a log line at teardown. Conditions the
+/// guest brings about are counted here and logged at debug, since it can
+/// repeat any of them as fast as it likes.
+#[derive(Default)]
+struct Counted {
+    /// Host connections opened.
+    connections: u64,
+    /// Connections which failed, at the connect or later.
+    failed: u64,
+    /// SYNs refused past `CONNECTIONS`.
+    refused: u64,
+    /// UDP flows opened.
+    flows: u64,
+    /// Frames dropped, from the guest or to it.
+    dropped: u64,
+}
+
 /// One UDP destination of the guest, with a host socket per guest port
 /// talking to it.
 struct Flow {
@@ -208,6 +225,7 @@ pub struct Stack {
     started: Instant,
     /// Next moment smoltcp wants a poll, computed by `poll`.
     due: Option<Tick>,
+    counted: Counted,
 }
 
 impl Stack {
@@ -253,6 +271,7 @@ impl Stack {
             bound: HashMap::new(),
             started,
             due: None,
+            counted: Counted::default(),
         })
     }
 
@@ -330,13 +349,15 @@ impl Stack {
             self.listening.remove(&(ip, port));
         }
         if self.proxies.len() >= CONNECTIONS {
-            warn!("stack refuses a connection to {ip}:{port}, {CONNECTIONS} are open");
+            debug!("stack refuses a connection to {ip}:{port}, {CONNECTIONS} are open");
+            self.counted.refused += 1;
             return;
         }
         let host = match host::connect(self.host_address(ip, port)) {
             Ok(host) => host,
             Err(err) => {
-                warn!("stack could not connect to {ip}:{port}: {err}");
+                debug!("stack could not connect to {ip}:{port}: {err}");
+                self.counted.failed += 1;
                 return;
             }
         };
@@ -355,6 +376,7 @@ impl Stack {
         }
         let handle = self.sockets.add(socket);
         self.listening.insert((ip, port), handle);
+        self.counted.connections += 1;
         self.proxies.insert(
             handle,
             Proxy {
@@ -395,6 +417,7 @@ impl Stack {
         }
         let handle = self.sockets.add(socket);
         self.bound.insert((ip, port), handle);
+        self.counted.flows += 1;
         self.flows.insert(
             handle,
             Flow {
@@ -427,8 +450,10 @@ impl Stack {
             let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
             match pump(proxy, socket) {
                 Ok(busy) => moved |= busy,
+                // A connect refused by the peer is reported here too.
                 Err(err) => {
-                    warn!("stack drops a connection: {err}");
+                    debug!("stack drops a connection: {err}");
+                    self.counted.failed += 1;
                     socket.abort();
                 }
             }
@@ -451,6 +476,7 @@ impl Stack {
         let mut moved = false;
         let mut gone = Vec::new();
         let ip = self.config.ip;
+        let counted = &mut self.counted;
         for (handle, flow) in &mut self.flows {
             let socket = self.sockets.get_mut::<udp::Socket>(*handle);
             // Guest to host, one host socket per guest port.
@@ -465,13 +491,17 @@ impl Stack {
                     None => {
                         let bound = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
                             Ok(bound) => bound,
+                            // Guest picks the ports, so a host out of
+                            // descriptors would be met once per datagram.
                             Err(err) => {
-                                warn!("stack could not bind a UDP socket: {err}");
+                                debug!("stack could not bind a UDP socket: {err}");
+                                counted.failed += 1;
                                 continue;
                             }
                         };
                         if let Err(err) = bound.set_nonblocking(true) {
-                            warn!("stack could not make a UDP socket non-blocking: {err}");
+                            debug!("stack could not make a UDP socket non-blocking: {err}");
+                            counted.failed += 1;
                             continue;
                         }
                         flow.senders.entry(port).or_insert((bound, Instant::now()))
@@ -481,7 +511,7 @@ impl Stack {
                 if let Err(err) = sender.0.send_to(&data, flow.to)
                     && err.kind() != io::ErrorKind::WouldBlock
                 {
-                    warn!("stack could not send a datagram to {}: {err}", flow.to);
+                    debug!("stack could not send a datagram to {}: {err}", flow.to);
                 }
                 moved = true;
             }
@@ -507,7 +537,7 @@ impl Stack {
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                         Err(err) => {
-                            warn!("stack drops a UDP flow to {}: {err}", flow.to);
+                            debug!("stack drops a UDP flow to {}: {err}", flow.to);
                             idle.push(*port);
                             break;
                         }
@@ -630,10 +660,11 @@ impl Carrier for Stack {
         self.poll();
         while let Some(frame) = self.pipe.to_guest.pop_front() {
             if frame.len() > into.len() {
-                warn!(
+                debug!(
                     "frame of {} bytes dropped, does not fit in buffer",
                     frame.len()
                 );
+                self.counted.dropped += 1;
                 continue;
             }
             into[..frame.len()].copy_from_slice(&frame);
@@ -644,17 +675,19 @@ impl Carrier for Stack {
 
     fn give(&mut self, frame: &[u8]) -> io::Result<bool> {
         if frame.len() > MAX_FRAME {
-            warn!(
+            debug!(
                 "frame of {} bytes dropped, longer than MAX_FRAME",
                 frame.len()
             );
+            self.counted.dropped += 1;
             return Ok(true);
         }
         if self.pipe.from_guest.len() >= QUEUE {
-            warn!(
+            debug!(
                 "frame of {} bytes dropped, stack queue is full",
                 frame.len()
             );
+            self.counted.dropped += 1;
             return Ok(true);
         }
         if self.inspect(frame) {
@@ -666,6 +699,16 @@ impl Carrier for Stack {
 
     fn resume(&mut self) -> io::Result<bool> {
         Ok(true)
+    }
+
+    fn counts(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            ("connections", self.counted.connections),
+            ("failed", self.counted.failed),
+            ("refused", self.counted.refused),
+            ("flows", self.counted.flows),
+            ("dropped", self.counted.dropped),
+        ]
     }
 
     /// Returns host sockets, a connection for reading while the guest has
@@ -975,6 +1018,8 @@ mod tests {
         }
         assert!(stack.proxies.is_empty(), "connection left behind");
         assert!(stack.listening.is_empty(), "listener left behind");
+        assert_eq!(stack.counted.connections, 1, "connection not counted");
+        assert_eq!(stack.counted.failed, 0, "connection counted as failed");
     }
 
     #[test]
@@ -1057,5 +1102,6 @@ mod tests {
             "connection stayed open"
         );
         assert!(stack.proxies.is_empty(), "connection left behind");
+        assert_eq!(stack.counted.failed, 1, "refused connect not counted");
     }
 }

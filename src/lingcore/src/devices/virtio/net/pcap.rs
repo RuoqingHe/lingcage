@@ -99,6 +99,10 @@ impl Carrier for Captured {
     fn wake_after(&self) -> Option<Duration> {
         self.inner.wake_after()
     }
+
+    fn counts(&self) -> Vec<(&'static str, u64)> {
+        self.inner.counts()
+    }
 }
 
 /// Returns file header.

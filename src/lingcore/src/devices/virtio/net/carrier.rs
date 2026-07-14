@@ -45,6 +45,12 @@ pub trait Carrier: Send {
     fn wake_after(&self) -> Option<std::time::Duration> {
         None
     }
+
+    /// Returns counts kept by the host end, each with its name, read for
+    /// a log line at teardown. Default keeps none.
+    fn counts(&self) -> Vec<(&'static str, u64)> {
+        Vec::new()
+    }
 }
 
 /// Carrier over a stream socket, each frame has a length prefix ahead.

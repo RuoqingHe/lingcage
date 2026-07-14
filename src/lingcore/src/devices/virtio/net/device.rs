@@ -9,7 +9,7 @@
 
 use std::os::fd::RawFd;
 
-use log::warn;
+use log::{debug, warn};
 
 use crate::devices::virtio::net::carrier::Carrier;
 use crate::devices::virtio::net::frame::{Header, MAX_FRAME, ROOM};
@@ -47,6 +47,12 @@ pub struct Net {
     /// receive buffer.
     receiving: Vec<u8>,
     waiting: Option<usize>,
+    /// Frames written to a receive buffer.
+    received: u64,
+    /// Frames given to the carrier.
+    sent: u64,
+    /// Frames from the carrier dropped for a receive buffer too small.
+    dropped: u64,
 }
 
 impl Net {
@@ -59,6 +65,9 @@ impl Net {
             sending: vec![0u8; ROOM + MAX_FRAME],
             receiving: vec![0u8; MAX_FRAME],
             waiting: None,
+            received: 0,
+            sent: 0,
+            dropped: 0,
         }
     }
 
@@ -87,6 +96,7 @@ impl Net {
                 return Ok(());
             }
             queue.add_used(ram, chain.head, 0)?;
+            self.sent += 1;
         }
         Ok(())
     }
@@ -109,12 +119,17 @@ impl Net {
                 return Ok(());
             };
             match frame_into(&chain, ram, &self.receiving[..len])? {
-                Some(written) => queue.add_used(ram, chain.head, written)?,
+                Some(written) => {
+                    queue.add_used(ram, chain.head, written)?;
+                    self.received += 1;
+                }
                 None => {
                     // Frame longer than the offered buffer is dropped, same
                     // as the driver would do. Buffer is put back for the
-                    // next frame.
-                    warn!("frame of {len} bytes dropped, longer than receive buffer");
+                    // next frame. The driver picks the buffer size, so this
+                    // is counted and logged at debug.
+                    debug!("frame of {len} bytes dropped, longer than receive buffer");
+                    self.dropped += 1;
                     queue.undo_pop();
                 }
             }
@@ -176,6 +191,17 @@ impl Device for Net {
     fn wake_after(&self) -> Option<std::time::Duration> {
         self.carrier.wake_after()
     }
+
+    /// Returns frames each way and dropped, then counts of the carrier.
+    fn counts(&self) -> Vec<(&'static str, u64)> {
+        let mut counts = vec![
+            ("rx", self.received),
+            ("tx", self.sent),
+            ("dropped", self.dropped),
+        ];
+        counts.extend(self.carrier.counts());
+        counts
+    }
 }
 
 /// Read readable buffers of `chain` into `into`, header and frame in one
@@ -202,7 +228,9 @@ fn frame_from(chain: &Chain, ram: &GuestRam, into: &mut [u8]) -> Result<Option<u
         return Ok(None);
     };
     if header.asks_for_an_offload() {
-        warn!("frame with offload header refused, no offload is offered");
+        // The driver asked for an offload which is not offered, transport
+        // counts the refusal as its fault.
+        debug!("frame with offload header refused, no offload is offered");
         return Err(Error::Request);
     }
     Ok(Some(whole))
@@ -408,6 +436,7 @@ mod tests {
         guest_sends(&ram, 0, &Header::default(), b"a frame from the guest");
         net.notify(TX, &mut tx, &ram).expect("notify tx");
         assert_eq!(wired.carried(), vec![b"a frame from the guest".to_vec()]);
+        assert_eq!(net.counts(), vec![("rx", 0), ("tx", 1), ("dropped", 0)]);
     }
 
     #[test]
@@ -525,6 +554,7 @@ mod tests {
             b"the one behind it",
             "buffer went to the frame which fits"
         );
+        assert_eq!(net.counts(), vec![("rx", 1), ("tx", 0), ("dropped", 1)]);
     }
 
     #[test]
