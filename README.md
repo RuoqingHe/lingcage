@@ -152,6 +152,8 @@ Flags, only `--kernel` is required:
 - `--pcap FILE`, write frames of the network link to FILE in pcap format, needs `--network`.
 - `--seccomp MODE`, syscall allowlist of guest threads, `trap` by default, `errno` or `none`.
 - `--timeout SECS`, stop the guest after SECS seconds.
+- `--log-file FILE`, write log lines to FILE instead of stderr.
+- `-v`, log more, once for info, twice for debug, three times for trace. `--verbose` is the same.
 
 Exit codes:
 

@@ -11,6 +11,7 @@
     any(target_arch = "x86_64", target_arch = "riscv64")
 ))]
 mod imp {
+    use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
@@ -21,6 +22,7 @@ mod imp {
     use lingcore::devices::virtio::net::stack::StackConfig;
     use lingcore::hv::backend::kvm::hypervisor::KvmHv;
     use lingcore::hv::vcpu::VmExit;
+    use lingcore::logging::{Logger, level_of};
     use lingcore::machine::{Config, Link, Machine, Network, StopHandle};
     use lingcore::seccomp::Refusal;
 
@@ -158,6 +160,18 @@ mod imp {
             required: false,
             help: "stop the guest after SECS seconds and exit with 124",
         },
+        Flag {
+            name: "log-file",
+            value: "FILE",
+            required: false,
+            help: "write log lines to FILE instead of stderr",
+        },
+        Flag {
+            name: "verbose",
+            value: "",
+            required: false,
+            help: "log more, -v for info, -vv for debug, -vvv for trace",
+        },
     ];
 
     /// Flags parsed from the command line.
@@ -165,6 +179,8 @@ mod imp {
     struct Parsed {
         /// Flag values by name, last one is used if a flag repeats.
         values: Vec<(&'static str, String)>,
+        /// Times `-v` or `--verbose` was given.
+        verbose: u8,
     }
 
     impl Parsed {
@@ -192,6 +208,8 @@ mod imp {
         for flag in FLAGS {
             if flag.required {
                 out.push_str(&format!(" --{} {}", flag.name, flag.value));
+            } else if flag.value.is_empty() {
+                out.push_str(&format!(" [--{}]", flag.name));
             } else {
                 out.push_str(&format!(" [--{} {}]", flag.name, flag.value));
             }
@@ -222,6 +240,13 @@ mod imp {
         while at < args.len() {
             let arg = &args[at];
             at += 1;
+            // `-v` counts once, `-vv` twice, same as `--verbose` repeated.
+            if let Some(more) = arg.strip_prefix("-v")
+                && more.chars().all(|c| c == 'v')
+            {
+                parsed.verbose = parsed.verbose.saturating_add(1 + more.len() as u8);
+                continue;
+            }
             let Some(name) = arg.strip_prefix("--") else {
                 return Err(usage_err(format!("unexpected argument {arg}")));
             };
@@ -232,6 +257,13 @@ mod imp {
             let Some(flag) = FLAGS.iter().find(|flag| flag.name == name) else {
                 return Err(usage_err(format!("unknown flag --{name}")));
             };
+            if flag.value.is_empty() {
+                if inline.is_some() {
+                    return Err(usage_err(format!("flag --{name} takes no value")));
+                }
+                parsed.verbose = parsed.verbose.saturating_add(1);
+                continue;
+            }
             let value = match inline {
                 Some(value) => value.to_string(),
                 None => {
@@ -415,6 +447,16 @@ mod imp {
                 ))),
             },
         }
+    }
+
+    /// Install the logger, writing to `--log-file` or stderr at level `-v`
+    /// asks for. File is opened here, before any allowlist goes on.
+    fn log_to(parsed: &Parsed) -> Result<()> {
+        let file = parsed.value("log-file").map(File::create).transpose()?;
+        Logger::new("lingcore", level_of(parsed.verbose), file)
+            .install()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(())
     }
 
     /// Console sink writing guest output to stdout right away. Stdout is line
@@ -610,6 +652,7 @@ mod imp {
     fn boot(parsed: &Parsed) -> Result<i32> {
         let config = config_of(parsed)?;
         let timeout = timeout_of(parsed)?;
+        log_to(parsed)?;
         keep_heap();
         let hv = KvmHv::new().map_err(lingcore::machine::Error::from)?;
         let mut machine = Machine::new(&hv, &config, Sink)?;
@@ -659,6 +702,7 @@ mod imp {
         fn test_help_lists_flags_and_exit_codes() {
             let help = cli_help();
             assert!(help.contains("--kernel K"), "help: {help}");
+            assert!(help.contains("[--verbose]"), "help: {help}");
             assert!(help.contains("124"), "help: {help}");
         }
 
@@ -691,6 +735,8 @@ mod imp {
                 vec!["--kernel", "k", "--network", "unix:"],
                 vec!["--kernel", "k", "--pcap", "link.pcap"],
                 vec!["--kernel", "k", "--timeout", "soon"],
+                vec!["--kernel", "k", "--verbose=2"],
+                vec!["--kernel", "k", "-vx"],
                 vec!["--kernel", "k", "extra"],
                 vec!["--kernel", "k", "--flag"],
             ] {
@@ -703,6 +749,19 @@ mod imp {
                     matches!(outcome, Err(CliError::Usage { .. })),
                     "accepted {args:?}: {outcome:?}"
                 );
+            }
+        }
+
+        #[test]
+        fn test_parse_verbose_counts() {
+            for (args, count) in [
+                (vec!["--kernel", "k"], 0),
+                (vec!["--kernel", "k", "-v"], 1),
+                (vec!["-vv", "--kernel", "k"], 2),
+                (vec!["--kernel", "k", "--verbose", "-v", "--verbose"], 3),
+            ] {
+                let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+                assert_eq!(parse(&args).unwrap().verbose, count, "args {args:?}");
             }
         }
 
