@@ -126,6 +126,18 @@ impl Starting {
                     ready.uptime,
                     self.inner.started.elapsed().as_secs_f64() * 1e3
                 );
+                crate::event::emit(
+                    "sandbox",
+                    "ready",
+                    serde_json::json!({
+                        "id": self.inner.id.as_str(),
+                        "hostname": hostname,
+                        "agent": ready.agent,
+                        "init_ms": ready.init_ms,
+                        "uptime": ready.uptime,
+                        "after_ms": self.inner.started.elapsed().as_millis() as u64,
+                    }),
+                );
                 self.inner.identity.hostname = hostname;
                 Ok(Sandbox {
                     inner: Arc::new(self.inner),
@@ -193,7 +205,18 @@ impl Sandbox {
         )
         .map_err(Error::Io)?;
         match assemble(hv, template, spec, id, run_dir.clone()) {
-            Ok(starting) => Ok(starting),
+            Ok(starting) => {
+                crate::event::emit(
+                    "sandbox",
+                    "starting",
+                    serde_json::json!({
+                        "id": starting.inner.id.as_str(),
+                        "template": template.id().to_string(),
+                        "hostname": starting.inner.identity.hostname,
+                    }),
+                );
+                Ok(starting)
+            }
             Err(err) => {
                 if let Err(left) = std::fs::remove_dir_all(&run_dir) {
                     log::warn!("run directory of failed start not removed: {left}");
@@ -457,6 +480,11 @@ impl Inner {
             return Ok(());
         }
         log::info!("sandbox {} torn down, {how}", self.id);
+        crate::event::emit(
+            "sandbox",
+            "stopped",
+            serde_json::json!({ "id": self.id.as_str(), "how": how }),
+        );
         let stopped = match self.machine.lock().unwrap().take() {
             Some(mut machine) if matches!(machine.state(), State::Running | State::Paused) => {
                 machine.stop().and_then(|()| machine.wait().map(drop))

@@ -73,6 +73,11 @@ impl TemplateStore {
         match built {
             Ok(template) => {
                 log::info!("template {} built", template.id());
+                crate::event::emit(
+                    "template",
+                    "built",
+                    serde_json::json!({ "id": template.id().to_string() }),
+                );
                 Ok(template)
             }
             Err(err) => {
