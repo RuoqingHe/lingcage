@@ -12,6 +12,7 @@
 ))]
 mod imp {
     use std::io::Write;
+    use std::os::fd::FromRawFd as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::time::{Duration, SystemTime};
@@ -306,9 +307,10 @@ mod imp {
         }
         out.push_str("\n`lingcage <verb> --help` prints flags of a specific verb.\n");
         out.push_str(
-            "\nflags of every verb, ahead of the verb or after it:\n  -v, --verbose    log more, \
-             -v for info, -vv for debug, -vvv for trace\n  --log-file FILE  write log lines to \
-             FILE instead of stderr\n",
+            "\nflags of every verb, ahead of the verb or after it:\n  -v, --verbose         log \
+             more, -v for info, -vv for debug, -vvv for trace\n  --log-file FILE       write log \
+             lines to FILE instead of stderr\n  --event-monitor SPEC  write events as JSON lines \
+             to path=FILE or fd=N\n",
         );
         out.push_str(
             "\nexit codes:\n  0    success; for run, the command's own status\n  \
@@ -417,6 +419,8 @@ mod imp {
         verbose: u8,
         /// `--log-file`, log lines go there instead of stderr.
         log_file: Option<PathBuf>,
+        /// `--event-monitor`, `path=FILE` or `fd=N` the events go to.
+        event_monitor: Option<String>,
     }
 
     /// Take flags of the program off `args`, returns them with the rest
@@ -441,20 +445,33 @@ mod imp {
             }
             match arg.as_str() {
                 "--verbose" => global.verbose = global.verbose.saturating_add(1),
-                "--log-file" => {
-                    let Some(path) = args.get(at) else {
-                        return Err(global_err("flag --log-file needs a value".to_string()));
+                "--log-file" | "--event-monitor" => {
+                    let Some(value) = args.get(at) else {
+                        return Err(global_err(format!("flag {arg} needs a value")));
                     };
                     at += 1;
-                    global.log_file = Some(PathBuf::from(path));
+                    global.take(arg, value);
                 }
-                _ => match arg.strip_prefix("--log-file=") {
-                    Some(path) => global.log_file = Some(PathBuf::from(path)),
-                    None => rest.push(arg.clone()),
+                _ => match arg.split_once('=') {
+                    Some((name @ ("--log-file" | "--event-monitor"), value)) => {
+                        global.take(name, value);
+                    }
+                    _ => rest.push(arg.clone()),
                 },
             }
         }
         Ok((global, rest))
+    }
+
+    impl Global {
+        /// Keep `value` of flag `name`, one which takes a value.
+        fn take(&mut self, name: &str, value: &str) {
+            if name == "--log-file" {
+                self.log_file = Some(PathBuf::from(value));
+            } else {
+                self.event_monitor = Some(value.to_string());
+            }
+        }
     }
 
     /// Build a usage error of the program with CLI help attached.
@@ -476,6 +493,37 @@ mod imp {
         Logger::new("lingcage", level_of(global.verbose), file)
             .install()
             .map_err(|err| std::io::Error::other(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Open file of `--event-monitor`, `path=FILE` creates it and `fd=N`
+    /// takes a descriptor open already.
+    fn event_file(spec: &str) -> Result<std::fs::File> {
+        if let Some(path) = spec.strip_prefix("path=") {
+            return Ok(std::fs::File::create(path)?);
+        }
+        let fd = spec
+            .strip_prefix("fd=")
+            .and_then(|fd| fd.parse::<i32>().ok())
+            .ok_or_else(|| {
+                global_err(format!(
+                    "invalid event monitor {spec}, use path=FILE or fd=N"
+                ))
+            })?;
+        // SAFETY: `fcntl` with `F_GETFD` takes no pointer.
+        if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            return Err(global_err(format!("descriptor {fd} is not open")));
+        }
+        // SAFETY: the descriptor is open and handed over by the caller, it
+        // is owned from here.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+
+    /// Route events to the file of `--event-monitor`, if given.
+    fn monitor(global: &Global) -> Result<()> {
+        if let Some(spec) = &global.event_monitor {
+            lingcage::event::route(event_file(spec)?);
+        }
         Ok(())
     }
 
@@ -506,6 +554,7 @@ mod imp {
         }
         let parsed = parse(verb, rest)?;
         log_to(&global)?;
+        monitor(&global)?;
         (verb.run)(verb, &parsed)
     }
 
@@ -1103,8 +1152,8 @@ mod imp {
         use std::time::Duration;
 
         use crate::imp::{
-            CliError, Global, VERBS, Verb, check_socket_room, cli_help, find_verb, parse,
-            parse_duration, parse_memory, take_global, verb_help,
+            CliError, Global, VERBS, Verb, check_socket_room, cli_help, event_file, find_verb,
+            parse, parse_duration, parse_memory, take_global, verb_help,
         };
 
         /// Look up the verb named `words` in `VERBS` table.
@@ -1269,21 +1318,46 @@ mod imp {
                 Global {
                     verbose: 2,
                     log_file: Some("lingcage.log".into()),
+                    event_monitor: None,
                 }
             );
             assert_eq!(
                 rest,
                 strings(&["run", "--template", "t", "--", "sh", "-vv"])
             );
-            let (global, rest) =
-                take_global(&strings(&["-vvv", "--log-file=x", "template", "ls"])).expect("take");
+            let (global, rest) = take_global(&strings(&[
+                "-vvv",
+                "--log-file=x",
+                "template",
+                "ls",
+                "--event-monitor",
+                "fd=3",
+            ]))
+            .expect("take");
             assert_eq!(global.verbose, 3);
             assert_eq!(global.log_file.as_deref(), Some(std::path::Path::new("x")));
+            assert_eq!(global.event_monitor.as_deref(), Some("fd=3"));
             assert_eq!(rest, strings(&["template", "ls"]));
             assert!(matches!(
                 take_global(&strings(&["run", "--log-file"])),
                 Err(CliError::Usage { .. })
             ));
+        }
+
+        #[test]
+        fn test_event_file_spec() {
+            // A path is created, a closed descriptor and another shape are
+            // refused.
+            let path = std::env::temp_dir().join(format!("lingcage-events-{}", std::process::id()));
+            let spec = format!("path={}", path.display());
+            assert!(event_file(&spec).is_ok(), "path not created");
+            std::fs::remove_file(&path).expect("remove the file");
+            for spec in ["fd=-1", "fd=999999", "fd=three", "socket"] {
+                assert!(
+                    matches!(event_file(spec), Err(CliError::Usage { .. })),
+                    "accepted {spec}"
+                );
+            }
         }
 
         #[test]
