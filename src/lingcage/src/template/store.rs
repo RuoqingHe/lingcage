@@ -71,7 +71,10 @@ impl TemplateStore {
         std::fs::create_dir_all(&staging).map_err(Error::Io)?;
         let built = self.boot_and_capture(plan, &hv, cid, &tag, &staging);
         match built {
-            Ok(template) => Ok(template),
+            Ok(template) => {
+                log::info!("template {} built", template.id());
+                Ok(template)
+            }
             Err(err) => {
                 // Failed build should leave no directory in the store.
                 // A dir already gone is not an error.
@@ -438,7 +441,12 @@ fn handshake(
             ),
         });
     }
-    log::debug!("build agent up in {} ms: {}", ready.init_ms, ready.agent);
+    log::info!(
+        "build guest ready, agent {} up in {} ms, guest uptime {:.2} s",
+        ready.agent,
+        ready.init_ms,
+        ready.uptime
+    );
     let answer =
         crate::lcp::Frame::with_payload(FIRST_REQUEST, crate::lcp::kind::IDENTIFY, 0, identity)
             .map_err(Error::Protocol)?;

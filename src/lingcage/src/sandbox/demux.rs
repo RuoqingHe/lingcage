@@ -189,10 +189,10 @@ impl Demux {
 
     /// Accept the first connection and run handshake as generation 1, then
     /// spawn accept loop for reconnects and log drain thread. Returns the
-    /// hostname read back from guest.
-    pub fn identify_first(self: &Arc<Self>, deadline: Instant) -> Result<String> {
+    /// hostname read back from guest with the `READY` message of the agent.
+    pub fn identify_first(self: &Arc<Self>, deadline: Instant) -> Result<(String, lcp::Ready)> {
         let stream = accept_within(&self.listener, deadline, "incoming connection from agent")?;
-        let hostname = identify(&stream, &self.identity, 1, deadline)?;
+        let (hostname, ready) = identify(&stream, &self.identity, 1, deadline)?;
         self.install(stream, 1)?;
         // Each thread is named, name shows in a log line and in `ps`.
         let accept_loop = std::thread::Builder::new()
@@ -211,7 +211,7 @@ impl Demux {
                 .map_err(Error::Io)?;
             *self.drainer.lock().unwrap() = Some(drainer);
         }
-        Ok(hostname)
+        Ok((hostname, ready))
     }
 
     /// Install `stream` as the live connection, replacing the old one.
@@ -281,7 +281,7 @@ impl Demux {
     /// Run the handshake on a reconnect, then install the connection.
     fn adopt(self: &Arc<Self>, stream: UnixStream) -> Result<()> {
         let generation = self.generation();
-        let hostname = identify(
+        let (hostname, _) = identify(
             &stream,
             &self.identity,
             generation,
@@ -460,7 +460,7 @@ fn identify(
     identity: &Identity,
     generation: u64,
     deadline: Instant,
-) -> Result<String> {
+) -> Result<(String, lcp::Ready)> {
     let first = crate::deadline::frame(stream, deadline, "ready frame")?;
     if first.kind != lcp::kind::READY || first.flags & lcp::flags::SESSION_START == 0 {
         return Err(Error::Agent {
@@ -505,7 +505,7 @@ fn identify(
         });
     }
     let identified: lcp::Identified = answer.payload().map_err(Error::Protocol)?;
-    Ok(identified.hostname)
+    Ok((identified.hostname, ready))
 }
 
 #[cfg(test)]

@@ -116,21 +116,30 @@ impl Starting {
     pub fn ready(mut self, within: Duration) -> Result<Sandbox> {
         let deadline = Instant::now() + within;
         match self.inner.demux.identify_first(deadline) {
-            Ok(hostname) => {
+            Ok((hostname, ready)) => {
+                log::info!(
+                    "sandbox {} ready as {hostname}, agent {} up in {} ms, guest uptime {:.2} s, \
+                     {:.1} ms after start",
+                    self.inner.id,
+                    ready.agent,
+                    ready.init_ms,
+                    ready.uptime,
+                    self.inner.started.elapsed().as_secs_f64() * 1e3
+                );
                 self.inner.identity.hostname = hostname;
                 Ok(Sandbox {
                     inner: Arc::new(self.inner),
                 })
             }
             Err(_) if self.inner.faulted() => {
-                if let Err(err) = self.inner.teardown() {
+                if let Err(err) = self.inner.teardown("lost image") {
                     log::warn!("teardown of guest with lost image failed: {err}");
                 }
                 Err(Error::Image)
             }
             Err(source) => {
                 let console_tail = self.inner.console.tail(CONSOLE_TAIL);
-                if let Err(err) = self.inner.teardown() {
+                if let Err(err) = self.inner.teardown("not ready") {
                     log::warn!("teardown of not ready guest failed: {err}");
                 }
                 Err(Error::NotReady {
@@ -148,7 +157,7 @@ impl Starting {
 
     /// Give up on the guest and tear it down.
     pub fn abandon(self) -> Result<()> {
-        self.inner.teardown()
+        self.inner.teardown("abandoned")
     }
 }
 
@@ -344,13 +353,13 @@ impl Sandbox {
             log::warn!("failed to send shutdown request: {err}");
         }
         let exit = self.inner.await_exit(within)?;
-        self.inner.teardown()?;
+        self.inner.teardown(&how(&exit))?;
         Ok(exit)
     }
 
     /// Stop the guest without power-off and tear down, consumes the sandbox.
     pub fn kill(self) -> Result<Exit> {
-        self.inner.teardown()?;
+        self.inner.teardown("killed")?;
         Ok(Exit::Killed {
             after: Duration::ZERO,
         })
@@ -376,7 +385,7 @@ impl Stopper {
     /// sandbox is already dropped.
     pub fn kill(&self) -> Result<()> {
         match self.inner.upgrade() {
-            Some(inner) => inner.teardown(),
+            Some(inner) => inner.teardown("killed"),
             None => Ok(()),
         }
     }
@@ -398,6 +407,8 @@ struct Inner {
     /// store from removing the template while the sandbox is using it,
     /// until teardown.
     image: Mutex<Option<File>>,
+    /// Moment the start began, readiness is logged against it.
+    started: Instant,
     /// Set by teardown, the lock is held for the entire teardown so that a
     /// second caller would wait for the first one to finish.
     torn: Mutex<bool>,
@@ -437,13 +448,15 @@ impl Inner {
     }
 
     /// Stop the guest and join its threads, stop the demux and remove the
-    /// run directory, only once. `torn` flag is not set if teardown fails,
-    /// so that the following drop would try again.
-    fn teardown(&self) -> Result<()> {
+    /// run directory, only once. `how` goes into the log line, "powered
+    /// off" or "killed". `torn` flag is not set if teardown fails, so
+    /// that the following drop would try again.
+    fn teardown(&self, how: &str) -> Result<()> {
         let mut torn = self.torn.lock().unwrap();
         if *torn {
             return Ok(());
         }
+        log::info!("sandbox {} torn down, {how}", self.id);
         let stopped = match self.machine.lock().unwrap().take() {
             Some(mut machine) if matches!(machine.state(), State::Running | State::Paused) => {
                 machine.stop().and_then(|()| machine.wait().map(drop))
@@ -465,9 +478,19 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if let Err(err) = self.teardown() {
+        if let Err(err) = self.teardown("dropped") {
             log::warn!("teardown of sandbox {} failed: {err}", self.id);
         }
+    }
+}
+
+/// Returns the reason text of `exit` for a log line.
+fn how(exit: &Exit) -> String {
+    match exit {
+        Exit::PoweredOff => "powered off".to_string(),
+        Exit::Rebooted => "rebooted".to_string(),
+        Exit::Killed { after } => format!("killed after {} s", after.as_secs()),
+        Exit::Failed { what } => format!("failed: {what}"),
     }
 }
 
@@ -481,6 +504,7 @@ fn assemble(
     id: SandboxId,
     run_dir: PathBuf,
 ) -> Result<Starting> {
+    let started = Instant::now();
     let vsock_prefix = run_dir.join("vs");
     let cid = crate::hv::next_cid();
     let shape = &template.meta().shape;
@@ -535,6 +559,7 @@ fn assemble(
             run_dir,
             vsock_prefix,
             image: Mutex::new(Some(image)),
+            started,
             torn: Mutex::new(false),
         },
     })
