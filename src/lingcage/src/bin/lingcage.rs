@@ -24,6 +24,7 @@ mod imp {
     use lingcage::template::{
         DeviceSet, Digest, TemplateId, TemplateMeta, TemplatePlan, TemplateStore,
     };
+    use lingcore::logging::{Logger, level_of};
 
     /// Store root used when neither `--store` nor `LINGCAGE_STORE` is set.
     const DEFAULT_STORE: &str = "/var/lib/lingcage";
@@ -305,6 +306,11 @@ mod imp {
         }
         out.push_str("\n`lingcage <verb> --help` prints flags of a specific verb.\n");
         out.push_str(
+            "\nflags of every verb, ahead of the verb or after it:\n  -v, --verbose    log more, \
+             -v for info, -vv for debug, -vvv for trace\n  --log-file FILE  write log lines to \
+             FILE instead of stderr\n",
+        );
+        out.push_str(
             "\nexit codes:\n  0    success; for run, the command's own status\n  \
              1    usage\n  2    an operational failure\n  \
              126  the command is not executable\n  127  the command is not found\n  \
@@ -403,8 +409,79 @@ mod imp {
         Ok(parsed)
     }
 
+    /// Flags of the program itself, taken off the command line ahead of
+    /// verb or after it, up to `--`.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Global {
+        /// Times `-v` or `--verbose` was given.
+        verbose: u8,
+        /// `--log-file`, log lines go there instead of stderr.
+        log_file: Option<PathBuf>,
+    }
+
+    /// Take flags of the program off `args`, returns them with the rest
+    /// of the command line in its order.
+    fn take_global(args: &[String]) -> Result<(Global, Vec<String>)> {
+        let mut global = Global::default();
+        let mut rest = Vec::with_capacity(args.len());
+        let mut at = 0;
+        while at < args.len() {
+            let arg = &args[at];
+            at += 1;
+            if arg == "--" {
+                rest.extend(args[at - 1..].iter().cloned());
+                break;
+            }
+            // `-v` counts once, `-vv` twice, same as `--verbose` repeated.
+            if let Some(more) = arg.strip_prefix("-v")
+                && more.chars().all(|c| c == 'v')
+            {
+                global.verbose = global.verbose.saturating_add(1 + more.len() as u8);
+                continue;
+            }
+            match arg.as_str() {
+                "--verbose" => global.verbose = global.verbose.saturating_add(1),
+                "--log-file" => {
+                    let Some(path) = args.get(at) else {
+                        return Err(global_err("flag --log-file needs a value".to_string()));
+                    };
+                    at += 1;
+                    global.log_file = Some(PathBuf::from(path));
+                }
+                _ => match arg.strip_prefix("--log-file=") {
+                    Some(path) => global.log_file = Some(PathBuf::from(path)),
+                    None => rest.push(arg.clone()),
+                },
+            }
+        }
+        Ok((global, rest))
+    }
+
+    /// Build a usage error of the program with CLI help attached.
+    fn global_err(what: String) -> CliError {
+        CliError::Usage {
+            what,
+            usage: cli_help(),
+        }
+    }
+
+    /// Install the logger, writing to `--log-file` or stderr at level `-v`
+    /// asks for.
+    fn log_to(global: &Global) -> Result<()> {
+        let file = global
+            .log_file
+            .as_deref()
+            .map(std::fs::File::create)
+            .transpose()?;
+        Logger::new("lingcage", level_of(global.verbose), file)
+            .install()
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        Ok(())
+    }
+
     /// Parse the command line and dispatch to the matching verb.
     fn cli(args: &[String]) -> Result<i32> {
+        let (global, args) = take_global(args)?;
         let Some(first) = args.first() else {
             print!("{}", cli_help());
             return Ok(0);
@@ -413,7 +490,7 @@ mod imp {
             print!("{}", cli_help());
             return Ok(0);
         }
-        let Some((verb, rest)) = find_verb(args) else {
+        let Some((verb, rest)) = find_verb(&args) else {
             return Err(CliError::Usage {
                 what: format!("unknown verb {first}"),
                 usage: cli_help(),
@@ -428,6 +505,7 @@ mod imp {
             return Ok(0);
         }
         let parsed = parse(verb, rest)?;
+        log_to(&global)?;
         (verb.run)(verb, &parsed)
     }
 
@@ -1025,8 +1103,8 @@ mod imp {
         use std::time::Duration;
 
         use crate::imp::{
-            CliError, VERBS, Verb, check_socket_room, cli_help, find_verb, parse, parse_duration,
-            parse_memory, verb_help,
+            CliError, Global, VERBS, Verb, check_socket_room, cli_help, find_verb, parse,
+            parse_duration, parse_memory, take_global, verb_help,
         };
 
         /// Look up the verb named `words` in `VERBS` table.
@@ -1170,6 +1248,45 @@ mod imp {
         }
 
         #[test]
+        fn test_take_global_flags_off_command_line() {
+            // Flags come off wherever they stand ahead of `--`, the rest
+            // keeps its order and everything after `--` stays.
+            let (global, rest) = take_global(&strings(&[
+                "-v",
+                "run",
+                "--template",
+                "t",
+                "--log-file",
+                "lingcage.log",
+                "--verbose",
+                "--",
+                "sh",
+                "-vv",
+            ]))
+            .expect("take");
+            assert_eq!(
+                global,
+                Global {
+                    verbose: 2,
+                    log_file: Some("lingcage.log".into()),
+                }
+            );
+            assert_eq!(
+                rest,
+                strings(&["run", "--template", "t", "--", "sh", "-vv"])
+            );
+            let (global, rest) =
+                take_global(&strings(&["-vvv", "--log-file=x", "template", "ls"])).expect("take");
+            assert_eq!(global.verbose, 3);
+            assert_eq!(global.log_file.as_deref(), Some(std::path::Path::new("x")));
+            assert_eq!(rest, strings(&["template", "ls"]));
+            assert!(matches!(
+                take_global(&strings(&["run", "--log-file"])),
+                Err(CliError::Usage { .. })
+            ));
+        }
+
+        #[test]
         fn test_cli_help_lists_verbs_and_exit_codes() {
             let help = cli_help();
             for verb in VERBS {
@@ -1178,6 +1295,7 @@ mod imp {
             for code in ["126", "127", "137"] {
                 assert!(help.contains(code), "exit code {code} missing from help");
             }
+            assert!(help.contains("--log-file FILE"), "help misses --log-file");
         }
 
         #[test]
