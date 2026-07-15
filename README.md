@@ -167,6 +167,12 @@ Exit codes:
 `lingcore --help` prints the same, `lingcore --version` prints the crate version. No environment
 variable is read.
 
+Log lines go to stderr, or to `--log-file`, one per record: the program, seconds since it started,
+level, thread and target, then the message. Without `-v` only warnings are written, which are
+failures on host side. `-v` adds phases of a boot with their time. `-vv` adds what the guest brought
+about, a refused chain, a dropped frame, a failed connect, and counts of each device at teardown.
+`--pcap FILE` writes frames of the link as they pass, for tcpdump or wireshark.
+
 With `--network user` nothing is needed on the host. Guest gets 10.0.2.15 by DHCP with gateway
 10.0.2.2 and DNS 10.0.2.3. Its TCP and UDP flows become sockets of the `lingcore` process, gateway
 address goes to loopback of the host and DNS queries go to resolvers of the host. No connection
@@ -192,7 +198,12 @@ $ lingcage template build --kernel bzImage --initrd initramfs.cpio.gz --memory 2
 $ lingcage run --template base -- sh -c 'echo hello from $(hostname)'
 ```
 
-Store defaults to `/var/lib/lingcage`, use `--store DIR` or `LINGCAGE_STORE` for another one.
+Store defaults to `/var/lib/lingcage`, use `--store DIR` or `LINGCAGE_STORE` for another one. `-v`,
+`--log-file FILE` and `--event-monitor SPEC` are flags of the program, given ahead of the verb or
+after it, up to `--`. Log lines are those of lingcore, and `-vv` adds diagnostics of the agent.
+`--event-monitor path=FILE` or `fd=N` writes one JSON line per event, for a program driving many
+sandboxes. Events are a template built, a sandbox starting, ready with timings of its agent, and
+stopped with what ended it, each with a timestamp.
 
 Exit codes follow convention of shell:
 
