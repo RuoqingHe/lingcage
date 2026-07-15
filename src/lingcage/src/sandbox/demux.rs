@@ -194,16 +194,22 @@ impl Demux {
         let stream = accept_within(&self.listener, deadline, "incoming connection from agent")?;
         let hostname = identify(&stream, &self.identity, 1, deadline)?;
         self.install(stream, 1)?;
-        let accept_loop = std::thread::spawn({
-            let demux = Arc::clone(self);
-            move || demux.accept_loop()
-        });
+        // Each thread is named, name shows in a log line and in `ps`.
+        let accept_loop = std::thread::Builder::new()
+            .name("lcp-accept".to_string())
+            .spawn({
+                let demux = Arc::clone(self);
+                move || demux.accept_loop()
+            })
+            .map_err(Error::Io)?;
         *self.acceptor.lock().unwrap() = Some(accept_loop);
         if let Some(log_listener) = self.log_listener.lock().unwrap().take() {
             let demux = Arc::clone(self);
-            *self.drainer.lock().unwrap() = Some(std::thread::spawn(move || {
-                drain_logs(&demux, &log_listener)
-            }));
+            let drainer = std::thread::Builder::new()
+                .name("lcp-logs".to_string())
+                .spawn(move || drain_logs(&demux, &log_listener))
+                .map_err(Error::Io)?;
+            *self.drainer.lock().unwrap() = Some(drainer);
         }
         Ok(hostname)
     }
@@ -218,11 +224,14 @@ impl Demux {
             .map_err(Error::Io)?;
         let stream = Arc::new(stream);
         let out = File::from(OwnedFd::from(stream.try_clone().map_err(Error::Io)?));
-        let reader = std::thread::spawn({
-            let demux = Arc::clone(self);
-            let reading = Arc::clone(&stream);
-            move || demux.read_loop(&reading, generation)
-        });
+        let reader = std::thread::Builder::new()
+            .name("lcp-reader".to_string())
+            .spawn({
+                let demux = Arc::clone(self);
+                let reading = Arc::clone(&stream);
+                move || demux.read_loop(&reading, generation)
+            })
+            .map_err(Error::Io)?;
         let old = {
             let mut link = self.link.lock().unwrap();
             *self.reader.lock().unwrap() = Some(reader);
