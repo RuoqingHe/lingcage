@@ -6,7 +6,11 @@
 
 #[cfg(target_arch = "riscv64")]
 use crate::hv::arch::ConfigReg;
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "riscv64"
+))]
 use crate::hv::arch::Reg;
 #[cfg(target_arch = "x86_64")]
 use crate::hv::arch::{CpuidEntry, DtReg, DtRegVal, SReg, SegReg, SegRegVal};
@@ -92,11 +96,19 @@ pub trait Vcpu: Send {
     fn stopper(&self) -> Box<dyn Stopper>;
 
     /// Read one general register.
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    ))]
     fn get_reg(&self, reg: Reg) -> Result<u64>;
 
     /// Set general registers in one batch.
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    ))]
     fn set_regs(&mut self, vals: &[(Reg, u64)]) -> Result<()>;
 
     /// Read a segment register, decoded into `SegRegVal`.

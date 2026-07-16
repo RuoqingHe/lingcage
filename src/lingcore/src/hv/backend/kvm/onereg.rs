@@ -9,8 +9,12 @@
 
 use std::os::fd::AsRawFd;
 
-use kvm_bindings::{KVM_REG_SIZE_MASK, KVM_REG_SIZE_SHIFT, KVMIO, kvm_one_reg, kvm_reg_list};
-use vmm_sys_util::ioctl::{ioctl_with_mut_ptr, ioctl_with_ref};
+#[cfg(target_arch = "riscv64")]
+use kvm_bindings::{KVM_REG_SIZE_MASK, KVM_REG_SIZE_SHIFT};
+use kvm_bindings::{KVMIO, kvm_one_reg, kvm_reg_list};
+#[cfg(target_arch = "riscv64")]
+use vmm_sys_util::ioctl::ioctl_with_mut_ptr;
+use vmm_sys_util::ioctl::ioctl_with_ref;
 use vmm_sys_util::{ioctl_iow_nr, ioctl_iowr_nr};
 
 use crate::hv::{Error, Result};
@@ -19,7 +23,9 @@ ioctl_iow_nr!(KVM_GET_ONE_REG, KVMIO, 0xab, kvm_one_reg);
 ioctl_iow_nr!(KVM_SET_ONE_REG, KVMIO, 0xac, kvm_one_reg);
 ioctl_iowr_nr!(KVM_GET_REG_LIST, KVMIO, 0xb0, kvm_reg_list);
 
-/// Returns width of register `id` in bytes.
+/// Returns width of register `id` in bytes. Only a state capture reads
+/// a register it does not know the width of.
+#[cfg(target_arch = "riscv64")]
 pub(in crate::hv::backend::kvm) fn width(id: u64) -> usize {
     1 << ((id & KVM_REG_SIZE_MASK) >> KVM_REG_SIZE_SHIFT)
 }
@@ -72,6 +78,8 @@ pub(in crate::hv::backend::kvm) fn set_reg(fd: &impl AsRawFd, id: u64, value: u6
 
 /// Returns the ids named by `KVM_GET_REG_LIST` for the vCPU named by
 /// `fd`. Call with no room fails with `E2BIG` and sets `n` to the count.
+/// Only a state capture walks the whole list.
+#[cfg(target_arch = "riscv64")]
 pub(in crate::hv::backend::kvm) fn reg_list(fd: &impl AsRawFd) -> Result<Vec<u64>> {
     let mut list: Vec<u64> = vec![0];
     // SAFETY: `KVM_GET_REG_LIST` reads `n` from the first word and writes
