@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! aarch64 register ids.
+//! aarch64 register ids and placement of the GIC.
 
 /// Core registers, the 31 general purpose registers, the stack pointer,
 /// the program counter and the processor state, in the order of
@@ -57,6 +57,34 @@ pub enum Reg {
 /// masks of `arch/arm64/include/uapi/asm/ptrace.h`.
 pub const PSTATE_EL1H: u64 = 0x3c5;
 
+/// Placement of the GIC, the interrupt controller of an aarch64 guest:
+/// the distributor, the redistributor of vCPU 0 and the wired sources.
+/// vCPU `n` has its redistributor `n` frames above the one of vCPU 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gic {
+    /// Guest address of distributor register block, `DIST_SIZE` bytes.
+    pub dist: u64,
+    /// Guest address of redistributor frame of vCPU 0.
+    pub redist: u64,
+    /// Wired interrupt sources, the SPIs. Sources are numbered from 0.
+    pub sources: u32,
+}
+
+/// Bytes of the distributor register block.
+pub const DIST_SIZE: u64 = 0x1_0000;
+
+/// Bytes of the redistributor frame of one vCPU, the RD and SGI pages.
+pub const REDIST_SIZE: u64 = 0x2_0000;
+
+/// Interrupt ids taken by the private sources of a vCPU, the SGIs and
+/// the PPIs. SPI `n` is interrupt id `PRIVATE_IDS + n`.
+pub const PRIVATE_IDS: u32 = 32;
+
+/// Returns bytes taken by the redistributor frames of `vcpus`.
+pub fn redist_room(vcpus: u16) -> u64 {
+    REDIST_SIZE * u64::from(vcpus)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::hv::arch::aarch64::*;
@@ -70,5 +98,11 @@ mod tests {
         assert_eq!(Reg::Sp as u64, 31);
         assert_eq!(Reg::Pc as u64, 32);
         assert_eq!(Reg::Pstate as u64, 33);
+    }
+
+    #[test]
+    fn test_redist_room() {
+        assert_eq!(redist_room(1), REDIST_SIZE);
+        assert_eq!(redist_room(4), 4 * REDIST_SIZE);
     }
 }
