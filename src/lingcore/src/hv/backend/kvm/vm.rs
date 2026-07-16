@@ -19,6 +19,8 @@ use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 use crate::hv::StateBlob;
 #[cfg(target_arch = "riscv64")]
 use crate::hv::arch::Aia;
+#[cfg(target_arch = "aarch64")]
+use crate::hv::backend::kvm::aarch64::vm::Platform;
 use crate::hv::backend::kvm::ioeventfd::KvmIoeventFdRegistry;
 #[cfg(target_arch = "riscv64")]
 use crate::hv::backend::kvm::irq::FIRST_MSI_GSI;
@@ -73,6 +75,9 @@ pub struct KvmVm {
     /// Harts, the AIA and the clock descriptor.
     #[cfg(target_arch = "riscv64")]
     platform: Platform,
+    /// Preferred target every vCPU is initialized with.
+    #[cfg(target_arch = "aarch64")]
+    platform: Platform,
 }
 
 impl KvmVm {
@@ -87,7 +92,7 @@ impl KvmVm {
             irqchip: AtomicBool::new(false),
             #[cfg(target_arch = "x86_64")]
             msrs,
-            #[cfg(target_arch = "riscv64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             platform: Platform::default(),
         }
     }
@@ -117,6 +122,8 @@ impl Vm for KvmVm {
             .fd
             .create_vcpu(u64::from(cpu_index))
             .map_err(kvm_err("KVM_CREATE_VCPU"))?;
+        #[cfg(target_arch = "aarch64")]
+        self.platform.adopt(cpu_index, &self.fd, &fd)?;
         #[cfg(target_arch = "riscv64")]
         self.platform.adopt(cpu_index, &fd)?;
         KvmVcpu::new(

@@ -11,6 +11,9 @@ pub mod memory;
 pub mod vcpu;
 pub mod vm;
 
+/// Preferred target and the vCPUs initialized from it.
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 /// One-register access, AIA and riscv64 state blobs.
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
