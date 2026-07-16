@@ -8,6 +8,9 @@ pub mod hypervisor;
 pub mod ioeventfd;
 pub mod irq;
 pub mod memory;
+/// The one-register ioctls, shared by the architectures which use them.
+#[cfg(target_arch = "riscv64")]
+mod onereg;
 pub mod vcpu;
 pub mod vm;
 

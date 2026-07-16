@@ -17,7 +17,8 @@ use kvm_ioctls::VcpuFd;
 use log::warn;
 
 use crate::hv::backend::kvm::kvm_err;
-use crate::hv::backend::kvm::riscv64::{get_reg, index, kind, reg_id, reg_list, set_reg, width};
+use crate::hv::backend::kvm::onereg::{get_reg, reg_list, set_reg, width};
+use crate::hv::backend::kvm::riscv64::{index, kind, reg_id};
 use crate::hv::{Arch, Backend, Error, Result, StateBlob};
 
 /// Layout version of `StateBlob::data`, `restore` refuses others.

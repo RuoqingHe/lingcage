@@ -16,9 +16,8 @@ use kvm_ioctls::VcpuFd;
 use log::debug;
 
 use crate::hv::arch::{ConfigReg, Reg};
-use crate::hv::backend::kvm::riscv64::{
-    extension_name, get_reg, index, kind, reg_id, reg_list, set_reg,
-};
+use crate::hv::backend::kvm::onereg::{get_reg, reg_list, set_reg};
+use crate::hv::backend::kvm::riscv64::{extension_name, index, kind, reg_id};
 use crate::hv::{Error, Result};
 
 // TODO: The SBI debug console extension is not yet offered.

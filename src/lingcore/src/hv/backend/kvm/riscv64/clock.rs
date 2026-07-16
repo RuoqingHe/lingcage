@@ -12,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use kvm_bindings::{KVM_REG_RISCV_TIMER, kvm_riscv_timer};
 
-use crate::hv::backend::kvm::riscv64::{get_reg, reg_id, set_reg};
+use crate::hv::backend::kvm::onereg::{get_reg, set_reg};
+use crate::hv::backend::kvm::riscv64::reg_id;
 use crate::hv::{Arch, Backend, Error, Result, StateBlob};
 
 /// Layout version of `StateBlob::data`, `decode` refuses other versions.
