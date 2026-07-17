@@ -2,20 +2,26 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Loading Image of riscv64 kernel, a flat binary entered at its first
-//! byte. It is loaded at `text_offset` above the start of RAM, with
-//! initramfs placed at the top of RAM.
+//! Loading Image of an aarch64 or riscv64 kernel, a flat binary entered
+//! at its first byte. It is loaded at `text_offset` above the start of
+//! RAM, with initramfs placed at the top of RAM. Both architectures lay
+//! their header out the same way and differ in the magic and in the
+//! registers the kernel is entered with.
 
 use std::io::{self, Read, Seek};
 
 use thiserror::Error;
 
-use crate::hv::arch::{MODE_S, Reg};
+#[cfg(target_arch = "riscv64")]
+use crate::hv::arch::MODE_S;
+#[cfg(target_arch = "aarch64")]
+use crate::hv::arch::PSTATE_EL1H;
+use crate::hv::arch::Reg;
 use crate::hv::vcpu::Vcpu;
 use crate::mem::GuestRam;
 
-/// Bytes of the header at the start of an Image, `struct riscv_image_header`
-/// in `arch/riscv/include/asm/image.h` [1]:
+/// Bytes of the header at the start of an Image. On riscv64 it is
+/// `struct riscv_image_header` in `arch/riscv/include/asm/image.h` [1]:
 ///
 /// ```c
 /// struct riscv_image_header {
@@ -36,16 +42,25 @@ use crate::mem::GuestRam;
 /// `text_offset` is the load address above start of RAM, `image_size` is
 /// the bytes taken by the kernel including bss.
 ///
+/// On aarch64 it is `struct arm64_image_header` in
+/// `arch/arm64/include/asm/image.h`, which declares same three fields at
+/// the same offsets and its own magic.
+///
 /// [1]: https://elixir.bootlin.com/linux/v6.18/source/arch/riscv/include/asm/image.h
 const HEADER: usize = 64;
 
 /// Offsets of header fields we read.
 const TEXT_OFFSET: usize = 8;
 const IMAGE_SIZE: usize = 16;
-const MAGIC2: usize = 56;
+const MAGIC_AT: usize = 56;
 
 /// `RISCV_IMAGE_MAGIC2`, "RSC\x05".
-const RISCV_IMAGE_MAGIC2: u32 = 0x0543_5352;
+#[cfg(target_arch = "riscv64")]
+const MAGIC: u32 = 0x0543_5352;
+
+/// `ARM64_IMAGE_MAGIC`, "ARM\x64".
+#[cfg(target_arch = "aarch64")]
+const MAGIC: u32 = 0x644d_5241;
 
 /// Alignment of the start of RAM, since early page tables of the kernel
 /// map it with 2 MiB pages.
@@ -109,7 +124,7 @@ where
         return Err(Error::NotImage);
     }
     let field = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-    if u32::from_le_bytes(bytes[MAGIC2..MAGIC2 + 4].try_into().unwrap()) != RISCV_IMAGE_MAGIC2 {
+    if u32::from_le_bytes(bytes[MAGIC_AT..MAGIC_AT + 4].try_into().unwrap()) != MAGIC {
         return Err(Error::NotImage);
     }
     let entry = base.checked_add(field(TEXT_OFFSET)).ok_or(Error::NoRoom)?;
@@ -167,6 +182,7 @@ where
 /// Set up `vcpu` to enter `kernel` as hart `hart` in supervisor mode,
 /// with hart id in `a0` and device tree address `fdt` in `a1`, as
 /// required by `Documentation/arch/riscv/boot.rst`.
+#[cfg(target_arch = "riscv64")]
 pub fn enter_kernel<V: Vcpu>(vcpu: &mut V, kernel: &Kernel, hart: u16, fdt: u64) -> Result<()> {
     vcpu.set_regs(&[
         (Reg::Pc, kernel.entry),
@@ -177,26 +193,50 @@ pub fn enter_kernel<V: Vcpu>(vcpu: &mut V, kernel: &Kernel, hart: u16, fdt: u64)
     .map_err(Error::Vcpu)
 }
 
+/// Set up `vcpu` to enter `kernel` at EL1 with device tree address `fdt`
+/// in `x0` and the three registers after it zero, as required by
+/// `Documentation/arch/arm64/booting.rst`.
+#[cfg(target_arch = "aarch64")]
+pub fn enter_kernel<V: Vcpu>(vcpu: &mut V, kernel: &Kernel, fdt: u64) -> Result<()> {
+    vcpu.set_regs(&[
+        (Reg::Pc, kernel.entry),
+        (Reg::X0, fdt),
+        (Reg::X1, 0),
+        (Reg::X2, 0),
+        (Reg::X3, 0),
+        (Reg::Pstate, PSTATE_EL1H),
+    ])
+    .map_err(Error::Vcpu)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::io::Cursor;
 
     use crate::boot::image::*;
 
-    /// `text_offset` of an rv64 Image.
-    const TEXT_OFFSET_RV64: u64 = 0x20_0000;
+    /// `text_offset` a test Image asks for.
+    const TEXT_OFFSET_AT: u64 = 0x20_0000;
+
+    /// Jump over the header to the payload, `j 64` on riscv64 encoded as
+    /// `jal x0, 64`.
+    #[cfg(target_arch = "riscv64")]
+    const JUMP: u32 = 0x0400_006f;
+
+    /// Jump over the header to the payload, `b .+64` on aarch64.
+    #[cfg(target_arch = "aarch64")]
+    const JUMP: u32 = 0x1400_0010;
 
     /// Build an Image with `payload` after the header. The header starts
     /// with a jump over itself like `code0` of a real kernel does, so the
     /// payload gets executed from the entry.
     pub(crate) fn image(payload: &[u8]) -> Vec<u8> {
         let mut image = vec![0u8; HEADER];
-        // `j 64`, encoded as `jal x0, 64`.
-        image[..4].copy_from_slice(&0x0400_006fu32.to_le_bytes());
-        image[TEXT_OFFSET..TEXT_OFFSET + 8].copy_from_slice(&TEXT_OFFSET_RV64.to_le_bytes());
+        image[..4].copy_from_slice(&JUMP.to_le_bytes());
+        image[TEXT_OFFSET..TEXT_OFFSET + 8].copy_from_slice(&TEXT_OFFSET_AT.to_le_bytes());
         image[IMAGE_SIZE..IMAGE_SIZE + 8]
             .copy_from_slice(&((HEADER + payload.len()) as u64).to_le_bytes());
-        image[MAGIC2..MAGIC2 + 4].copy_from_slice(&RISCV_IMAGE_MAGIC2.to_le_bytes());
+        image[MAGIC_AT..MAGIC_AT + 4].copy_from_slice(&MAGIC.to_le_bytes());
         image.extend_from_slice(payload);
         image
     }
@@ -208,7 +248,7 @@ pub(crate) mod tests {
         let payload = b"a kernel would be here".repeat(37);
         let kernel = load_kernel(&ram, BASE, &mut Cursor::new(image(&payload))).expect("load");
 
-        assert_eq!(kernel.entry, BASE + TEXT_OFFSET_RV64);
+        assert_eq!(kernel.entry, BASE + TEXT_OFFSET_AT);
         assert_eq!(
             kernel.end,
             kernel.entry + HEADER as u64 + payload.len() as u64
@@ -222,7 +262,7 @@ pub(crate) mod tests {
             &payload[..],
             "payload does not follow the header"
         );
-        assert_eq!(&back[..4], &0x0400_006fu32.to_le_bytes());
+        assert_eq!(&back[..4], &JUMP.to_le_bytes());
     }
 
     #[test]
@@ -251,7 +291,7 @@ pub(crate) mod tests {
 
         // Zero the magic.
         let mut wrong = image(b"payload");
-        wrong[MAGIC2] = 0;
+        wrong[MAGIC_AT] = 0;
         assert!(matches!(
             load_kernel(&ram, BASE, &mut Cursor::new(wrong)),
             Err(Error::NotImage)
@@ -303,10 +343,10 @@ pub(crate) mod tests {
         ));
     }
 
-    #[cfg(all(feature = "kvm", target_os = "linux"))]
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "riscv64"))]
     #[test]
     fn test_enter_kernel_as_hart_zero() {
-        // Check that a0 carries the hart id when the guest starts running.
+        // a0 carries the hart id when the guest starts running.
         use crate::hv::backend::kvm::hypervisor::KvmHv;
         use crate::hv::hypervisor::Hypervisor;
         use crate::hv::memory::{MemMapOption, VmMemory};
@@ -339,5 +379,46 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(cpu.get_reg(Reg::A1).expect("a1"), BASE);
+    }
+
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn test_enter_kernel_with_tree_address() {
+        // Kernel is entered at EL1 with the tree address in `x0`. The
+        // guest stores `x0` at an address with no memory behind it, so the
+        // run exits as MMIO carrying the low byte.
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+        use crate::hv::hypervisor::Hypervisor;
+        use crate::hv::memory::{MemMapOption, VmMemory};
+        use crate::hv::vcpu::{VmEntry, VmExit};
+        use crate::hv::vm::Vm;
+
+        const BASE: u64 = 0x4000_0000;
+        /// `mov x1, #0x2000` / `strb w0, [x1]` / `b .`
+        const PROGRAM: [u8; 12] = [
+            0x01, 0x00, 0x84, 0xd2, 0x20, 0x00, 0x00, 0x39, 0x00, 0x00, 0x00, 0x14,
+        ];
+
+        let ram = GuestRam::new(&[(BASE, 4 << 20)]).expect("host pages");
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let mem = vm.create_vm_memory().expect("address space");
+        for region in ram.regions() {
+            mem.mem_map(region.gpa, region.size, region.hva, MemMapOption::default())
+                .expect("map guest RAM");
+        }
+        let kernel = load_kernel(&ram, BASE, &mut Cursor::new(image(&PROGRAM))).expect("load");
+
+        let mut cpu = vm.create_vcpu(0).expect("vcpu 0");
+        enter_kernel(&mut cpu, &kernel, BASE).expect("enter the kernel");
+        assert_eq!(
+            cpu.run(VmEntry::Run).expect("run"),
+            VmExit::Mmio {
+                addr: 0x2000,
+                write: Some(0),
+                size: 1
+            }
+        );
+        assert_eq!(cpu.get_reg(Reg::X0).expect("x0"), BASE);
     }
 }

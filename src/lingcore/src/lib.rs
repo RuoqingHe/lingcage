@@ -8,8 +8,16 @@
 //! `lingcore` is a library instead of a VMM. Each component is gated
 //! behind a Cargo feature.
 
-// bzImage on x86_64 and Image on riscv64, no other format is read.
-#[cfg(all(feature = "boot", any(target_arch = "x86_64", target_arch = "riscv64")))]
+// bzImage on x86_64 and Image on aarch64 and riscv64, no other format is
+// read.
+#[cfg(all(
+    feature = "boot",
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
+))]
 pub mod boot;
 #[cfg(feature = "devices")]
 pub mod devices;
