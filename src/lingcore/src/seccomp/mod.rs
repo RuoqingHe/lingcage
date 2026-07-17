@@ -98,16 +98,18 @@ const COMMON: &[libc::c_long] = &[
 ];
 
 /// Architecture which the allowlist checks syscall numbers against.
+#[cfg(target_arch = "aarch64")]
+const ARCH: TargetArch = TargetArch::aarch64;
 #[cfg(target_arch = "x86_64")]
 const ARCH: TargetArch = TargetArch::x86_64;
 #[cfg(target_arch = "riscv64")]
 const ARCH: TargetArch = TargetArch::riscv64;
 
-/// Syscall behind `poll(2)`. x86_64 has `poll`, riscv64 only has
-/// `ppoll`.
+/// Syscall behind `poll(2)`. x86_64 has `poll`, the architectures on the
+/// generic syscall table only have `ppoll`.
 #[cfg(target_arch = "x86_64")]
 const SYS_POLL: libc::c_long = libc::SYS_poll;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const SYS_POLL: libc::c_long = libc::SYS_ppoll;
 
 /// Index of `request` in `ioctl(fd, request, ...)`.
@@ -123,7 +125,8 @@ const FIONBIO: u64 = 0x5421;
 
 /// `KVM_IRQ_LINE` is `_IOW(KVMIO, 0x61, struct kvm_irq_level)`, eight
 /// bytes, from `include/uapi/linux/kvm.h`. A riscv64 thread raises the
-/// line of a device through it.
+/// line of a device through it. An aarch64 thread pulses an irqfd
+/// instead, so it needs no rule for the call.
 #[cfg(target_arch = "riscv64")]
 const KVM_IRQ_LINE: u64 = 0x4008_ae61;
 

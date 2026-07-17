@@ -34,12 +34,16 @@ pub mod logging;
 pub mod machine;
 #[cfg(feature = "mem")]
 pub mod mem;
-// seccomp is Linux specific and syscall numbers are x86_64 and riscv64
-// specific.
+// seccomp is Linux specific and syscall numbers are aarch64, x86_64 and
+// riscv64 specific.
 #[cfg(all(
     feature = "seccomp",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 pub mod seccomp;
 #[cfg(feature = "vcpu")]
