@@ -17,16 +17,16 @@ required-features = ["cli"]
 default = ["hv"]
 # ACPI tables in guest RAM. x86_64 only.
 acpi = ["dep:acpi_tables", "mem"]
-# Kernel loading into guest RAM. x86_64 and riscv64 only.
+# Kernel loading into guest RAM. aarch64, x86_64 and riscv64 only.
 boot = ["dep:linux-loader", "hv", "mem"]
-# Device tree in guest RAM. riscv64 only.
+# Device tree in guest RAM. aarch64 and riscv64 only.
 fdt = ["dep:vm-fdt", "mem"]
 # Guest-facing devices, serde carries their state.
 devices = ["dep:serde", "dep:serde_json", "vcpu"]
 # Hypervisor backends and the Linux mechanisms under them, libc for poll(2).
 hv = ["dep:libc"]
-# Guest assembly, RAM, kernel, bus and the run loop. x86_64 and riscv64
-# Linux only.
+# Guest assembly, RAM, kernel, bus and the run loop. aarch64, x86_64 and
+# riscv64 Linux only.
 machine = [
   "acpi",
   "boot",
@@ -44,12 +44,12 @@ machine = [
 serde = ["dep:serde"]
 # Guest RAM, held as vm-memory regions.
 mem = ["dep:libc", "dep:vm-memory"]
-# Per-thread syscall allowlists. x86_64 and riscv64 Linux only.
+# Per-thread syscall allowlists. aarch64, x86_64 and riscv64 Linux only.
 seccomp = ["dep:libc", "dep:seccompiler"]
 # vCPU run loop and the bus which it dispatches to.
 vcpu = ["hv"]
-# The `lingcore` binary, boots a guest with KVM. x86_64 and riscv64 Linux
-# only.
+# The `lingcore` binary, boots a guest with KVM. aarch64, x86_64 and
+# riscv64 Linux only.
 cli = ["kvm", "machine"]
 # Virtio devices and the split virtqueue.
 virtio = ["devices", "mem"]
@@ -87,6 +87,7 @@ libc = { workspace = true, optional = true }
 seccompiler = { workspace = true, optional = true }
 vmm-sys-util = { workspace = true, optional = true }
 
-# Device tree writer, a bzImage guest names its devices in ACPI.
-[target.'cfg(target_arch = "riscv64")'.dependencies]
+# Device tree writer, for the architectures which boot with a tree. A
+# bzImage guest names its devices in ACPI instead.
+[target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 vm-fdt = { workspace = true, optional = true }
