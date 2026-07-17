@@ -147,6 +147,11 @@ pub trait Vcpu: Send {
     #[cfg(target_arch = "x86_64")]
     fn set_msrs(&mut self, msrs: &[(u32, u64)]) -> Result<()>;
 
+    /// Returns the affinity of this vCPU, the bits of `MPIDR_EL1` a
+    /// device tree describes a CPU with.
+    #[cfg(target_arch = "aarch64")]
+    fn affinity(&self) -> Result<u64>;
+
     /// Read one configuration register.
     #[cfg(target_arch = "riscv64")]
     fn get_config(&self, reg: ConfigReg) -> Result<u64>;

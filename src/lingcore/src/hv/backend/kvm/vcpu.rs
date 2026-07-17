@@ -439,6 +439,11 @@ impl Vcpu for KvmVcpu {
         aarch64::vcpu::set_core_regs(&self.fd, vals)
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn affinity(&self) -> Result<u64> {
+        aarch64::vcpu::affinity(&self.fd)
+    }
+
     #[cfg(target_arch = "riscv64")]
     fn get_reg(&self, reg: Reg) -> Result<u64> {
         riscv64::vcpu::core_reg(&self.fd, reg)

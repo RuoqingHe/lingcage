@@ -5,7 +5,7 @@
 //! Registers of an aarch64 vCPU, read and written by their one-register
 //! id.
 
-use kvm_bindings::{KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_SIZE_U64};
+use kvm_bindings::{KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_ARM64_SYSREG, KVM_REG_SIZE_U64};
 use kvm_ioctls::VcpuFd;
 
 use crate::hv::Result;
@@ -17,6 +17,20 @@ use crate::hv::backend::kvm::onereg::{get_reg, set_reg};
 /// every field of `user_pt_regs` is a `u64`.
 const WORDS: u64 = 2;
 
+/// Shifts of a system register id, from `ARM64_SYS_REG` in
+/// `arch/arm64/include/uapi/asm/kvm.h`. `op2` sits at the bottom.
+const OP0_SHIFT: u64 = 14;
+const CRM_SHIFT: u64 = 3;
+
+/// `MPIDR_EL1`, the affinity of a vCPU, at `op0` 3, `op1` 0, `crn` 0,
+/// `crm` 0 with `op2` 5.
+const MPIDR_EL1: u64 = (3 << OP0_SHIFT) | (0 << CRM_SHIFT) | 5;
+
+/// Bits of `MPIDR_EL1` which hold the affinity, `MPIDR_HWID_BITMASK` of
+/// `arch/arm64/include/asm/cputype.h`. A device tree describes a CPU
+/// with them.
+const HWID_BITS: u64 = 0xff00_ffff_ff;
+
 /// Returns the one-register id of core register `reg`.
 pub(in crate::hv::backend::kvm) fn core_id(reg: Reg) -> u64 {
     KVM_REG_ARM64 | KVM_REG_SIZE_U64 | u64::from(KVM_REG_ARM_CORE) | (reg as u64 * WORDS)
@@ -25,6 +39,13 @@ pub(in crate::hv::backend::kvm) fn core_id(reg: Reg) -> u64 {
 /// Read core register `reg` of the vCPU named by `fd`.
 pub(in crate::hv::backend::kvm) fn core_reg(fd: &VcpuFd, reg: Reg) -> Result<u64> {
     get_reg(fd, core_id(reg))
+}
+
+/// Returns the affinity of the vCPU named by `fd`, the bits of
+/// `MPIDR_EL1` a device tree describes it with.
+pub(in crate::hv::backend::kvm) fn affinity(fd: &VcpuFd) -> Result<u64> {
+    let id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | u64::from(KVM_REG_ARM64_SYSREG) | MPIDR_EL1;
+    Ok(get_reg(fd, id)? & HWID_BITS)
 }
 
 /// Write core registers in `vals`, in order, to the vCPU named by `fd`.
@@ -49,6 +70,23 @@ mod tests {
         assert_eq!(core_id(Reg::Sp), 0x6030_0000_0010_003e);
         assert_eq!(core_id(Reg::Pc), 0x6030_0000_0010_0040);
         assert_eq!(core_id(Reg::Pstate), 0x6030_0000_0010_0042);
+    }
+
+    #[test]
+    fn test_affinity_follows_vcpu_index() {
+        // KVM maps the vCPU index into the first three affinity levels, as
+        // `reset_mpidr` of `arch/arm64/kvm/sys_regs.c` does.
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+        use crate::hv::hypervisor::Hypervisor;
+        use crate::hv::vcpu::Vcpu;
+        use crate::hv::vm::Vm;
+
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let vm = hv.create_vm().expect("guest");
+        let cpu0 = vm.create_vcpu(0).expect("vcpu 0");
+        let cpu1 = vm.create_vcpu(1).expect("vcpu 1");
+        assert_eq!(cpu0.affinity().expect("affinity of vcpu 0"), 0);
+        assert_eq!(cpu1.affinity().expect("affinity of vcpu 1"), 1);
     }
 
     #[test]
