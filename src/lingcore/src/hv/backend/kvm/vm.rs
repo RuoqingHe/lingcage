@@ -20,9 +20,11 @@ use crate::hv::StateBlob;
 #[cfg(target_arch = "riscv64")]
 use crate::hv::arch::Aia;
 #[cfg(target_arch = "aarch64")]
+use crate::hv::arch::Gic;
+#[cfg(target_arch = "aarch64")]
 use crate::hv::backend::kvm::aarch64::vm::Platform;
 use crate::hv::backend::kvm::ioeventfd::KvmIoeventFdRegistry;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::hv::backend::kvm::irq::FIRST_MSI_GSI;
 use crate::hv::backend::kvm::irq::{KvmIrqSender, KvmMsiSender, Routing};
 use crate::hv::backend::kvm::kvm_err;
@@ -211,6 +213,21 @@ impl Vm for KvmVm {
 
     /// Create the AIA for vCPUs created so far. Wired sources take the GSIs
     /// below the first MSI one, since a sender names its pin in a byte.
+    #[cfg(target_arch = "aarch64")]
+    fn enable_in_kernel_irqchip(&self, gic: &Gic) -> Result<()> {
+        if gic.sources >= FIRST_MSI_GSI {
+            return Err(Error::Overfull {
+                of: "wired interrupt sources",
+            });
+        }
+        self.platform.create_gic(&self.fd, gic)?;
+        // The GIC routes GSI `n` to SPI `n`, which is interrupt id 32 plus
+        // `n`. Table written from here carries the pins again.
+        self.routing.lock().unwrap().pins = gic.sources;
+        self.irqchip.store(true, Ordering::Release);
+        Ok(())
+    }
+
     #[cfg(target_arch = "riscv64")]
     fn enable_in_kernel_irqchip(&self, aia: &Aia) -> Result<()> {
         if aia.sources >= FIRST_MSI_GSI {

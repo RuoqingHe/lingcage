@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! aarch64 side of `KvmVm`. A vCPU is unusable until
+//! aarch64 side of `KvmVm`, the target its vCPUs are initialized with
+//! and the GIC once created. A vCPU is unusable until
 //! `KVM_ARM_VCPU_INIT` tells which CPU it emulates, so the preferred
 //! target of the host is read once and every vCPU is initialized from
 //! it.
@@ -12,18 +13,22 @@ use std::sync::OnceLock;
 use kvm_bindings::{KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, kvm_vcpu_init};
 use kvm_ioctls::{VcpuFd, VmFd};
 
-use crate::hv::Result;
+use crate::hv::arch::Gic;
+use crate::hv::backend::kvm::aarch64::gic::KvmGic;
 use crate::hv::backend::kvm::kvm_err;
+use crate::hv::{Error, Result};
 
 /// Bits of one word of `kvm_vcpu_init::features`.
 const FEATURE_BITS: u32 = 32;
 
 /// Platform of an aarch64 guest, the target every vCPU is initialized
-/// with.
+/// with and the GIC.
 #[derive(Default)]
 pub(in crate::hv::backend::kvm) struct Platform {
     /// Preferred target of the host, read on the first vCPU.
     target: OnceLock<kvm_vcpu_init>,
+    /// The GIC, once created by `enable_in_kernel_irqchip`.
+    gic: OnceLock<KvmGic>,
 }
 
 impl Platform {
@@ -52,6 +57,19 @@ impl Platform {
             set(&mut init, KVM_ARM_VCPU_POWER_OFF);
         }
         fd.vcpu_init(&init).map_err(kvm_err("KVM_ARM_VCPU_INIT"))
+    }
+
+    /// Create the GIC placed by `gic` in `vm`. KVM initializes one GIC per
+    /// guest, a second one is refused.
+    pub(in crate::hv::backend::kvm) fn create_gic(&self, vm: &VmFd, gic: &Gic) -> Result<()> {
+        let made = KvmGic::new(vm, gic)?;
+        if self.gic.set(made).is_err() {
+            return Err(Error::Os {
+                op: "KVM_CREATE_DEVICE",
+                errno: libc::EEXIST,
+            });
+        }
+        Ok(())
     }
 }
 
