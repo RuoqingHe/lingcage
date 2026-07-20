@@ -8,7 +8,11 @@
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 mod imp {
     use std::fs::File;
@@ -97,7 +101,7 @@ mod imp {
             name: "kernel",
             value: "K",
             required: true,
-            help: "kernel image path, bzImage on x86_64 or Image on riscv64",
+            help: "kernel image path, bzImage on x86_64 or Image on aarch64 and riscv64",
         },
         Flag {
             name: "initrd",
@@ -815,7 +819,11 @@ mod imp {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 fn main() {
     use std::io::Write as _;
@@ -830,9 +838,14 @@ fn main() {
     std::process::exit(code);
 }
 
-// `machine` layer only supports Linux on x86_64 and riscv64 for now.
+// `machine` layer only supports Linux on aarch64, x86_64 and riscv64 for
+// now.
 #[cfg(not(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 )))]
 fn main() {}
