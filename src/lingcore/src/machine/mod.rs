@@ -42,6 +42,8 @@ use crate::mem::GuestRam;
 use crate::seccomp::{Filter, Refusal, Thread};
 use crate::vcpu::VmOps;
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
 pub mod snapshot;
@@ -49,6 +51,8 @@ pub mod vmgenid;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
+#[cfg(target_arch = "aarch64")]
+use crate::machine::aarch64::*;
 #[cfg(target_arch = "riscv64")]
 use crate::machine::riscv64::*;
 #[cfg(target_arch = "x86_64")]
@@ -129,11 +133,11 @@ pub enum Error {
     NoRoomForTables,
     /// Device tree overruns its window, or text offset of the kernel leaves
     /// no room for the tree and the identifier below the kernel.
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     #[error("device tree does not fit below kernel")]
     NoRoomForTree,
     /// Failed to assemble the device tree.
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     #[error("failed to assemble device tree")]
     Tree,
     /// Failed to encode or decode the snapshot.

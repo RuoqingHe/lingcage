@@ -29,7 +29,11 @@ pub mod logging;
 #[cfg(all(
     feature = "machine",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 pub mod machine;
 #[cfg(feature = "mem")]
