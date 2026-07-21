@@ -14,7 +14,11 @@ use kvm_bindings::{KVM_EXIT_RISCV_CSR, KVM_EXIT_RISCV_SBI};
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "riscv64"
+))]
 use crate::hv::StateBlob;
 #[cfg(target_arch = "riscv64")]
 use crate::hv::arch::ConfigReg;
@@ -437,6 +441,16 @@ impl Vcpu for KvmVcpu {
     #[cfg(target_arch = "aarch64")]
     fn set_regs(&mut self, vals: &[(Reg, u64)]) -> Result<()> {
         aarch64::vcpu::set_core_regs(&self.fd, vals)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn get_state(&self) -> Result<StateBlob> {
+        aarch64::state::VcpuState::capture(&self.fd)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn set_state(&mut self, blob: &StateBlob) -> Result<()> {
+        aarch64::state::VcpuState::restore(&self.fd, blob)
     }
 
     #[cfg(target_arch = "aarch64")]

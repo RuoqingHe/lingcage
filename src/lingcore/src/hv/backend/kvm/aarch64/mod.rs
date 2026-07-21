@@ -7,6 +7,8 @@
 
 /// The GIC as a KVM device.
 pub(in crate::hv::backend::kvm) mod gic;
+/// Serialized vCPU state.
+pub(in crate::hv::backend::kvm) mod state;
 /// Core registers, read and written by their one-register id.
 pub(in crate::hv::backend::kvm) mod vcpu;
 /// Preferred target of the host and the vCPUs initialized from it.
