@@ -8,7 +8,11 @@
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 mod imp {
     use std::io::Write;
@@ -1410,7 +1414,11 @@ mod imp {
 
 #[cfg(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 fn main() {
     use std::io::Write as _;
@@ -1425,10 +1433,14 @@ fn main() {
     std::process::exit(code);
 }
 
-// `lingcore` machine layer currently supports Linux on x86_64 and riscv64
-// only.
+// `lingcore` machine layer currently supports Linux on aarch64, x86_64 and
+// riscv64 only.
 #[cfg(not(all(
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 )))]
 fn main() {}

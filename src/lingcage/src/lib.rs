@@ -7,32 +7,48 @@
 //! holds the sealed spawn sources and `sandbox` the guests cloned from
 //! them. Process model, control API and policy are placed in this crate.
 
-// Machine layer of `lingcore` only supports Linux on x86_64 and riscv64,
-// modules built on top of it are gated accordingly.
+// Machine layer of `lingcore` only supports Linux on aarch64, x86_64 and
+// riscv64, modules built on top of it are gated accordingly.
 #[cfg(feature = "agent")]
 pub mod agent;
 #[cfg(all(
     feature = "template",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 mod deadline;
 #[cfg(all(
     feature = "template",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 pub mod error;
 #[cfg(all(
     feature = "template",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 pub mod event;
 #[cfg(all(
     feature = "template",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 pub mod hv;
 #[cfg(feature = "lcp")]
@@ -40,25 +56,41 @@ pub mod lcp;
 #[cfg(all(
     feature = "template",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 mod random;
 #[cfg(all(
     feature = "sandbox",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 pub mod sandbox;
 #[cfg(all(
     feature = "template",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 pub mod template;
 
 #[cfg(all(
     feature = "template",
     target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "riscv64")
+    any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )
 ))]
 pub use error::{Error, Result};
