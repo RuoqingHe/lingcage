@@ -173,6 +173,10 @@ struct Proxy {
     to_host: Vec<u8>,
     /// Bytes of `to_host` written so far.
     sent: usize,
+    /// Bytes read from the host end not yet queued for the guest.
+    to_guest: Vec<u8>,
+    /// Bytes of `to_guest` queued so far.
+    fed: usize,
     /// Set once the host end has closed, FIN is then sent to the guest.
     host_closed: bool,
     /// Set once the guest has closed its side and the host end was shut
@@ -384,6 +388,8 @@ impl Stack {
                 connected: false,
                 to_host: Vec::new(),
                 sent: 0,
+                to_guest: Vec::new(),
+                fed: 0,
                 host_closed: false,
                 guest_closed: false,
             },
@@ -619,29 +625,41 @@ fn pump(proxy: &mut Proxy, socket: &mut tcp::Socket) -> io::Result<bool> {
             return Err(err);
         }
     }
-    // Host to guest.
-    while !proxy.host_closed && socket.can_send() {
-        let room = socket.send_capacity().min(CHUNK);
-        if room == 0 {
-            break;
-        }
-        let mut chunk = vec![0u8; room];
+    // Host to guest. Bytes are read into `to_guest` first, since
+    // `send_slice` only accepts what the send buffer has room for, and
+    // the rest is already read out of the host socket.
+    if proxy.to_guest.is_empty() && !proxy.host_closed && socket.can_send() {
+        let mut chunk = vec![0u8; CHUNK];
         match proxy.host.read(&mut chunk) {
-            Ok(0) => {
-                proxy.host_closed = true;
-                socket.close();
-                moved = true;
-            }
+            Ok(0) => proxy.host_closed = true,
             Ok(len) => {
-                if socket.send_slice(&chunk[..len]).is_err() {
-                    break;
-                }
-                moved = true;
+                chunk.truncate(len);
+                proxy.to_guest = chunk;
+                proxy.fed = 0;
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return Err(err),
         }
+    }
+    while proxy.fed < proxy.to_guest.len() {
+        match socket.send_slice(&proxy.to_guest[proxy.fed..]) {
+            Ok(0) | Err(_) => break,
+            Ok(put) => {
+                proxy.fed += put;
+                moved = true;
+            }
+        }
+    }
+    if proxy.fed == proxy.to_guest.len() {
+        proxy.to_guest.clear();
+        proxy.fed = 0;
+    }
+    // Close only after `to_guest` is drained, otherwise FIN goes ahead
+    // of the bytes still waiting.
+    if proxy.host_closed && proxy.to_guest.is_empty() && socket.may_send() {
+        socket.close();
+        moved = true;
     }
     Ok(moved)
 }
@@ -1020,6 +1038,61 @@ mod tests {
         assert!(stack.listening.is_empty(), "listener left behind");
         assert_eq!(stack.counted.connections, 1, "connection not counted");
         assert_eq!(stack.counted.failed, 0, "connection counted as failed");
+    }
+
+    #[test]
+    fn test_host_send_over_buffer_not_dropped() {
+        // Make sure no byte is dropped once the send buffer runs full.
+        const SENT: usize = 128 * 1024;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sending = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let payload: Vec<u8> = (0..SENT).map(|i| (i % 251) as u8).collect();
+            stream.write_all(&payload).unwrap();
+            drop(stream);
+            payload
+        });
+        let config = StackConfig::default();
+        let mut stack = stack();
+        let mut guest = Guest::new(&config);
+        // A small receive buffer keeps the guest behind the host.
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 4096]),
+            tcp::SocketBuffer::new(vec![0; 4096]),
+        );
+        let handle = guest.sockets.add(socket);
+        let context = guest.iface.context();
+        guest
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .connect(context, (config.gateway, port), 40001)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut got = Vec::new();
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "guest only got {} of {SENT} bytes",
+                got.len()
+            );
+            guest.exchange(&mut stack, 4);
+            let socket = guest.sockets.get_mut::<tcp::Socket>(handle);
+            while socket.can_recv() {
+                let mut chunk = [0u8; 2048];
+                let len = socket.recv_slice(&mut chunk).unwrap();
+                got.extend_from_slice(&chunk[..len]);
+            }
+            if !socket.may_recv() && got.len() >= SENT {
+                break;
+            }
+        }
+        assert_eq!(got.len(), SENT, "guest did not get every byte");
+        assert_eq!(
+            got,
+            sending.join().unwrap(),
+            "bytes do not match what host sent"
+        );
     }
 
     #[test]
