@@ -57,6 +57,10 @@ const CONNECTIONS: usize = 1024;
 /// Frames from the guest held for smoltcp. Past it a frame is dropped.
 const QUEUE: usize = 64;
 
+/// Time a TCP connection is kept while bytes wait for the guest and it
+/// stays quiet.
+const TCP_IDLE: Duration = Duration::from_secs(60);
+
 /// Time a UDP flow without traffic is kept.
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
@@ -369,6 +373,10 @@ impl Stack {
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER]),
         );
+        // Guest which stops answering while bytes wait for it would hold
+        // the connection and the host socket for ever, smoltcp resets such
+        // connection instead.
+        socket.set_timeout(Some(TCP_IDLE.into()));
         if socket
             .listen(IpListenEndpoint {
                 addr: Some(IpAddress::Ipv4(ip)),
@@ -454,18 +462,28 @@ impl Stack {
         let mut gone = Vec::new();
         for (handle, proxy) in &mut self.proxies {
             let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
+            let mut failed = false;
             match pump(proxy, socket) {
                 Ok(busy) => moved |= busy,
                 // A connect refused by the peer is reported here too.
                 Err(err) => {
                     debug!("stack drops a connection: {err}");
-                    self.counted.failed += 1;
+                    failed = true;
                     socket.abort();
                 }
             }
             // An aborted socket is closed as well, one push for both.
             if socket.state() == tcp::State::Closed {
+                // Neither end finished, so the guest reset it or `TCP_IDLE`
+                // did.
+                if !failed && !proxy.host_closed && !proxy.guest_closed {
+                    debug!("stack drops a connection closed by neither end");
+                    failed = true;
+                }
                 gone.push(*handle);
+            }
+            if failed {
+                self.counted.failed += 1;
             }
         }
         for handle in gone {
@@ -1093,6 +1111,40 @@ mod tests {
             sending.join().unwrap(),
             "bytes do not match what host sent"
         );
+    }
+
+    #[test]
+    fn test_connection_gets_timeout() {
+        // Make sure connection carries a timeout for a guest gone quiet.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = std::thread::spawn(move || listener.accept().unwrap());
+        let config = StackConfig::default();
+        let mut stack = stack();
+        let mut guest = Guest::new(&config);
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 4096]),
+            tcp::SocketBuffer::new(vec![0; 4096]),
+        );
+        let handle = guest.sockets.add(socket);
+        let context = guest.iface.context();
+        guest
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .connect(context, (config.gateway, port), 40002)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stack.proxies.is_empty() {
+            assert!(Instant::now() < deadline, "guest never got through");
+            guest.exchange(&mut stack, 4);
+        }
+        let opened = *stack.proxies.keys().next().unwrap();
+        assert_eq!(
+            stack.sockets.get::<tcp::Socket>(opened).timeout(),
+            Some(TCP_IDLE.into()),
+            "connection left without a timeout"
+        );
+        drop(held.join().unwrap());
     }
 
     #[test]
