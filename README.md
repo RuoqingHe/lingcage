@@ -35,8 +35,9 @@ There are two crates in this repository:
 
 ### Prerequisites
 
-- x86_64 or riscv64 Linux with KVM enabled, and read/write access to `/dev/kvm`. riscv64 host needs
-  AIA, since interrupt controller of a guest is in-kernel APLIC and IMSICs.
+- aarch64, x86_64 or riscv64 Linux with KVM enabled, and read/write access to `/dev/kvm`. aarch64
+  host needs GICv3, since interrupt controller of a guest is in-kernel distributor and
+  redistributors. riscv64 host needs AIA, since controller there is in-kernel APLIC and IMSICs.
 
 - Rust toolchain, pinned via [rust-toolchain.toml](rust-toolchain.toml). Install via
   [rustup](https://rustup.rs):
@@ -140,7 +141,7 @@ $ lingcore --kernel bzImage --initrd initramfs.cpio.gz --vcpus 2 --memory 1G
 
 Flags, only `--kernel` is required:
 
-- `--kernel K`, kernel image, bzImage on x86_64 or Image on riscv64.
+- `--kernel K`, kernel image, bzImage on x86_64 or Image on aarch64 and riscv64.
 - `--initrd I`, initramfs, a cpio archive.
 - `--cmdline C`, kernel command line, `console=ttyS0` by default.
 - `--memory SIZE`, guest RAM in MiB or with K/M/G suffix, 512M by default.
@@ -267,14 +268,16 @@ cargo test --workspace --features $features
 
 `--all-features` is not used anywhere. Unit tests under `hv`, `boot` and `machine` of `lingcore` and
 under `sandbox` of `lingcage` open `/dev/kvm` and run guest code, so a KVM host is needed.
-`cargo check --target aarch64-unknown-linux-gnu` and `--target x86_64-apple-darwin` make sure the
-`cfg` gates are correct. Only x86_64 and riscv64 Linux build the `machine` feature and parts of
-`lingcage` on top of it.
+`cargo check --target aarch64-unknown-linux-gnu`, `--target riscv64gc-unknown-linux-gnu` and
+`--target x86_64-apple-darwin` make sure the `cfg` gates are correct, the darwin one because only
+Linux builds the `machine` feature and parts of `lingcage` on top of it. An aarch64 guest is
+verified under QEMU with `-machine virt,virtualization=on`, which offers EL2 so that KVM runs inside
+the emulated machine.
 
 ## Status
 
 `lingcore` boots a Linux guest with the devices above, captures and clones it. KVM is the only
-backend, `x86_64` boots a bzImage with ACPI tables and `riscv64` boots an Image with device tree.
-`lingcage` builds a template from a kernel and a guest image, clones it into a sandbox, runs
-commands through its agent over vsock and powers the guest off. `lingcage run` is the front end.
-Isolation, storage and networking are next milestones.
+backend, `x86_64` boots a bzImage with ACPI tables while `aarch64` and `riscv64` boot an Image with
+device tree. `lingcage` builds a template from a kernel and a guest image, clones it into a sandbox,
+runs commands through its agent over vsock and powers the guest off. `lingcage run` is the front
+end. Isolation, storage and networking are next milestones.
