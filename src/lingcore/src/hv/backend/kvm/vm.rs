@@ -15,7 +15,11 @@ use kvm_ioctls::{Cap as KvmCap, VmFd};
 use vmm_sys_util::eventfd::{EFD_CLOEXEC, EFD_NONBLOCK, EventFd};
 use vmm_sys_util::signal::{Killable, SIGRTMIN, register_signal_handler};
 
-#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "riscv64"
+))]
 use crate::hv::StateBlob;
 #[cfg(target_arch = "riscv64")]
 use crate::hv::arch::Aia;
@@ -241,6 +245,16 @@ impl Vm for KvmVm {
         self.routing.lock().unwrap().pins = aia.sources + 1;
         self.irqchip.store(true, Ordering::Release);
         Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn get_irqchip_state(&self) -> Result<StateBlob> {
+        self.platform.gic("KVM_GET_DEVICE_ATTR")?.capture()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn set_irqchip_state(&self, state: &StateBlob) -> Result<()> {
+        self.platform.gic("KVM_SET_DEVICE_ATTR")?.restore(state)
     }
 
     #[cfg(target_arch = "riscv64")]

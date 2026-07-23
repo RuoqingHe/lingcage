@@ -12,25 +12,30 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{DeviceFd, VmFd};
 
-use crate::hv::Result;
 use crate::hv::arch::{Gic, PRIVATE_IDS};
+use crate::hv::backend::kvm::aarch64::gicstate::GicState;
 use crate::hv::backend::kvm::kvm_err;
+use crate::hv::{Result, StateBlob};
 
 /// Interrupt ids of the guest, the private ones of each vCPU plus the
 /// SPIs. KVM wants a multiple of 32, 64 at the least.
 const ID_STEP: u32 = 32;
 
-/// GIC of one guest, its device fd. The fd stays open for the life of
-/// the guest, closing it would take the controller down.
+/// GIC of one guest, its device fd and the shape it was created with.
+/// The fd stays open for the life of the guest, closing it would stop
+/// the controller.
 pub(in crate::hv::backend::kvm) struct KvmGic {
     device: DeviceFd,
+    vcpus: u32,
+    ids: u32,
 }
 
 impl KvmGic {
-    /// Create and initialize the GIC of `vm` placed by `gic`. The vCPUs
-    /// should exist already, since KVM needs a redistributor frame for
-    /// each of them and the init refuses one still being created.
-    pub(in crate::hv::backend::kvm) fn new(vm: &VmFd, gic: &Gic) -> Result<Self> {
+    /// Create and initialize the GIC of `vm` placed by `gic` for `vcpus`
+    /// vCPUs, which should exist already, since KVM needs a redistributor
+    /// frame for each of them and the init refuses one still being
+    /// created.
+    pub(in crate::hv::backend::kvm) fn new(vm: &VmFd, gic: &Gic, vcpus: u32) -> Result<Self> {
         let mut request = kvm_create_device {
             type_: kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3,
             fd: 0,
@@ -39,7 +44,11 @@ impl KvmGic {
         let device = vm
             .create_device(&mut request)
             .map_err(kvm_err("KVM_CREATE_DEVICE"))?;
-        let made = KvmGic { device };
+        let made = KvmGic {
+            device,
+            vcpus,
+            ids: ids(gic.sources),
+        };
         made.set(
             KVM_DEV_ARM_VGIC_GRP_ADDR,
             u64::from(KVM_VGIC_V3_ADDR_TYPE_DIST),
@@ -58,6 +67,16 @@ impl KvmGic {
             &0u32,
         )?;
         Ok(made)
+    }
+
+    /// Capture the state of this GIC as a `StateBlob`.
+    pub(in crate::hv::backend::kvm) fn capture(&self) -> Result<StateBlob> {
+        GicState::capture(&self.device, self.vcpus, self.ids)
+    }
+
+    /// Restore a blob captured by `capture` into this GIC.
+    pub(in crate::hv::backend::kvm) fn restore(&self, blob: &StateBlob) -> Result<()> {
+        GicState::restore(&self.device, blob)
     }
 
     /// Write `value` to attribute `attr` of `group`. KVM reads the value at

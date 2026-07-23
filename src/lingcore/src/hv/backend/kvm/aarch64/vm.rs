@@ -9,6 +9,7 @@
 //! it.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use kvm_bindings::{KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, kvm_vcpu_init};
 use kvm_ioctls::{VcpuFd, VmFd};
@@ -29,6 +30,9 @@ pub(in crate::hv::backend::kvm) struct Platform {
     target: OnceLock<kvm_vcpu_init>,
     /// The GIC, once created by `enable_in_kernel_irqchip`.
     gic: OnceLock<KvmGic>,
+    /// vCPUs created so far. GIC needs a redistributor frame for
+    /// each of them.
+    vcpus: AtomicU32,
 }
 
 impl Platform {
@@ -56,13 +60,15 @@ impl Platform {
         if cpu_index != 0 {
             set(&mut init, KVM_ARM_VCPU_POWER_OFF);
         }
-        fd.vcpu_init(&init).map_err(kvm_err("KVM_ARM_VCPU_INIT"))
+        fd.vcpu_init(&init).map_err(kvm_err("KVM_ARM_VCPU_INIT"))?;
+        self.vcpus.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Create the GIC placed by `gic` in `vm`. KVM initializes one GIC per
     /// guest, a second one is refused.
     pub(in crate::hv::backend::kvm) fn create_gic(&self, vm: &VmFd, gic: &Gic) -> Result<()> {
-        let made = KvmGic::new(vm, gic)?;
+        let made = KvmGic::new(vm, gic, self.vcpus.load(Ordering::SeqCst))?;
         if self.gic.set(made).is_err() {
             return Err(Error::Os {
                 op: "KVM_CREATE_DEVICE",
@@ -70,6 +76,11 @@ impl Platform {
             });
         }
         Ok(())
+    }
+
+    /// Returns the GIC, or `Unsupported` with `op` before it is created.
+    pub(in crate::hv::backend::kvm) fn gic(&self, op: &'static str) -> Result<&KvmGic> {
+        self.gic.get().ok_or(Error::Unsupported(op))
     }
 }
 
