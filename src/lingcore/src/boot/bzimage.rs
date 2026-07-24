@@ -45,6 +45,9 @@ const E820_RAM: u32 = 1;
 /// `type_of_loader` for a loader without assigned ID.
 const LOADER_OTHER: u8 = 0xff;
 
+/// Offset of the 64-bit entry point from the start of a loaded bzImage.
+const ENTRY_64: u64 = 0x200;
+
 /// Errors thrown while loading a kernel.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -84,7 +87,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Kernel loaded into guest RAM.
 #[derive(Clone, Copy)]
 pub struct Kernel {
-    /// Guest address of kernel entry point.
+    /// Guest address of the 64-bit entry point of the kernel.
     pub entry: u64,
     /// First guest address after the loaded kernel.
     pub end: u64,
@@ -111,7 +114,7 @@ where
         _ => Error::NoRoom,
     })?;
     Ok(Kernel {
-        entry: loaded.kernel_load.0,
+        entry: loaded.kernel_load.0 + ENTRY_64,
         end: loaded.kernel_end,
         setup: loaded.setup_header.unwrap_or_default(),
     })
@@ -274,7 +277,7 @@ pub(crate) mod tests {
         let payload = b"a kernel would be here".repeat(37);
         let kernel = load_kernel(&ram, &mut Cursor::new(bzimage(&payload))).expect("load");
 
-        assert_eq!(kernel.entry, LOAD_ADDRESS);
+        assert_eq!(kernel.entry, LOAD_ADDRESS + ENTRY_64);
         assert_eq!(kernel.end, LOAD_ADDRESS + payload.len() as u64);
 
         // Setup sectors are not copied, payload should be at LOAD_ADDRESS.

@@ -25,9 +25,6 @@ const PD: u64 = 0xb000;
 /// Initial stack pointer, top of the page below the page tables.
 const STACK: u64 = 0x8ff0;
 
-/// Offset of 64-bit entry point from the start of loaded kernel.
-const ENTRY_64: u64 = 0x200;
-
 /// RFLAGS with only the reserved bit set, interrupts are disabled.
 const RFLAGS_RESET: u64 = 0x2;
 
@@ -183,7 +180,7 @@ pub fn enter_long_mode<V: Vcpu>(ram: &GuestRam, vcpu: &mut V, kernel: &Kernel) -
     .map_err(Error::Vcpu)?;
 
     vcpu.set_regs(&[
-        (Reg::Rip, kernel.entry + ENTRY_64),
+        (Reg::Rip, kernel.entry),
         (Reg::Rsp, STACK),
         (Reg::Rbp, STACK),
         (Reg::Rsi, BOOT_PARAMS),
@@ -267,9 +264,9 @@ mod tests {
                 .expect("map guest RAM");
         }
 
-        // Program is placed at `ENTRY_64`, bytes ahead of it act as the 32-bit
-        // entry.
-        let mut payload = vec![0u8; ENTRY_64 as usize];
+        // Program is placed at the 64-bit entry, the bytes ahead of it act
+        // as the 32-bit entry.
+        let mut payload = vec![0u8; 0x200];
         payload.extend_from_slice(&PROGRAM);
         let kernel = load_kernel(&ram, &mut Cursor::new(bzimage(&payload))).expect("load");
         write_boot_params(&ram, &kernel, "console=ttyS0", None).expect("parameters");
