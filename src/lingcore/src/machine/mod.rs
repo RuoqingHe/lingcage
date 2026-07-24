@@ -22,6 +22,8 @@ use crate::devices::serial::Serial;
 use crate::devices::virtio::block::Block;
 use crate::devices::virtio::entropy::Entropy;
 use crate::devices::virtio::mmio::{self, Transport};
+#[cfg(target_os = "linux")]
+use crate::devices::virtio::net::carrier::Tap;
 use crate::devices::virtio::net::carrier::{Carrier, Framed};
 use crate::devices::virtio::net::device::Net;
 use crate::devices::virtio::net::pcap::Captured;
@@ -213,6 +215,10 @@ pub enum Link {
     /// The stack in this process, frames are translated to host sockets
     /// and no privilege is needed.
     User(StackConfig),
+    /// Tap device of the host with this name, created by the caller. The
+    /// stack behind it is the kernel of the host, so a guest is reached at
+    /// the address the caller gives the tap.
+    Tap(String),
 }
 
 /// Network link of a guest, a virtio-net device over `Link`.
@@ -683,6 +689,10 @@ impl<H: Hypervisor> Machine<H> {
             let carrier: Box<dyn Carrier> = match &network.link {
                 Link::Socket(at) => Box::new(Framed::connect(at).map_err(Error::Network)?),
                 Link::User(stack) => Box::new(Stack::new(stack.clone()).map_err(Error::Network)?),
+                #[cfg(target_os = "linux")]
+                Link::Tap(name) => Box::new(Tap::attach(name).map_err(Error::Network)?),
+                #[cfg(not(target_os = "linux"))]
+                Link::Tap(_) => return Err(Error::Network(io::ErrorKind::Unsupported.into())),
             };
             // Capture wraps the carrier, so frames of either link are
             // written on their way through.

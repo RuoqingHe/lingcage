@@ -137,8 +137,8 @@ mod imp {
             name: "network",
             value: "LINK",
             required: false,
-            help: "guest network, user for the stack in this process or unix:PATH for a host \
-                   socket carrying Ethernet frames",
+            help: "guest network, user for the stack in this process, unix:PATH for a host socket \
+                   carrying Ethernet frames, or tap:NAME for a tap of the host",
         },
         Flag {
             name: "mac",
@@ -381,15 +381,22 @@ mod imp {
         Ok(mac)
     }
 
-    /// Parse `--network`, `user` for the stack in this process and
-    /// `unix:PATH` for a host socket.
+    /// Parse `--network`, `user` for the stack in this process,
+    /// `unix:PATH` for a host socket and `tap:NAME` for a tap of the host.
     fn parse_link(text: &str) -> std::result::Result<Link, String> {
         if text == "user" {
             return Ok(Link::User(StackConfig::default()));
         }
+        if let Some(name) = text.strip_prefix("tap:")
+            && !name.is_empty()
+        {
+            return Ok(Link::Tap(name.to_string()));
+        }
         match text.strip_prefix("unix:") {
             Some(path) if !path.is_empty() => Ok(Link::Socket(PathBuf::from(path))),
-            _ => Err(format!("invalid network {text}, use user or unix:PATH")),
+            _ => Err(format!(
+                "invalid network {text}, use user, unix:PATH or tap:NAME"
+            )),
         }
     }
 

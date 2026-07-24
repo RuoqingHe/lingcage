@@ -3,12 +3,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Host end of virtio-net device. `Carrier` carries frames of a guest
-//! in both directions, `Framed` is a carrier over a stream socket.
+//! in both directions, `Framed` is a carrier over a stream socket and
+//! `Tap` one over a tap device of the host.
 //!
 //! The program assembling the machine chooses the host end. A frame not
 //! taken by the host end in time is finished by `Carrier::resume`, the
 //! next one is left in the ring of the guest until then.
 
+#[cfg(target_os = "linux")]
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -188,6 +191,150 @@ impl Carrier for Framed {
     }
 }
 
+/// Character device a tap is opened through.
+#[cfg(target_os = "linux")]
+const TUN: &str = "/dev/net/tun";
+
+/// `TUNSETIFF` of `include/uapi/linux/if_tun.h`.
+#[cfg(target_os = "linux")]
+const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+
+/// `IFF_TAP | IFF_NO_PI`, an Ethernet tap whose frames carry no header
+/// ahead of them.
+#[cfg(target_os = "linux")]
+const TAP_FLAGS: libc::c_short = 0x0002 | 0x1000;
+
+/// Carrier over a tap device of the host. One read is one frame, so no
+/// length goes ahead of it.
+///
+/// Device is opened while machine is assembled, ahead of an allowlist,
+/// and device thread only reads and writes it after.
+#[cfg(target_os = "linux")]
+pub struct Tap {
+    tap: File,
+    /// Frame the tap did not accept, offered again by `resume`.
+    leaving: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl Tap {
+    /// Attach to tap named `name`, which the caller has created.
+    pub fn attach(name: &str) -> io::Result<Self> {
+        let mut request = Tap::request(name)?;
+        let tap = OpenOptions::new().read(true).write(true).open(TUN)?;
+        // SAFETY: `request` is 40 bytes, longer than the `ifreq` the kernel
+        // reads, and `tap` is open for the length of the call.
+        let attached = unsafe { libc::ioctl(tap.as_raw_fd(), TUNSETIFF, request.as_mut_ptr()) };
+        if attached < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Tap::over(tap)
+    }
+
+    /// The `ifreq` `TUNSETIFF` reads, laid out by hand. Only name and
+    /// flags are read, rest stays zero.
+    fn request(name: &str) -> io::Result<[u8; 40]> {
+        if name.is_empty() || name.len() >= libc::IFNAMSIZ {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut request = [0u8; 40];
+        request[..name.len()].copy_from_slice(name.as_bytes());
+        request[libc::IFNAMSIZ..libc::IFNAMSIZ + 2].copy_from_slice(&TAP_FLAGS.to_ne_bytes());
+        Ok(request)
+    }
+
+    /// Take a tap already opened and attached by the caller.
+    pub fn held(tap: OwnedFd) -> io::Result<Self> {
+        Tap::over(File::from(tap))
+    }
+
+    fn over(tap: File) -> io::Result<Self> {
+        // Blocking read or write would stall the device thread.
+        // SAFETY: `tap` is open for the length of the call.
+        let flags = unsafe { libc::fcntl(tap.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `tap` is open for the length of the call.
+        if unsafe { libc::fcntl(tap.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Tap {
+            tap,
+            leaving: Vec::new(),
+        })
+    }
+
+    /// Write the frame the tap did not accept. Returns `true` once none
+    /// waits.
+    fn push(&mut self) -> io::Result<bool> {
+        while !self.leaving.is_empty() {
+            match self.tap.write(&self.leaving) {
+                // A tap accepts a whole frame or none, so a short write is
+                // not part of one.
+                Ok(_) => self.leaving.clear(),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Carrier for Tap {
+    fn take(&mut self, into: &mut [u8]) -> io::Result<Option<usize>> {
+        loop {
+            match self.tap.read(into) {
+                Ok(0) => return Ok(None),
+                Ok(len) => return Ok(Some(len)),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                // Frame longer than `into` is refused by kernel, not cut
+                // short, and tap drops it.
+                Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+                    warn!("frame dropped, does not fit in buffer");
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn give(&mut self, frame: &[u8]) -> io::Result<bool> {
+        if !self.leaving.is_empty() {
+            // Caller keeps this one until `resume` returns `true`.
+            return Ok(false);
+        }
+        if frame.len() > MAX_FRAME {
+            // Overlong frame left in the ring would block frames behind
+            // it, so it is dropped.
+            warn!(
+                "frame of {} bytes dropped, longer than MAX_FRAME",
+                frame.len()
+            );
+            return Ok(true);
+        }
+        self.leaving.extend_from_slice(frame);
+        self.push()?;
+        Ok(true)
+    }
+
+    fn resume(&mut self) -> io::Result<bool> {
+        self.push()
+    }
+
+    fn outside(&self) -> Vec<(RawFd, Interest)> {
+        let interest = if self.leaving.is_empty() {
+            Interest::Read
+        } else {
+            Interest::Both
+        };
+        vec![(self.tap.as_raw_fd(), interest)]
+    }
+}
+
 // Socket buffers are shrunk through `libc::setsockopt`.
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
@@ -226,6 +373,28 @@ mod tests {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Vec::new(),
             Err(err) => panic!("read failed: {err}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_tap_request_layout() {
+        let request = Tap::request("tap0").expect("a name which fits");
+        assert_eq!(&request[..4], b"tap0");
+        assert_eq!(request[4], 0, "name is not terminated");
+        assert_eq!(
+            &request[libc::IFNAMSIZ..libc::IFNAMSIZ + 2],
+            &TAP_FLAGS.to_ne_bytes(),
+            "flags are not where TUNSETIFF reads them"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_reject_name_too_long_for_ifreq() {
+        // A name past `IFNAMSIZ` would run into the flags behind it.
+        assert!(Tap::request("").is_err());
+        assert!(Tap::request(&"e".repeat(libc::IFNAMSIZ)).is_err());
+        assert!(Tap::request(&"e".repeat(libc::IFNAMSIZ - 1)).is_ok());
     }
 
     #[test]
