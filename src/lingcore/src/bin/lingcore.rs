@@ -131,7 +131,7 @@ mod imp {
             name: "disk",
             value: "FILE",
             required: false,
-            help: "file attached as virtio-blk disk, /dev/vda in guest",
+            help: "file attached as a virtio-blk disk, /dev/vda in the guest, given once per disk",
         },
         Flag {
             name: "network",
@@ -195,6 +195,15 @@ mod imp {
                 .rev()
                 .find(|(flag, _)| *flag == name)
                 .map(|(_, value)| value.as_str())
+        }
+
+        /// Returns the values given for flag `name`, in the order given.
+        fn each(&self, name: &str) -> Vec<&str> {
+            self.values
+                .iter()
+                .filter(|(flag, _)| *flag == name)
+                .map(|(_, value)| value.as_str())
+                .collect()
         }
     }
 
@@ -406,7 +415,7 @@ mod imp {
                 .unwrap_or("console=ttyS0")
                 .to_string(),
             memory: 512 << 20,
-            disk: parsed.value("disk").map(PathBuf::from),
+            disks: parsed.each("disk").into_iter().map(PathBuf::from).collect(),
             confine: Some(Refusal::Trap),
             ..Default::default()
         };

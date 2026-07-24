@@ -542,7 +542,7 @@ fn assemble(
         kernel: template.kernel_path(),
         initrd: None,
         cmdline: String::new(),
-        disk: None,
+        disks: Vec::new(),
         channel: Some(Channel {
             cid,
             at: vsock_prefix.clone(),

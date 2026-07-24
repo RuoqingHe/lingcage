@@ -61,6 +61,11 @@ use crate::machine::x86_64::*;
 /// Bytes of RAM given to a guest by `Config::default`.
 pub const DEFAULT_MEMORY: u64 = 128 << 20;
 
+/// Most disks a guest is given. A virtio device needs an interrupt line,
+/// so the count is held well inside what the interrupt controller of each
+/// architecture routes.
+pub const DISKS: usize = 8;
+
 /// Host file read by the entropy source.
 const ENTROPY_SOURCE: &str = "/dev/urandom";
 
@@ -123,6 +128,9 @@ pub enum Error {
     /// `Config::kernel` is empty.
     #[error("guest needs a kernel")]
     NoKernel,
+    /// `Config::disks` holds more than `DISKS` of them.
+    #[error("guest takes at most {DISKS} disks, {0} were named")]
+    TooManyDisks(usize),
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[cfg(target_arch = "x86_64")]
     #[error("MP table does not fit in its kilobyte")]
@@ -247,8 +255,9 @@ pub struct Config {
     pub initrd: Option<PathBuf>,
     /// Kernel command line.
     pub cmdline: String,
-    /// File backing the disk of the guest, if any.
-    pub disk: Option<PathBuf>,
+    /// Files backing the disks of the guest, in the order the guest sees
+    /// them. At most `DISKS` of them.
+    pub disks: Vec<PathBuf>,
     /// Vsock channel to the guest, if any.
     pub channel: Option<Channel>,
     /// Network link of the guest, if any.
@@ -266,7 +275,7 @@ impl Default for Config {
             kernel: PathBuf::new(),
             initrd: None,
             cmdline: String::new(),
-            disk: None,
+            disks: Vec::new(),
             channel: None,
             network: None,
             confine: None,
@@ -278,7 +287,7 @@ impl Default for Config {
 /// disk, the channel and the network link, each one if named in
 /// `Config`.
 fn virtio_count(config: &Config) -> u8 {
-    1 + u8::from(config.disk.is_some())
+    1 + config.disks.len() as u8
         + u8::from(config.channel.is_some())
         + u8::from(config.network.is_some())
 }
@@ -607,6 +616,9 @@ impl<H: Hypervisor> Machine<H> {
         if config.kernel.as_os_str().is_empty() {
             return Err(Error::NoKernel);
         }
+        if config.disks.len() > DISKS {
+            return Err(Error::TooManyDisks(config.disks.len()));
+        }
         let assembled = Instant::now();
         let since = |assembled: Instant| assembled.elapsed().as_secs_f64() * 1e3;
         let vm = hv.create_vm()?;
@@ -655,7 +667,7 @@ impl<H: Hypervisor> Machine<H> {
         // `virtio_count(config)` slots in the same order.
         let mut devices: Vec<Box<dyn crate::devices::virtio::Device>> =
             vec![Box::new(Entropy::new(seed))];
-        if let Some(path) = &config.disk {
+        for path in &config.disks {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1337,6 +1349,42 @@ mod tests {
             "stop told was missed"
         );
         assert!(orders.wait_for_a_stop_within(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_reject_more_disks_than_slots() {
+        #[cfg(all(feature = "kvm", target_os = "linux"))]
+        {
+            use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+            let hv = KvmHv::new().expect("open /dev/kvm");
+            let config = Config {
+                vcpus: 1,
+                cmdline: String::new(),
+                confine: None,
+                kernel: PathBuf::from("/nonexistent/kernel"),
+                memory: 16 << 20,
+                disks: (0..DISKS + 1).map(|_| PathBuf::from("/dev/null")).collect(),
+                ..Default::default()
+            };
+            assert!(matches!(
+                Machine::new(&hv, &config, Vec::new()),
+                Err(Error::TooManyDisks(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_slot_per_disk() {
+        // Entropy is on the first slot and a disk sits behind it, so a
+        // guest with three disks holds four devices.
+        let mut config = Config {
+            kernel: PathBuf::from("/nonexistent/kernel"),
+            ..Default::default()
+        };
+        assert_eq!(virtio_count(&config), 1);
+        config.disks = vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")];
+        assert_eq!(virtio_count(&config), 4);
     }
 
     #[test]

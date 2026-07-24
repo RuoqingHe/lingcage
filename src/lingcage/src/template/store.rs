@@ -238,7 +238,7 @@ impl TemplateStore {
             kernel: plan.kernel.clone(),
             initrd: plan.initrd.clone(),
             cmdline: plan.cmdline.clone(),
-            disk: None,
+            disks: Vec::new(),
             channel: Some(Channel { cid, at: prefix }),
             network: None,
             confine: Some(Refusal::Trap),
