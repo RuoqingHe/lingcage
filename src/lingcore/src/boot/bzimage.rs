@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Loading bzImage of x86_64 kernel at the address fixed by boot
-//! protocol, together with boot parameters and initramfs.
+//! Loading x86_64 kernel at the address fixed by boot protocol, together
+//! with boot parameters and initramfs. A bzImage carries a setup header,
+//! an uncompressed `vmlinux` is an ELF and carries none.
 
 use std::io::{Read, Seek};
 
@@ -12,6 +13,7 @@ use linux_loader::loader::bootparam::{
     E820_MAX_ENTRIES_ZEROPAGE, boot_e820_entry, boot_params, setup_header,
 };
 use linux_loader::loader::bzimage::BzImage;
+use linux_loader::loader::elf::Elf;
 use thiserror::Error;
 use vm_memory::{ByteValued, GuestAddress, ReadVolatile};
 
@@ -44,6 +46,20 @@ const E820_RAM: u32 = 1;
 
 /// `type_of_loader` for a loader without assigned ID.
 const LOADER_OTHER: u8 = 0xff;
+
+/// First four bytes of an ELF image, `\x7fELF`.
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
+/// `header` of a setup header, "HdrS". An ELF has no such header, so the
+/// value is written for it, the kernel reads the field either way.
+const SETUP_MAGIC: u32 = 0x5372_6448;
+
+/// `boot_flag` of a setup header, the boot sector signature.
+const BOOT_FLAG: u16 = 0xaa55;
+
+/// `kernel_alignment` written for an ELF, the alignment a bzImage of this
+/// architecture asks for.
+const KERNEL_ALIGNMENT: u32 = 0x0100_0000;
 
 /// Offset of the 64-bit entry point from the start of a loaded bzImage.
 const ENTRY_64: u64 = 0x200;
@@ -97,12 +113,48 @@ pub struct Kernel {
     setup: setup_header,
 }
 
-/// Load the bzImage in `image` into `ram` at `LOAD_ADDRESS`. Setup
-/// sectors ahead of the kernel are not copied.
+/// Returns whether `image` opens with the ELF magic. Read position is
+/// put back before returning.
+fn is_elf<F>(image: &mut F) -> Result<bool>
+where
+    F: Read + Seek,
+{
+    let at = image.stream_position().map_err(|_| Error::NotBzImage)?;
+    let mut magic = [0u8; 4];
+    let read = image.read(&mut magic).map_err(|_| Error::NotBzImage)?;
+    image
+        .seek(std::io::SeekFrom::Start(at))
+        .map_err(|_| Error::NotBzImage)?;
+    Ok(read == magic.len() && magic == ELF_MAGIC)
+}
+
+/// Load the kernel in `image` into `ram` at `LOAD_ADDRESS`. A bzImage has
+/// its setup sectors left behind, an ELF is loaded at the addresses its
+/// program headers name.
 pub fn load_kernel<F>(ram: &GuestRam, image: &mut F) -> Result<Kernel>
 where
     F: Read + Seek + ReadVolatile,
 {
+    if is_elf(image)? {
+        let loaded = Elf::load(ram.backing(), None, image, Some(GuestAddress(LOAD_ADDRESS)))
+            .map_err(|err| match err {
+                linux_loader::loader::Error::Elf(_) => Error::NotBzImage,
+                _ => Error::NoRoom,
+            })?;
+        // An ELF carries no setup header. The kernel still reads these
+        // fields out of the zero page, so they are written for it.
+        let setup = setup_header {
+            header: SETUP_MAGIC,
+            boot_flag: BOOT_FLAG,
+            kernel_alignment: KERNEL_ALIGNMENT,
+            ..Default::default()
+        };
+        return Ok(Kernel {
+            entry: loaded.kernel_load.0,
+            end: loaded.kernel_end,
+            setup,
+        });
+    }
     let loaded = BzImage::load(
         ram.backing(),
         Some(GuestAddress(LOAD_ADDRESS)),
@@ -269,6 +321,73 @@ pub(crate) mod tests {
             .copy_from_slice(header.as_mut_slice());
         image[setup..].copy_from_slice(payload);
         image
+    }
+
+    /// Returns a 64-bit ELF whose one loadable segment holds `payload` at
+    /// `at`, the shape an uncompressed `vmlinux` has.
+    pub(crate) fn elf(payload: &[u8], at: u64) -> Vec<u8> {
+        const HEADER: usize = 64;
+        const PROGRAM: usize = 56;
+        let offset = (HEADER + PROGRAM) as u64;
+        let mut image = vec![0u8; offset as usize + payload.len()];
+        image[..4].copy_from_slice(&ELF_MAGIC);
+        // 64-bit, little endian, current version, System V.
+        image[4] = 2;
+        image[5] = 1;
+        image[6] = 1;
+        // ET_EXEC, EM_X86_64, version.
+        image[16..18].copy_from_slice(&2u16.to_le_bytes());
+        image[18..20].copy_from_slice(&62u16.to_le_bytes());
+        image[20..24].copy_from_slice(&1u32.to_le_bytes());
+        image[24..32].copy_from_slice(&at.to_le_bytes());
+        image[32..40].copy_from_slice(&(HEADER as u64).to_le_bytes());
+        image[52..54].copy_from_slice(&(HEADER as u16).to_le_bytes());
+        image[54..56].copy_from_slice(&(PROGRAM as u16).to_le_bytes());
+        image[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+        // One PT_LOAD segment, laid at the physical address of `at`.
+        let len = payload.len() as u64;
+        let mut program = [0u8; PROGRAM];
+        program[..4].copy_from_slice(&1u32.to_le_bytes());
+        program[4..8].copy_from_slice(&5u32.to_le_bytes());
+        program[8..16].copy_from_slice(&offset.to_le_bytes());
+        program[16..24].copy_from_slice(&at.to_le_bytes());
+        program[24..32].copy_from_slice(&at.to_le_bytes());
+        program[32..40].copy_from_slice(&len.to_le_bytes());
+        program[40..48].copy_from_slice(&len.to_le_bytes());
+        image[HEADER..HEADER + PROGRAM].copy_from_slice(&program);
+        image[offset as usize..].copy_from_slice(payload);
+        image
+    }
+
+    #[test]
+    fn test_load_elf_at_its_own_entry() {
+        // An ELF names the address it is entered at, so no offset of a
+        // bzImage is added to it.
+        const AT: u64 = 0x100_0000;
+        let ram = GuestRam::new(&[(0, 32 * 1024 * 1024)]).expect("host pages");
+        let payload = b"an uncompressed kernel".repeat(11);
+        let kernel = load_kernel(&ram, &mut Cursor::new(elf(&payload, AT))).expect("load");
+
+        assert_eq!(kernel.entry, AT, "entry of an ELF is its own");
+        assert_eq!(kernel.end, AT + payload.len() as u64);
+        let mut back = vec![0u8; payload.len()];
+        ram.read(AT, &mut back).expect("read it back");
+        assert_eq!(back, payload, "segment is not at the address it names");
+    }
+
+    #[test]
+    fn test_elf_carries_setup_header_fields() {
+        // An ELF has no setup header of its own, and the kernel reads these
+        // fields out of the zero page either way.
+        let ram = GuestRam::new(&[(0, 32 * 1024 * 1024)]).expect("host pages");
+        let kernel = load_kernel(&ram, &mut Cursor::new(elf(b"kernel", 0x100_0000))).expect("load");
+        // `setup_header` is packed, so each field is copied out before it
+        // is compared.
+        let hdr = kernel.setup;
+        assert_eq!({ hdr.header }, SETUP_MAGIC);
+        assert_eq!({ hdr.boot_flag }, BOOT_FLAG);
+        assert_eq!({ hdr.kernel_alignment }, KERNEL_ALIGNMENT);
     }
 
     #[test]
