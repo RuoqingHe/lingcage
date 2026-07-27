@@ -20,14 +20,15 @@ mod imp {
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use lingcore::devices::Receive;
     use lingcore::devices::virtio::net::stack::StackConfig;
     use lingcore::hv::backend::kvm::hypervisor::KvmHv;
     use lingcore::hv::vcpu::VmExit;
     use lingcore::logging::{Logger, level_of};
-    use lingcore::machine::{Config, Link, Machine, Network, StopHandle};
+    use lingcore::machine::snapshot::Snapshot;
+    use lingcore::machine::{Config, Link, Machine, Network, StopHandle, control};
     use lingcore::seccomp::Refusal;
 
     /// Byte typed on the terminal to end the guest, `Ctrl-]`.
@@ -42,6 +43,9 @@ mod imp {
     /// Exit code if `--timeout` elapsed before guest powered off, same as
     /// `timeout(1)`.
     const EXIT_TIMEOUT: i32 = 124;
+
+    /// Time the guest is waited on between two rounds of orders.
+    const SLICE: Duration = Duration::from_millis(50);
 
     /// Time to wait before retrying if console input queue is full.
     const INPUT_RETRY: Duration = Duration::from_millis(5);
@@ -151,6 +155,19 @@ mod imp {
             value: "FILE",
             required: false,
             help: "write frames of the network link to FILE in pcap format, needs --network",
+        },
+        Flag {
+            name: "control",
+            value: "PATH",
+            required: false,
+            help: "take orders on the Unix socket at PATH while the guest runs, one JSON object \
+                   per line",
+        },
+        Flag {
+            name: "restore",
+            value: "DIR",
+            required: false,
+            help: "lay a guest written by a snapshot order over this one before starting it",
         },
         Flag {
             name: "seccomp",
@@ -674,13 +691,44 @@ mod imp {
         let timeout = timeout_of(parsed)?;
         log_to(parsed)?;
         keep_heap();
+        let control = parsed.value("control").map(PathBuf::from);
+        let restore = parsed.value("restore").map(PathBuf::from);
         let hv = KvmHv::new().map_err(lingcore::machine::Error::from)?;
-        let mut machine = Machine::new(&hv, &config, Sink)?;
+        let mut machine = match &restore {
+            // A guest laid over a captured one shares pages of the image
+            // until it writes to them.
+            Some(from) => {
+                let image = File::open(from.join(control::MEMORY))
+                    .map_err(|_| lingcore::machine::Error::Snapshot)?;
+                let mut machine = Machine::cloned(&hv, &config, Sink, &image)?;
+                let mut document = File::open(from.join(control::DOCUMENT))
+                    .map_err(|_| lingcore::machine::Error::Snapshot)?;
+                let taken = Snapshot::read_from(&mut document)?;
+                machine.restore(&taken)?;
+                machine
+            }
+            None => Machine::new(&hv, &config, Sink)?,
+        };
+        let orders = match &control {
+            Some(at) => Some(control::listen(at).map_err(lingcore::machine::Error::Network)?),
+            None => None,
+        };
+
         let stop = machine.stop_handle();
         arm_signals(stop.clone())?;
         let terminal = Terminal::raw()?;
         machine.start()?;
         forward_input(machine.console(), stop.clone(), terminal.is_tty());
+        if let Some(orders) = &orders {
+            // Orders are served between two waits on the guest, so the one
+            // thread which holds the guest is the one which changes it.
+            let exit = drive(&mut machine, orders, timeout)?;
+            drop(terminal);
+            if let Some(code) = signalled() {
+                return Ok(code);
+            }
+            return Ok(exit_code(exit));
+        }
         let exit = match timeout {
             Some(within) => match machine.wait_timeout(within)? {
                 Some(exit) => exit,
@@ -701,7 +749,12 @@ mod imp {
         if ESCAPED.load(Ordering::SeqCst) {
             return Ok(0);
         }
-        Ok(match exit {
+        Ok(exit_code(exit))
+    }
+
+    /// Returns the status a guest which stopped on `exit` leaves behind.
+    fn exit_code(exit: VmExit) -> i32 {
+        match exit {
             VmExit::Shutdown => 0,
             VmExit::Reboot => {
                 eprintln!("lingcore: guest asked for a reboot");
@@ -711,7 +764,29 @@ mod imp {
                 eprintln!("lingcore: guest stopped on {other:?}");
                 EXIT_FAILURE
             }
-        })
+        }
+    }
+
+    /// Run the guest until it stops, serving orders in between. A guest
+    /// held still still answers, since the wait is a short one.
+    fn drive(
+        machine: &mut Machine<KvmHv>,
+        orders: &control::Orders,
+        timeout: Option<Duration>,
+    ) -> Result<VmExit> {
+        let deadline = timeout.map(|within| Instant::now() + within);
+        loop {
+            while let Some(order) = orders.next() {
+                order.serve(machine);
+            }
+            if let Some(exit) = machine.wait_timeout(SLICE)? {
+                return Ok(exit);
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                machine.stop()?;
+                return Ok(machine.wait()?);
+            }
+        }
     }
 
     #[cfg(test)]
