@@ -11,6 +11,10 @@ use thiserror::Error;
 
 pub mod block;
 pub mod entropy;
+// FUSE and the calls a directory is served with are Linux, so the
+// device is built there only.
+#[cfg(target_os = "linux")]
+pub mod fs;
 pub mod mmio;
 pub mod net;
 pub mod queue;
