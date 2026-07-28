@@ -239,6 +239,7 @@ impl TemplateStore {
             initrd: plan.initrd.clone(),
             cmdline: plan.cmdline.clone(),
             disks: Vec::new(),
+            shares: Vec::new(),
             channel: Some(Channel { cid, at: prefix }),
             network: None,
             confine: Some(Refusal::Trap),

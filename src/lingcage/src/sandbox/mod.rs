@@ -543,6 +543,7 @@ fn assemble(
         initrd: None,
         cmdline: String::new(),
         disks: Vec::new(),
+        shares: Vec::new(),
         channel: Some(Channel {
             cid,
             at: vsock_prefix.clone(),

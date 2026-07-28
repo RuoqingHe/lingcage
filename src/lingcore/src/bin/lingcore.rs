@@ -28,7 +28,7 @@ mod imp {
     use lingcore::hv::vcpu::VmExit;
     use lingcore::logging::{Logger, level_of};
     use lingcore::machine::snapshot::Snapshot;
-    use lingcore::machine::{Config, Link, Machine, Network, StopHandle, control};
+    use lingcore::machine::{Config, Link, Machine, Network, Share, StopHandle, control};
     use lingcore::seccomp::Refusal;
 
     /// Byte typed on the terminal to end the guest, `Ctrl-]`.
@@ -155,6 +155,13 @@ mod imp {
             value: "FILE",
             required: false,
             help: "write frames of the network link to FILE in pcap format, needs --network",
+        },
+        Flag {
+            name: "share",
+            value: "TAG=DIR[:ro]",
+            required: false,
+            help: "directory of the host the guest mounts with `mount -t virtiofs TAG`, given \
+                   once per share, `:ro` refuses changes",
         },
         Flag {
             name: "control",
@@ -417,6 +424,28 @@ mod imp {
         }
     }
 
+    /// Parse `--share`, `TAG=DIR` or `TAG=DIR:ro`.
+    fn parse_share(text: &str) -> std::result::Result<Share, String> {
+        let Some((tag, rest)) = text.split_once('=') else {
+            return Err(format!("invalid share {text}, use TAG=DIR or TAG=DIR:ro"));
+        };
+        if tag.is_empty() {
+            return Err(format!("invalid share {text}, tag is empty"));
+        }
+        let (at, writable) = match rest.strip_suffix(":ro") {
+            Some(at) => (at, false),
+            None => (rest, true),
+        };
+        if at.is_empty() {
+            return Err(format!("invalid share {text}, directory is empty"));
+        }
+        Ok(Share {
+            tag: tag.to_string(),
+            at: PathBuf::from(at),
+            writable,
+        })
+    }
+
     /// Parse `--seccomp` mode, `None` means no allowlist.
     fn parse_seccomp(text: &str) -> std::result::Result<Option<Refusal>, String> {
         match text {
@@ -431,6 +460,10 @@ mod imp {
 
     /// Build guest `Config` from the parsed flags.
     fn config_of(parsed: &Parsed) -> Result<Config> {
+        let mut shares = Vec::new();
+        for text in parsed.each("share") {
+            shares.push(parse_share(text).map_err(usage_err)?);
+        }
         let mut config = Config {
             kernel: PathBuf::from(parsed.value("kernel").expect("required flag")),
             initrd: parsed.value("initrd").map(PathBuf::from),
@@ -440,6 +473,7 @@ mod imp {
                 .to_string(),
             memory: 512 << 20,
             disks: parsed.each("disk").into_iter().map(PathBuf::from).collect(),
+            shares,
             confine: Some(Refusal::Trap),
             ..Default::default()
         };

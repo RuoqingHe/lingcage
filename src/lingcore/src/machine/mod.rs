@@ -21,6 +21,8 @@ use crate::devices::bus::Bus;
 use crate::devices::serial::Serial;
 use crate::devices::virtio::block::Block;
 use crate::devices::virtio::entropy::Entropy;
+#[cfg(target_os = "linux")]
+use crate::devices::virtio::fs::Fs;
 use crate::devices::virtio::mmio::{self, Transport};
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::net::carrier::Tap;
@@ -68,6 +70,10 @@ pub const DEFAULT_MEMORY: u64 = 128 << 20;
 /// so the count is held well inside what the interrupt controller of each
 /// architecture routes.
 pub const DISKS: usize = 8;
+
+/// Most directories of the host shared with a guest. Held inside what
+/// interrupt controller routes, the same as `DISKS`.
+pub const SHARES: usize = 8;
 
 /// Host file read by the entropy source.
 const ENTROPY_SOURCE: &str = "/dev/urandom";
@@ -134,6 +140,12 @@ pub enum Error {
     /// `Config::disks` holds more than `DISKS` of them.
     #[error("guest takes at most {DISKS} disks, {0} were named")]
     TooManyDisks(usize),
+    /// `Config::shares` holds more than `SHARES` of them.
+    #[error("guest takes at most {SHARES} shared directories, {0} were named")]
+    TooManyShares(usize),
+    /// A shared directory could not be opened.
+    #[error("failed to share a directory")]
+    Share(#[source] std::io::Error),
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[cfg(target_arch = "x86_64")]
     #[error("MP table does not fit in its kilobyte")]
@@ -222,6 +234,17 @@ pub enum Link {
     Tap(String),
 }
 
+/// Directory of the host shared with a guest over virtio-fs.
+#[derive(Debug, Clone)]
+pub struct Share {
+    /// Name the guest mounts by, `mount -t virtiofs TAG AT`.
+    pub tag: String,
+    /// Directory of the host behind the tag.
+    pub at: PathBuf,
+    /// Set if the guest may change what is served.
+    pub writable: bool,
+}
+
 /// Network link of a guest, a virtio-net device over `Link`.
 #[derive(Debug, Clone)]
 pub struct Network {
@@ -265,6 +288,9 @@ pub struct Config {
     /// Files backing the disks of the guest, in the order the guest sees
     /// them. At most `DISKS` of them.
     pub disks: Vec<PathBuf>,
+    /// Directories of the host shared with the guest, each under a tag
+    /// the guest mounts by. At most `SHARES` of them.
+    pub shares: Vec<Share>,
     /// Vsock channel to the guest, if any.
     pub channel: Option<Channel>,
     /// Network link of the guest, if any.
@@ -283,6 +309,7 @@ impl Default for Config {
             initrd: None,
             cmdline: String::new(),
             disks: Vec::new(),
+            shares: Vec::new(),
             channel: None,
             network: None,
             confine: None,
@@ -295,6 +322,7 @@ impl Default for Config {
 /// `Config`.
 fn virtio_count(config: &Config) -> u8 {
     1 + config.disks.len() as u8
+        + config.shares.len() as u8
         + u8::from(config.channel.is_some())
         + u8::from(config.network.is_some())
 }
@@ -572,6 +600,9 @@ pub struct Machine<H: Hypervisor> {
     /// Set if the network link is the stack in this process, the device
     /// thread then takes the wider allowlist.
     host_stack: bool,
+    /// Set if a directory of the host is served, device thread then takes
+    /// the wider allowlist.
+    sharing: bool,
     /// Moment the assembly began, log lines of the phases count from it.
     assembled: Instant,
     state: State,
@@ -625,6 +656,9 @@ impl<H: Hypervisor> Machine<H> {
         }
         if config.disks.len() > DISKS {
             return Err(Error::TooManyDisks(config.disks.len()));
+        }
+        if config.shares.len() > SHARES {
+            return Err(Error::TooManyShares(config.shares.len()));
         }
         let assembled = Instant::now();
         let since = |assembled: Instant| assembled.elapsed().as_secs_f64() * 1e3;
@@ -681,6 +715,14 @@ impl<H: Hypervisor> Machine<H> {
                 .open(path)
                 .map_err(Error::Disk)?;
             devices.push(Box::new(Block::new(file).map_err(Error::Disk)?));
+        }
+        for share in &config.shares {
+            #[cfg(target_os = "linux")]
+            devices.push(Box::new(
+                Fs::new(&share.tag, share.at.clone(), share.writable).map_err(Error::Share)?,
+            ));
+            #[cfg(not(target_os = "linux"))]
+            let _ = share;
         }
         if let Some(channel) = &config.channel {
             let sockets = Sockets::listening(&channel.at).map_err(Error::Channel)?;
@@ -747,6 +789,7 @@ impl<H: Hypervisor> Machine<H> {
             orders: Arc::new(Orders::default()),
             genid,
             confine: config.confine,
+            sharing: !config.shares.is_empty(),
             host_stack: matches!(
                 config.network,
                 Some(Network {
@@ -929,9 +972,12 @@ impl<H: Hypervisor> Machine<H> {
         self.state.valid_transition(State::Running)?;
         let confine = |thread| self.confine.map(|how| Filter::new(thread, how)).transpose();
         let driving = confine(Thread::Vcpu)?;
-        // Device thread with the stack opens host sockets, its list is wider.
+        // Device thread with the stack opens host sockets and one with a
+        // shared directory reaches the filesystem, each list is wider.
         let working = confine(if self.host_stack {
             Thread::Stack
+        } else if self.sharing {
+            Thread::Sharing
         } else {
             Thread::Device
         })?;

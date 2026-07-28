@@ -60,6 +60,9 @@ pub enum Thread {
     /// running in this process.
     #[cfg(feature = "netstack")]
     Stack,
+    /// Same as `Device`, plus calls a shared directory is served with. A
+    /// guest without one keeps the narrower list.
+    Sharing,
 }
 
 /// Action on a syscall outside of the allowlist.
@@ -138,6 +141,7 @@ impl Thread {
             Thread::Device => "device",
             #[cfg(feature = "netstack")]
             Thread::Stack => "stack",
+            Thread::Sharing => "sharing",
         }
     }
 
@@ -210,6 +214,52 @@ impl Thread {
                 ),
                 (libc::SYS_socket, vec![family(libc::AF_UNIX)?]),
             ])),
+            // A shared directory is walked, opened, read and written, and
+            // a guest asking for room reaches `statfs`. Paths served are
+            // held inside the directory the device was given.
+            Thread::Sharing => {
+                let mut list = Thread::Device.extras()?;
+                for call in [
+                    libc::SYS_openat,
+                    libc::SYS_statx,
+                    libc::SYS_newfstatat,
+                    libc::SYS_getdents64,
+                    libc::SYS_write,
+                    libc::SYS_fsync,
+                    libc::SYS_ftruncate,
+                    libc::SYS_statfs,
+                    libc::SYS_fstatfs,
+                    libc::SYS_mkdirat,
+                    libc::SYS_unlinkat,
+                    libc::SYS_renameat2,
+                    libc::SYS_symlinkat,
+                    libc::SYS_readlinkat,
+                    libc::SYS_fchmodat,
+                    libc::SYS_utimensat,
+                    // glibc of x86_64 still reaches the calls which name a
+                    // path of their own, the other architectures have only
+                    // the `*at` forms above.
+                    #[cfg(target_arch = "x86_64")]
+                    libc::SYS_fstat,
+                    #[cfg(target_arch = "x86_64")]
+                    libc::SYS_mkdir,
+                    #[cfg(target_arch = "x86_64")]
+                    libc::SYS_rmdir,
+                    #[cfg(target_arch = "x86_64")]
+                    libc::SYS_unlink,
+                    #[cfg(target_arch = "x86_64")]
+                    libc::SYS_rename,
+                    #[cfg(target_arch = "x86_64")]
+                    libc::SYS_renameat,
+                    #[cfg(target_arch = "x86_64")]
+                    libc::SYS_symlink,
+                    #[cfg(target_arch = "x86_64")]
+                    libc::SYS_readlink,
+                ] {
+                    list.insert(call, Vec::new());
+                }
+                Ok(list)
+            }
             // The stack opens `AF_INET` sockets as well, binds the UDP ones,
             // asks a connect how it went through `getpeername` and
             // `getsockopt`, and its hash maps draw their keys from
