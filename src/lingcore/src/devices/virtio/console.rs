@@ -12,6 +12,10 @@
 //! Queues come in pairs, a receive and a transmit per port, with the
 //! control pair between port zero and port one. Each port is carried to a
 //! stream socket of the host, and the far side of it reaches the guest.
+//!
+//! A port either waits on the socket for the host end, or dials one
+//! already waiting. A sandbox layer above which listens itself takes the
+//! second.
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -86,10 +90,23 @@ const CHUNK: usize = 4096;
 /// the oldest bytes go.
 const HELD: usize = 64 * 1024;
 
+/// Way the host end of a port is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Wait on the socket for the host end to arrive.
+    Listen,
+    /// Dial a socket someone is already waiting on.
+    Dial,
+}
+
 /// One named port and the host end behind it.
 struct Port {
     name: String,
-    /// Socket the host end is accepted on, `None` once accepted.
+    /// Socket of the host end, and the way it is reached.
+    at: PathBuf,
+    reach: Reach,
+    /// Socket the host end is accepted on, `None` once accepted or when
+    /// the port dials instead.
     listening: Option<UnixListener>,
     /// Host end, once it has been connected to.
     host: Option<UnixStream>,
@@ -114,20 +131,28 @@ pub struct Console {
 }
 
 impl Console {
-    /// Create a console whose ports are `named`, each with the path its
-    /// host end is accepted on.
-    pub fn new(named: &[(String, PathBuf)]) -> io::Result<Self> {
+    /// Create a console whose ports are `named`, each with the path of its
+    /// host end and how that end is reached.
+    pub fn new(named: &[(String, PathBuf, Reach)]) -> io::Result<Self> {
         if named.is_empty() {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let mut ports = Vec::with_capacity(named.len());
-        for (name, at) in named {
-            let _ = std::fs::remove_file(at);
-            let listening = UnixListener::bind(at)?;
-            listening.set_nonblocking(true)?;
+        for (name, at, reach) in named {
+            let listening = match reach {
+                Reach::Listen => {
+                    let _ = std::fs::remove_file(at);
+                    let listening = UnixListener::bind(at)?;
+                    listening.set_nonblocking(true)?;
+                    Some(listening)
+                }
+                Reach::Dial => None,
+            };
             ports.push(Port {
                 name: name.clone(),
-                listening: Some(listening),
+                at: at.clone(),
+                reach: *reach,
+                listening,
                 host: None,
                 to_guest: Vec::new(),
                 to_host: Vec::new(),
@@ -155,8 +180,14 @@ impl Console {
         out
     }
 
-    /// Queue the messages which tell the guest about every port.
+    /// Queue the messages which tell the guest about the ports. None is
+    /// sent before the guest reports itself ready, since a port added
+    /// while it is still probing arrives in the middle of its own queue
+    /// set-up.
     fn announce(&mut self) {
+        if !self.ready {
+            return;
+        }
         for index in 0..self.ports.len() {
             if self.ports[index].announced {
                 continue;
@@ -178,19 +209,25 @@ impl Console {
             if port.host.is_some() {
                 continue;
             }
-            let Some(listening) = &port.listening else {
-                continue;
+            let arrived = match (&port.listening, port.reach) {
+                (Some(listening), _) => listening.accept().map(|(stream, _)| stream),
+                (None, Reach::Dial) => UnixStream::connect(&port.at),
+                (None, Reach::Listen) => continue,
             };
-            match listening.accept() {
-                Ok((stream, _)) => {
+            match arrived {
+                Ok(stream) => {
                     if stream.set_nonblocking(true).is_err() {
                         continue;
                     }
-                    debug!("console port {} was connected to", port.name);
+                    debug!("console port {} reached its host end", port.name);
                     port.host = Some(stream);
                     joined.push(index);
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) if port.reach == Reach::Dial => {
+                    // Nobody is waiting yet, the next round tries again.
+                    debug!("console port {} could not dial: {err}", port.name);
+                }
                 Err(err) => warn!("console port {} refused a dial: {err}", port.name),
             }
         }
@@ -383,10 +420,24 @@ impl Device for Console {
             match (&port.host, &port.listening) {
                 (Some(host), _) => watched.push((host.as_raw_fd(), Interest::Read)),
                 (None, Some(listening)) => watched.push((listening.as_raw_fd(), Interest::Read)),
+                // A port which dials has nothing to wait on until it is
+                // through, `wake_after` brings it back instead.
                 (None, None) => {}
             }
         }
         watched
+    }
+
+    fn wake_after(&self) -> Option<std::time::Duration> {
+        // A control message waits for the receive queue of the control
+        // pair, which the guest fills once and does not notify again, so
+        // the device is brought back for it. A port still dialling is
+        // brought back the same way.
+        let dialling = self
+            .ports
+            .iter()
+            .any(|port| port.host.is_none() && port.reach == Reach::Dial);
+        (!self.pending.is_empty() || dialling).then(|| std::time::Duration::from_millis(10))
     }
 
     fn counts(&self) -> Vec<(&'static str, u64)> {
@@ -437,8 +488,8 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let console =
-            Console::new(&[("agent".to_string(), at.clone())]).expect("a console with one port");
+        let console = Console::new(&[("agent".to_string(), at.clone(), Reach::Listen)])
+            .expect("a console with one port");
         (console, at)
     }
 

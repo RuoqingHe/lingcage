@@ -23,6 +23,7 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use lingcore::devices::Receive;
+    use lingcore::devices::virtio::console::Reach;
     use lingcore::devices::virtio::net::stack::StackConfig;
     use lingcore::hv::backend::kvm::hypervisor::KvmHv;
     use lingcore::hv::vcpu::VmExit;
@@ -167,8 +168,8 @@ mod imp {
             name: "port",
             value: "NAME=PATH",
             required: false,
-            help: "named port of a virtio console, its host end accepted on the socket at PATH, \
-                   given once per port",
+            help: "named port of a virtio console, its host end accepted on the socket at PATH or \
+                   dialled with dial:PATH, given once per port",
         },
         Flag {
             name: "control",
@@ -476,10 +477,16 @@ mod imp {
             let Some((name, at)) = text.split_once('=') else {
                 return Err(usage_err(format!("invalid port {text}, use NAME=PATH")));
             };
+            // `dial:` names a socket already waited on, the bare form
+            // waits for the host end instead.
+            let (at, reach) = match at.strip_prefix("dial:") {
+                Some(at) => (at, Reach::Dial),
+                None => (at, Reach::Listen),
+            };
             if name.is_empty() || at.is_empty() {
                 return Err(usage_err(format!("invalid port {text}, use NAME=PATH")));
             }
-            ports.push((name.to_string(), PathBuf::from(at)));
+            ports.push((name.to_string(), PathBuf::from(at), reach));
         }
         let mut config = Config {
             kernel: PathBuf::from(parsed.value("kernel").expect("required flag")),

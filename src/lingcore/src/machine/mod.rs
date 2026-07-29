@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::devices::bus::Bus;
 use crate::devices::serial::Serial;
 use crate::devices::virtio::block::Block;
-use crate::devices::virtio::console::Console;
+use crate::devices::virtio::console::{Console, Reach};
 use crate::devices::virtio::entropy::Entropy;
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::fs::Fs;
@@ -295,9 +295,9 @@ pub struct Config {
     /// Directories of the host shared with the guest, each under a tag
     /// the guest mounts by. At most `SHARES` of them.
     pub shares: Vec<Share>,
-    /// Named ports of a virtio console, each with the socket its host end
-    /// is accepted on. Empty places no console device.
-    pub ports: Vec<(String, PathBuf)>,
+    /// Named ports of a virtio console, each with the socket of its host
+    /// end and how that end is reached. Empty places no console device.
+    pub ports: Vec<(String, PathBuf, Reach)>,
     /// Vsock channel to the guest, if any.
     pub channel: Option<Channel>,
     /// Network link of the guest, if any.
