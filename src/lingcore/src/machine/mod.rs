@@ -32,7 +32,7 @@ use crate::devices::virtio::net::device::Net;
 use crate::devices::virtio::net::pcap::Captured;
 use crate::devices::virtio::net::stack::{Stack, StackConfig};
 use crate::devices::virtio::vsock::device::Vsock;
-use crate::devices::virtio::vsock::host::Sockets;
+use crate::devices::virtio::vsock::host::{Endpoint, Named, Sockets};
 use crate::devices::{Blob, Receive, Shared};
 use crate::hv::Interest;
 use crate::hv::hypervisor::Hypervisor;
@@ -217,12 +217,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Vsock channel through which a guest is reached. Context id comes
 /// from the caller, one per guest it runs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Channel {
     /// Context id of the guest.
     pub cid: u64,
     /// Prefix of host socket paths. A port connects to `<prefix>_<port>`.
     pub at: PathBuf,
+    /// Ports served on a socket the caller named, in place of one built
+    /// from the prefix. `Reach::Dial` opens that socket once the guest
+    /// reaches out, `Reach::Listen` binds it for connections reaching
+    /// in. An empty list leaves the prefix to serve them.
+    pub named: Vec<(u32, PathBuf, Reach)>,
 }
 
 /// Host end of the network link of a guest.
@@ -745,8 +750,19 @@ impl<H: Hypervisor> Machine<H> {
             let _ = share;
         }
         if let Some(channel) = &config.channel {
-            let sockets = Sockets::listening(&channel.at).map_err(Error::Channel)?;
-            devices.push(Box::new(Vsock::new(channel.cid, Box::new(sockets))));
+            let endpoint: Box<dyn Endpoint> = if channel.named.is_empty() {
+                Box::new(Sockets::listening(&channel.at).map_err(Error::Channel)?)
+            } else {
+                let mut named = Named::new();
+                for (port, at, reach) in &channel.named {
+                    match reach {
+                        Reach::Dial => named.dial(*port, at),
+                        Reach::Listen => named.listen(*port, at).map_err(Error::Channel)?,
+                    }
+                }
+                Box::new(named)
+            };
+            devices.push(Box::new(Vsock::new(channel.cid, endpoint)));
         }
         if let Some(network) = &config.network {
             let carrier: Box<dyn Carrier> = match &network.link {

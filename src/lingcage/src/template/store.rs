@@ -241,7 +241,11 @@ impl TemplateStore {
             disks: Vec::new(),
             shares: Vec::new(),
             ports: Vec::new(),
-            channel: Some(Channel { cid, at: prefix }),
+            channel: Some(Channel {
+                cid,
+                at: prefix,
+                ..Default::default()
+            }),
             network: None,
             confine: Some(Refusal::Trap),
         };

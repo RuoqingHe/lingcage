@@ -14,7 +14,7 @@ use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-use log::warn;
+use log::{debug, warn};
 
 use crate::devices::virtio::queue::{Chain, Queue};
 use crate::devices::virtio::vsock::connection::{Answer, Connection};
@@ -136,6 +136,7 @@ impl Vsock {
                 return;
             };
             let host_port = self.free_port(guest_port);
+            debug!("incoming connection asks guest port {guest_port} from host port {host_port}");
             let connection = Connection::asking(self.guest_cid, guest_port, host_port);
             let asks = connection.asks();
             self.open.insert(
@@ -259,14 +260,17 @@ impl Vsock {
                 // `OK <port>` is written before bytes of the guest are carried,
                 // host end refusing it is closed.
                 Answer::Opened => {
-                    let host_port = connection.ports().1;
-                    if let Err(refused) = host::acknowledge(stream.as_mut(), host_port) {
-                        warn!(
-                            "acknowledging an incoming connection failed, connection closed: \
-                             {refused}"
-                        );
-                        reply = Some(connection.host_done());
-                        done = true;
+                    debug!("guest took the connection on its port {}", ports.0);
+                    if self.endpoint.acknowledges() {
+                        let host_port = connection.ports().1;
+                        if let Err(refused) = host::acknowledge(stream.as_mut(), host_port) {
+                            warn!(
+                                "acknowledging an incoming connection failed, connection closed: \
+                                 {refused}"
+                            );
+                            reply = Some(connection.host_done());
+                            done = true;
+                        }
                     }
                 }
                 // Bytes stay in the connection until `carry` writes them.

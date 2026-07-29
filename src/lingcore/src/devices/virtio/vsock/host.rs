@@ -8,11 +8,12 @@
 //! Host process connects with the line `CONNECT <port>`, [`acknowledge`]
 //! replies `OK <port>` once the connection is open.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use log::warn;
 
@@ -68,6 +69,13 @@ pub trait Endpoint: Send {
     /// Returns descriptors which incoming connections arrive on, each with
     /// the interest to wait on it for.
     fn outside(&self) -> Vec<(RawFd, Interest)>;
+
+    /// Returns `true` for an endpoint which answers an incoming
+    /// connection with `OK <port>`. An endpoint naming a socket per port
+    /// leaves that line out, and the host process reads bytes alone.
+    fn acknowledges(&self) -> bool {
+        true
+    }
 }
 
 /// Endpoint which connects each port to Unix socket `<prefix>_<port>`.
@@ -196,6 +204,77 @@ impl Endpoint for Sockets {
                 .map(|(stream, _)| (stream.as_raw_fd(), Interest::Read)),
         );
         waited
+    }
+}
+
+/// Endpoint which serves each port on a socket the caller named, in
+/// place of a name built from a prefix. A dialled port is opened once
+/// the guest reaches out on it. A bound port takes incoming
+/// connections, and the socket one arrives on names its port.
+#[derive(Default)]
+pub struct Named {
+    /// Socket opened for each port the guest reaches out on.
+    dialled: BTreeMap<u32, PathBuf>,
+    /// Listener bound for each port the host process reaches in on.
+    bound: Vec<(u32, UnixListener)>,
+}
+
+impl Named {
+    /// Create an endpoint which serves no port yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Serve `port` by opening `at` once the guest reaches out on it.
+    pub fn dial(&mut self, port: u32, at: impl Into<PathBuf>) {
+        self.dialled.insert(port, at.into());
+    }
+
+    /// Serve `port` by binding `at` and handing the guest each connection
+    /// taken there. A name already bound is refused, not unlinked.
+    pub fn listen(&mut self, port: u32, at: impl AsRef<Path>) -> io::Result<()> {
+        let listener = UnixListener::bind(at)?;
+        // Blocking accept would stall the thread which serves connections.
+        listener.set_nonblocking(true)?;
+        self.bound.push((port, listener));
+        Ok(())
+    }
+}
+
+impl Endpoint for Named {
+    fn connect(&self, port: u32) -> Option<Box<dyn Stream>> {
+        let stream = UnixStream::connect(self.dialled.get(&port)?).ok()?;
+        // Blocking read would stall the thread which serves other connections.
+        stream.set_nonblocking(true).ok()?;
+        Some(Box::new(stream))
+    }
+
+    fn incoming(&mut self) -> Option<(u32, Box<dyn Stream>)> {
+        for (port, listener) in &self.bound {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if stream.set_nonblocking(true).is_err() {
+                        warn!("incoming connection on port {port} could not be set aside");
+                        continue;
+                    }
+                    return Some((*port, Box::new(stream)));
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) => warn!("port {port} took no incoming connection: {err}"),
+            }
+        }
+        None
+    }
+
+    fn outside(&self) -> Vec<(RawFd, Interest)> {
+        self.bound
+            .iter()
+            .map(|(_, listener)| (listener.as_raw_fd(), Interest::Read))
+            .collect()
+    }
+
+    fn acknowledges(&self) -> bool {
+        false
     }
 }
 
@@ -398,5 +477,72 @@ mod tests {
         let mut said = [0u8; 8];
         theirs.read_exact(&mut said).expect("read the answer");
         assert_eq!(&said, b"OK 4321\n");
+    }
+}
+
+#[cfg(test)]
+mod named_tests {
+    use std::io::{Read as _, Write as _};
+    use std::time::Duration;
+
+    use crate::devices::virtio::vsock::host::*;
+
+    /// Directory holding the sockets of one test.
+    fn dir(name: &str) -> PathBuf {
+        let at = std::env::temp_dir().join(format!("lingcore-named-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::create_dir_all(&at).expect("make the directory");
+        at
+    }
+
+    #[test]
+    fn test_dial_port_on_its_own_socket() {
+        let at = dir("dial");
+        let socket = at.join("out");
+        let listening = UnixListener::bind(&socket).expect("bind the host end");
+        let mut named = Named::new();
+        named.dial(6000, &socket);
+
+        let mut opened = named.connect(6000).expect("the port was not opened");
+        let (mut host, _) = listening.accept().expect("the socket took no dial");
+        host.write_all(b"ping").expect("write to the port");
+        let mut read = [0u8; 4];
+        while opened.read(&mut read).is_err() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(&read, b"ping", "the port carried something else");
+        assert!(named.connect(6001).is_none(), "a port not served opened");
+        let _ = std::fs::remove_dir_all(&at);
+    }
+
+    #[test]
+    fn test_take_incoming_on_socket_of_its_port() {
+        let at = dir("listen");
+        let socket = at.join("in");
+        let mut named = Named::new();
+        named.listen(6000, &socket).expect("bind the port");
+        assert_eq!(named.outside().len(), 1, "the listener is not waited on");
+        assert!(
+            named.incoming().is_none(),
+            "an incoming connection appeared"
+        );
+
+        let mut dialled = UnixStream::connect(&socket).expect("reach the port");
+        dialled.write_all(b"hello").expect("write to the port");
+        let (port, _stream) = named.incoming().expect("the connection was not taken");
+        assert_eq!(port, 6000, "the connection landed on another port");
+        assert!(!named.acknowledges(), "a named port answers a line");
+        let _ = std::fs::remove_dir_all(&at);
+    }
+
+    #[test]
+    fn test_refuse_name_already_bound() {
+        let at = dir("bound");
+        let socket = at.join("twice");
+        let mut named = Named::new();
+        named.listen(6000, &socket).expect("bind the port");
+        let mut other = Named::new();
+        assert!(other.listen(6000, &socket).is_err(), "the name was taken");
+        let _ = std::fs::remove_dir_all(&at);
     }
 }

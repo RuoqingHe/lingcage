@@ -548,6 +548,7 @@ fn assemble(
         channel: Some(Channel {
             cid,
             at: vsock_prefix.clone(),
+            ..Default::default()
         }),
         network: None,
         confine: Some(Refusal::Trap),
