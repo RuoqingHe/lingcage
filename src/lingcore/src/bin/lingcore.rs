@@ -164,6 +164,13 @@ mod imp {
                    once per share, `:ro` refuses changes",
         },
         Flag {
+            name: "port",
+            value: "NAME=PATH",
+            required: false,
+            help: "named port of a virtio console, its host end accepted on the socket at PATH, \
+                   given once per port",
+        },
+        Flag {
             name: "control",
             value: "PATH",
             required: false,
@@ -464,6 +471,16 @@ mod imp {
         for text in parsed.each("share") {
             shares.push(parse_share(text).map_err(usage_err)?);
         }
+        let mut ports = Vec::new();
+        for text in parsed.each("port") {
+            let Some((name, at)) = text.split_once('=') else {
+                return Err(usage_err(format!("invalid port {text}, use NAME=PATH")));
+            };
+            if name.is_empty() || at.is_empty() {
+                return Err(usage_err(format!("invalid port {text}, use NAME=PATH")));
+            }
+            ports.push((name.to_string(), PathBuf::from(at)));
+        }
         let mut config = Config {
             kernel: PathBuf::from(parsed.value("kernel").expect("required flag")),
             initrd: parsed.value("initrd").map(PathBuf::from),
@@ -474,6 +491,7 @@ mod imp {
             memory: 512 << 20,
             disks: parsed.each("disk").into_iter().map(PathBuf::from).collect(),
             shares,
+            ports,
             confine: Some(Refusal::Trap),
             ..Default::default()
         };

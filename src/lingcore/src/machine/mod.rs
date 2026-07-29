@@ -20,6 +20,7 @@ use thiserror::Error;
 use crate::devices::bus::Bus;
 use crate::devices::serial::Serial;
 use crate::devices::virtio::block::Block;
+use crate::devices::virtio::console::Console;
 use crate::devices::virtio::entropy::Entropy;
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::fs::Fs;
@@ -146,6 +147,9 @@ pub enum Error {
     /// A shared directory could not be opened.
     #[error("failed to share a directory")]
     Share(#[source] std::io::Error),
+    /// A console port could not be listened on.
+    #[error("failed to open a console port")]
+    Port(#[source] std::io::Error),
     /// MP table for the vCPU count overflows the kilobyte scanned by kernel.
     #[cfg(target_arch = "x86_64")]
     #[error("MP table does not fit in its kilobyte")]
@@ -291,6 +295,9 @@ pub struct Config {
     /// Directories of the host shared with the guest, each under a tag
     /// the guest mounts by. At most `SHARES` of them.
     pub shares: Vec<Share>,
+    /// Named ports of a virtio console, each with the socket its host end
+    /// is accepted on. Empty places no console device.
+    pub ports: Vec<(String, PathBuf)>,
     /// Vsock channel to the guest, if any.
     pub channel: Option<Channel>,
     /// Network link of the guest, if any.
@@ -310,6 +317,7 @@ impl Default for Config {
             cmdline: String::new(),
             disks: Vec::new(),
             shares: Vec::new(),
+            ports: Vec::new(),
             channel: None,
             network: None,
             confine: None,
@@ -323,6 +331,7 @@ impl Default for Config {
 fn virtio_count(config: &Config) -> u8 {
     1 + config.disks.len() as u8
         + config.shares.len() as u8
+        + u8::from(!config.ports.is_empty())
         + u8::from(config.channel.is_some())
         + u8::from(config.network.is_some())
 }
@@ -715,6 +724,9 @@ impl<H: Hypervisor> Machine<H> {
                 .open(path)
                 .map_err(Error::Disk)?;
             devices.push(Box::new(Block::new(file).map_err(Error::Disk)?));
+        }
+        if !config.ports.is_empty() {
+            devices.push(Box::new(Console::new(&config.ports).map_err(Error::Port)?));
         }
         for share in &config.shares {
             #[cfg(target_os = "linux")]
