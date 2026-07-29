@@ -10,6 +10,7 @@
 use thiserror::Error;
 
 pub mod block;
+pub mod console;
 pub mod entropy;
 // FUSE and the calls a directory is served with are Linux, so the
 // device is built there only.
