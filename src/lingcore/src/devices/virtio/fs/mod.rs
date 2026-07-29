@@ -38,6 +38,10 @@ const QUEUES: u16 = 2;
 /// requests, sent to cancel one already on its way.
 const REQUEST_QUEUE: u16 = 1;
 
+/// `FATTR_SIZE` of `fuse_setattr_in.valid`, the length of the file is
+/// being set.
+const FATTR_SIZE: u32 = 1 << 3;
+
 /// Largest answer built for one request. A guest asking for more than
 /// this is answered short, so no file is read into memory unbounded.
 const MAX_ANSWER: usize = 1 << 20;
@@ -383,15 +387,18 @@ impl Fs {
             return Answer::error(libc::ENOENT);
         };
         // `FATTR_SIZE` is the one change which has to reach the file, not
-        // its metadata alone.
-        if fuse::u32(body, 0) & (1 << 3) != 0 {
-            let size = fuse::u64(body, 24);
-            if let Err(err) = std::fs::OpenOptions::new().write(true).open(&at) {
-                return Answer::error(errno(&err));
-            } else if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&at)
-                && let Err(err) = file.set_len(size)
-            {
-                return Answer::error(errno(&err));
+        // its metadata alone. `size` of `fuse_setattr_in` sits behind
+        // `valid`, its padding and the handle.
+        if fuse::u32(body, 0) & FATTR_SIZE != 0 {
+            let size = fuse::u64(body, 16);
+            let opened = std::fs::OpenOptions::new().write(true).open(&at);
+            match opened {
+                Ok(file) => {
+                    if let Err(err) = file.set_len(size) {
+                        return Answer::error(errno(&err));
+                    }
+                }
+                Err(err) => return Answer::error(errno(&err)),
             }
         }
         match self.shared.attr(&at) {
@@ -603,6 +610,10 @@ impl Device for Fs {
             let room = Fs::room(&chain);
             let answer = self.serve(&header, body, room);
             if answer.error != 0 {
+                debug!(
+                    "fs refused opcode {} on node {} with {}",
+                    header.opcode, header.nodeid, -answer.error
+                );
                 self.refused += 1;
             } else {
                 self.served += 1;

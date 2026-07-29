@@ -24,8 +24,9 @@ pub const OUT_HEADER: usize = 16;
 /// Bytes of `fuse_attr`.
 pub const ATTR: usize = 88;
 
-/// Bytes of `fuse_entry_out`, an `fuse_attr` behind six fields.
-pub const ENTRY_OUT: usize = 48 + ATTR;
+/// Bytes of `fuse_entry_out`, an `fuse_attr` behind six fields: the node
+/// and its generation, two lifetimes and the nanoseconds of each.
+pub const ENTRY_OUT: usize = 40 + ATTR;
 
 /// Bytes of `fuse_dirent` ahead of the name.
 pub const DIRENT: usize = 24;
