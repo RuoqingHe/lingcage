@@ -71,6 +71,17 @@ pub(in crate::machine) const EVENTS_IRQ: u8 = 1;
 /// source.
 pub(in crate::machine) const VIRTIO_IRQ: u8 = 2;
 
+/// Virtio devices the sources of this machine reach, the SPIs of the
+/// GIC behind the console and the identifier.
+pub(in crate::machine) const VIRTIO_DEVICES: usize = GIC.sources as usize - VIRTIO_IRQ as usize;
+
+/// Returns the source of virtio register block `slot`, or `None` once
+/// the sources of the GIC are spent. Sources here run one after
+/// another, and this machine puts no other device on them.
+pub(in crate::machine) fn virtio_line(slot: u8) -> Option<u8> {
+    (usize::from(slot) < VIRTIO_DEVICES).then_some(VIRTIO_IRQ + slot)
+}
+
 /// The GIC, 32 SPIs, enough for the console, the identifier and virtio
 /// devices, and the fewest interrupt ids KVM allows.
 const GIC: Gic = Gic {
@@ -177,7 +188,7 @@ pub(in crate::machine) fn enter<V: Vcpu>(
                 .map(|slot| fdt::Named {
                     at: virtio_at(slot),
                     room: mmio::SIZE,
-                    line: VIRTIO_IRQ + slot,
+                    line: virtio_line(slot).unwrap_or(VIRTIO_IRQ),
                 })
                 .collect(),
         },

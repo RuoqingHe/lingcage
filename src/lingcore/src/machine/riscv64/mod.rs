@@ -66,6 +66,17 @@ pub(in crate::machine) const EVENTS_IRQ: u8 = 2;
 /// source.
 pub(in crate::machine) const VIRTIO_IRQ: u8 = 3;
 
+/// Virtio devices the sources of this machine reach. Sources run from
+/// one, so the last is `AIA.sources` itself.
+pub(in crate::machine) const VIRTIO_DEVICES: usize = AIA.sources as usize + 1 - VIRTIO_IRQ as usize;
+
+/// Returns the source of virtio register block `slot`, or `None` once
+/// the sources of the AIA are spent. Sources here run one after
+/// another, and this machine puts no other device on them.
+pub(in crate::machine) fn virtio_line(slot: u8) -> Option<u8> {
+    (usize::from(slot) < VIRTIO_DEVICES).then_some(VIRTIO_IRQ + slot)
+}
+
 /// The AIA, 31 wired sources, enough for the console, the identifier
 /// and virtio devices, and the fewest identities an IMSIC file holds.
 const AIA: Aia = Aia {
@@ -175,7 +186,7 @@ pub(in crate::machine) fn enter<V: Vcpu>(
                 .map(|slot| fdt::Named {
                     at: virtio_at(slot),
                     room: mmio::SIZE,
-                    line: VIRTIO_IRQ + slot,
+                    line: virtio_line(slot).unwrap_or(VIRTIO_IRQ),
                 })
                 .collect(),
         },

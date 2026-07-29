@@ -144,6 +144,9 @@ pub enum Error {
     /// `Config::shares` holds more than `SHARES` of them.
     #[error("guest takes at most {SHARES} shared directories, {0} were named")]
     TooManyShares(usize),
+    /// `Config` asks for more virtio devices than the machine has lines.
+    #[error("guest takes at most {VIRTIO_DEVICES} virtio devices, {0} were named")]
+    TooManyDevices(usize),
     /// A shared directory could not be opened.
     #[error("failed to share a directory")]
     Share(#[source] std::io::Error),
@@ -351,9 +354,9 @@ struct Wired {
     ioeventfds: Vec<Arc<dyn IoeventFd>>,
 }
 
-/// Place `device` on `bus` in virtio register block `slot`, on line
-/// `VIRTIO_IRQ + slot`, with one ioeventfd per queue bound on its
-/// `QUEUE_NOTIFY`.
+/// Place `device` on `bus` in virtio register block `slot`, on the line
+/// the machine gives that slot, with one ioeventfd per queue bound on
+/// its `QUEUE_NOTIFY`.
 fn place_virtio<V: Vm>(
     bus: &mut Bus,
     vm: &V,
@@ -366,7 +369,8 @@ where
     V::IrqSender: 'static,
     <V::IoeventFdRegistry as IoeventFdRegistry>::IoeventFd: 'static,
 {
-    let line = vm.create_irq_sender(VIRTIO_IRQ + slot)?;
+    let line = virtio_line(slot).ok_or(Error::TooManyDevices(usize::from(slot) + 1))?;
+    let line = vm.create_irq_sender(line)?;
     let queues = device.queue_count();
     let transport = Shared::new(Transport::new(device, ram.clone(), Box::new(line)));
     bus.place_mmio(virtio_at(slot), mmio::SIZE, Box::new(transport.clone()))?;
@@ -668,6 +672,10 @@ impl<H: Hypervisor> Machine<H> {
         }
         if config.shares.len() > SHARES {
             return Err(Error::TooManyShares(config.shares.len()));
+        }
+        let devices = usize::from(virtio_count(config));
+        if devices > VIRTIO_DEVICES {
+            return Err(Error::TooManyDevices(devices));
         }
         let assembled = Instant::now();
         let since = |assembled: Instant| assembled.elapsed().as_secs_f64() * 1e3;
@@ -1418,6 +1426,46 @@ mod tests {
             "stop told was missed"
         );
         assert!(orders.wait_for_a_stop_within(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_reject_more_devices_than_lines() {
+        // Disks and shared directories fill the lines between them, so
+        // a console port behind those outruns the machine while each
+        // kind stays inside its own limit.
+        #[cfg(all(feature = "kvm", target_os = "linux"))]
+        {
+            use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+            let hv = KvmHv::new().expect("open /dev/kvm");
+            let config = Config {
+                vcpus: 1,
+                cmdline: String::new(),
+                confine: None,
+                kernel: PathBuf::from("/nonexistent/kernel"),
+                memory: 16 << 20,
+                disks: (0..DISKS).map(|_| PathBuf::from("/dev/null")).collect(),
+                shares: (0..SHARES)
+                    .map(|at| Share {
+                        tag: format!("tag{at}"),
+                        at: PathBuf::from("/tmp"),
+                        writable: false,
+                    })
+                    .collect(),
+                ports: vec![(
+                    "port".to_string(),
+                    PathBuf::from("/tmp/port.sock"),
+                    Reach::Listen,
+                )],
+                ..Default::default()
+            };
+            let named = usize::from(virtio_count(&config));
+            assert!(named > VIRTIO_DEVICES, "{named} devices fit the lines");
+            assert!(matches!(
+                Machine::new(&hv, &config, Vec::new()),
+                Err(Error::TooManyDevices(count)) if count == named
+            ));
+        }
     }
 
     #[test]

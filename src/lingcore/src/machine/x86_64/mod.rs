@@ -70,9 +70,28 @@ pub(in crate::machine) const EVENTS_IRQ: u8 = 9;
 /// line and the kernel takes it, so no other device is put on this one.
 const SCI_IRQ: u8 = 10;
 
-/// IRQ of the first virtio device, an ISA line free on PC. Each device
-/// takes the next line.
+/// IRQ of the first virtio device, an ISA line free on PC.
 pub(in crate::machine) const VIRTIO_IRQ: u8 = 5;
+
+/// Lines a virtio device is put on, in the order they are taken. The
+/// GED and the SCI are left out, since the kernel holds both from the
+/// tables and refuses a device which asks for either with `EBUSY`.
+///
+/// Lines up to fifteen come first. The 8259 pair carries those and the
+/// I/O APIC alone carries the rest, so a guest booted with `noapic`
+/// keeps the devices of any configuration which fits in the first nine.
+const VIRTIO_LINES: [u8; 17] = [
+    VIRTIO_IRQ, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+];
+
+/// Virtio devices the lines of this machine reach.
+pub(in crate::machine) const VIRTIO_DEVICES: usize = VIRTIO_LINES.len();
+
+/// Returns the line of virtio register block `slot`, or `None` once the
+/// lines of the bus are spent.
+pub(in crate::machine) fn virtio_line(slot: u8) -> Option<u8> {
+    VIRTIO_LINES.get(usize::from(slot)).copied()
+}
 
 /// Guest address of the VM generation ID, below the RSDP.
 pub(in crate::machine) const GENID_AT: u64 = acpi::GENID_AT;
@@ -168,7 +187,7 @@ pub(in crate::machine) fn enter<V: Vcpu>(
                 .map(|slot| acpi::Named {
                     at: virtio_at(slot),
                     room: mmio::SIZE,
-                    line: Some(VIRTIO_IRQ + slot),
+                    line: virtio_line(slot),
                 })
                 .collect(),
         },
@@ -179,6 +198,51 @@ pub(in crate::machine) fn enter<V: Vcpu>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn test_virtio_lines_carried_by_8259_come_first() {
+        /// Last line the 8259 pair carries. A guest booted with the
+        /// APIC off reaches no device behind it.
+        const LAST_PIC_LINE: u8 = 15;
+
+        let taken: Vec<u8> = (0..).map_while(virtio_line).collect();
+        let pic = taken
+            .iter()
+            .take_while(|line| **line <= LAST_PIC_LINE)
+            .count();
+        assert_eq!(pic, 9, "lines the 8259 pair carries: {taken:?}");
+        assert!(
+            taken[pic..].iter().all(|line| *line > LAST_PIC_LINE),
+            "a line the 8259 pair carries sits behind one it does not: {taken:?}"
+        );
+    }
+
+    #[test]
+    fn test_virtio_lines_leave_out_events_and_sci() {
+        let taken: Vec<u8> = (0..).map_while(virtio_line).collect();
+        assert!(
+            !taken.contains(&EVENTS_IRQ),
+            "a virtio device sits on the line of the GED: {taken:?}"
+        );
+        assert!(
+            !taken.contains(&SCI_IRQ),
+            "a virtio device sits on the line of the SCI: {taken:?}"
+        );
+        assert!(
+            !taken.contains(&COM1_IRQ),
+            "a virtio device sits on the line of the console: {taken:?}"
+        );
+        let mut sorted = taken.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), taken.len(), "two devices share a line");
+        assert_eq!(virtio_line(taken.len() as u8), None, "the lines run on");
+        assert_eq!(
+            taken.len(),
+            VIRTIO_DEVICES,
+            "the count and the table differ"
+        );
+    }
     use crate::machine::x86_64::*;
     #[cfg(all(feature = "kvm", target_os = "linux"))]
     use crate::machine::*;
