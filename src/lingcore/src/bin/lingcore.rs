@@ -29,7 +29,7 @@ mod imp {
     use lingcore::hv::vcpu::VmExit;
     use lingcore::logging::{Logger, level_of};
     use lingcore::machine::snapshot::Snapshot;
-    use lingcore::machine::{Config, Link, Machine, Network, Share, StopHandle, control};
+    use lingcore::machine::{Channel, Config, Link, Machine, Network, Share, StopHandle, control};
     use lingcore::seccomp::Refusal;
 
     /// Byte typed on the terminal to end the guest, `Ctrl-]`.
@@ -170,6 +170,20 @@ mod imp {
             required: false,
             help: "named port of a virtio console, its host end accepted on the socket at PATH or \
                    dialled with dial:PATH, given once per port",
+        },
+        Flag {
+            name: "channel",
+            value: "CID",
+            required: false,
+            help: "give the guest a vsock channel under context id CID, reached over the sockets \
+                   named by --vsock",
+        },
+        Flag {
+            name: "vsock",
+            value: "PORT=PATH",
+            required: false,
+            help: "port of the vsock channel, its host end accepted on the socket at PATH or \
+                   dialled with dial:PATH, given once per port, needs --channel",
         },
         Flag {
             name: "control",
@@ -488,8 +502,43 @@ mod imp {
             }
             ports.push((name.to_string(), PathBuf::from(at), reach));
         }
+        let mut vsock = Vec::new();
+        for text in parsed.each("vsock") {
+            let Some((port, at)) = text.split_once('=') else {
+                return Err(usage_err(format!(
+                    "invalid vsock port {text}, use PORT=PATH"
+                )));
+            };
+            // `dial:` names a socket already waited on, the bare form
+            // waits for the host end instead.
+            let (at, reach) = match at.strip_prefix("dial:") {
+                Some(at) => (at, Reach::Dial),
+                None => (at, Reach::Listen),
+            };
+            let port: u32 = port
+                .parse()
+                .map_err(|_| usage_err(format!("invalid vsock port {port}, use a number")))?;
+            if at.is_empty() {
+                return Err(usage_err(format!(
+                    "invalid vsock port {text}, use PORT=PATH"
+                )));
+            }
+            vsock.push((port, PathBuf::from(at), reach));
+        }
+        let channel = match parsed.value("channel") {
+            Some(cid) => Some(Channel {
+                cid: cid
+                    .parse()
+                    .map_err(|_| usage_err(format!("invalid context id {cid}, use a number")))?,
+                named: vsock,
+                ..Default::default()
+            }),
+            None if vsock.is_empty() => None,
+            None => return Err(usage_err("--vsock needs --channel".to_string())),
+        };
         let mut config = Config {
             kernel: PathBuf::from(parsed.value("kernel").expect("required flag")),
+            channel,
             initrd: parsed.value("initrd").map(PathBuf::from),
             cmdline: parsed
                 .value("cmdline")
