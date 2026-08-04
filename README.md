@@ -60,75 +60,15 @@ Library usage and the `lingcore` binary are described in
 
 ### Using lingcage
 
-`lingcage` runs a command in a guest cloned from a template, which is a captured boot of a kernel
-and a guest image carrying `lingcage-agent`. Build the image first, then build the front end:
-
-```console
-cargo build --release -p lingcage --features cli --bin lingcage
-```
-
-`lingcage check` lists host prerequisites, `template build` boots the guest once and registers the
-capture, and `run` clones it, runs the command and exits with status of the command:
-
-```console
-$ lingcage check --kernel bzImage
-$ lingcage template build --kernel bzImage --initrd initramfs.cpio.gz --memory 256M --vcpus 1 \
-      --name base
-$ lingcage run --template base -- sh -c 'echo hello from $(hostname)'
-```
-
-Store defaults to `/var/lib/lingcage`, use `--store DIR` or `LINGCAGE_STORE` for another one. `-v`,
-`--log-file FILE` and `--event-monitor SPEC` are flags of the program, given ahead of the verb or
-after it, up to `--`. Log lines are those of lingcore, and `-vv` adds diagnostics of the agent.
-`--event-monitor path=FILE` or `fd=N` writes one JSON line per event, for a program driving many
-sandboxes. Events are a template built, a sandbox starting, ready with timings of its agent, and
-stopped with what ended it, each with a timestamp.
-
-Exit codes follow convention of shell:
-
-- 126, command is not executable.
-- 127, command not found.
-- 137, command killed by timeout.
-- 1, usage error.
-- 2, operational failure.
-
-To do the same from a Rust program, enable the `sandbox` feature:
+Add `lingcage` to your host program with the `sandbox` feature enabled:
 
 ```toml
 [dependencies]
 lingcage = { version = "0.1", features = ["sandbox"] }
 ```
 
-```rust
-use std::io::Write as _;
-use std::time::Duration;
-
-use lingcage::hv::Hv;
-use lingcage::sandbox::Sandbox;
-use lingcage::sandbox::exec::Command;
-use lingcage::sandbox::spec::SandboxSpec;
-use lingcage::template::TemplateStore;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let hv = Hv::open()?;
-    let store = TemplateStore::open("/var/lib/lingcage")?;
-    let template = store.get(&"base".into())?;
-    let spec = SandboxSpec::for_template(&template);
-    // A started sandbox runs no command until its agent has connected.
-    let sandbox = Sandbox::start(&hv, &template, &spec)?.ready(Duration::from_secs(5))?;
-
-    let mut process = sandbox.exec(Command::new("sh").args(["-c", "read line; echo got $line"]))?;
-    // The stream closes with the handle, and the command reads EOF.
-    process.stdin.take().expect("a stdin stream").write_all(b"hello\n")?;
-    let output = process.wait_with_output()?;
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-
-    // The guest is asked to power off, and stopped after five seconds if it has not.
-    let exit = sandbox.shutdown(Duration::from_secs(5))?;
-    println!("{exit:?}");
-    Ok(())
-}
-```
+Library usage and the `lingcage` binary are described in
+[src/lingcage/README.md](src/lingcage/README.md).
 
 ## Objectives
 
