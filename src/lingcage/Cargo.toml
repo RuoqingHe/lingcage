@@ -8,6 +8,11 @@ name = "lingcage"
 repository.workspace = true
 version.workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["aarch64-unknown-linux-gnu", "riscv64gc-unknown-linux-gnu"]
+
 [[bin]]
 name = "lingcage"
 path = "src/bin/lingcage.rs"
