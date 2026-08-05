@@ -4,7 +4,8 @@
 
 //! Wire format of FUSE, the protocol a virtio-fs device carries.
 //!
-//! A request opens with [`InHeader`] and an answer with [`OutHeader`].
+//! A request opens with [`InHeader`]. Header of an answer is written
+//! byte by byte, [`OUT_HEADER`] bytes of it.
 //! Structures are laid out the way `include/uapi/linux/fuse.h` lays them
 //! out, so each one is read and written byte by byte, not cast.
 
@@ -18,7 +19,7 @@ pub const MINOR: u32 = 31;
 /// Bytes of [`InHeader`].
 pub const IN_HEADER: usize = 40;
 
-/// Bytes of [`OutHeader`].
+/// Bytes of the header ahead of an answer.
 pub const OUT_HEADER: usize = 16;
 
 /// Bytes of `fuse_attr`.
