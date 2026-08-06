@@ -6,6 +6,7 @@ homepage.workspace = true
 license.workspace = true
 name = "lingcore"
 repository.workspace = true
+rust-version.workspace = true
 version.workspace = true
 
 [package.metadata.docs.rs]

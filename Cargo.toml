@@ -11,6 +11,7 @@ edition = "2024"
 homepage = "https://lingcage.com"
 license = "Apache-2.0"
 repository = "https://github.com/RuoqingHe/lingcage"
+rust-version = "1.91"
 version = "0.1.0"
 
 [workspace.dependencies]
