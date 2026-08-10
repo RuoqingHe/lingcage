@@ -1,8 +1,10 @@
 [package]
 authors.workspace = true
+categories.workspace = true
 description = "Building blocks for agentic-workload VMMs."
 edition.workspace = true
 homepage.workspace = true
+keywords = ["hypervisor", "kvm", "microvm", "virtio", "vmm"]
 license.workspace = true
 name = "lingcore"
 repository.workspace = true

@@ -1,8 +1,10 @@
 [package]
 authors.workspace = true
+categories.workspace = true
 description = "Secure agent infrastructure that cages AI agents with minimum overhead."
 edition.workspace = true
 homepage.workspace = true
+keywords = ["agent", "isolation", "microvm", "sandbox", "vmm"]
 license.workspace = true
 name = "lingcage"
 repository.workspace = true
