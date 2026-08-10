@@ -9,7 +9,7 @@ license.workspace = true
 name = "lingcage"
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.1.0"
 
 [package.metadata.docs.rs]
 all-features = true
