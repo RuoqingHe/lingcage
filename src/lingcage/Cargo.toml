@@ -28,10 +28,7 @@ required-features = ["agent"]
 
 [dependencies]
 libc = { workspace = true, optional = true }
-lingcore = { path = "../lingcore", features = [
-  "kvm",
-  "machine",
-], optional = true }
+lingcore = { workspace = true, features = ["kvm", "machine"], optional = true }
 log = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
