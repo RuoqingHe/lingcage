@@ -64,7 +64,7 @@ Add `lingcage` to your host program with the `sandbox` feature enabled:
 
 ```toml
 [dependencies]
-lingcage = { version = "0.1", features = ["sandbox"] }
+lingcage = { version = "0.2", features = ["sandbox"] }
 ```
 
 Library usage and the `lingcage` binary are described in

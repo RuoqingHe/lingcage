@@ -40,7 +40,7 @@ Add `lingcage` to your host program with the `sandbox` feature enabled:
 
 ```toml
 [dependencies]
-lingcage = { version = "0.1", features = ["sandbox"] }
+lingcage = { version = "0.2", features = ["sandbox"] }
 ```
 
 Following program starts a sandbox from a registered template, runs a command in it and shuts the
