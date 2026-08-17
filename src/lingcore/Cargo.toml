@@ -9,7 +9,7 @@ license.workspace = true
 name = "lingcore"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.1.0"
+version = "0.2.0"
 
 [package.metadata.docs.rs]
 all-features = true

@@ -52,7 +52,7 @@ Add `lingcore` to your host program with `machine` and `kvm` features enabled:
 
 ```toml
 [dependencies]
-lingcore = { version = "0.1", features = ["machine", "kvm"] }
+lingcore = { version = "0.2", features = ["machine", "kvm"] }
 ```
 
 Library usage and the `lingcore` binary are described in
