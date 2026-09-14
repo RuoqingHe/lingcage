@@ -105,8 +105,9 @@ fn write_tables(ram: &GuestRam) -> Result<[SegRegVal; 3]> {
     let segs = [seg(1, CODE_ATTR), seg(2, DATA_ATTR), seg(3, TSS_ATTR)];
 
     let mut table = [0u8; (1 + 3) * size_of::<u64>()];
-    for (slot, seg) in table.chunks_exact_mut(size_of::<u64>()).skip(1).zip(&segs) {
-        slot.copy_from_slice(&descriptor(seg).to_le_bytes());
+    let (slots, _) = table.as_chunks_mut::<{ size_of::<u64>() }>();
+    for (slot, seg) in slots.iter_mut().skip(1).zip(&segs) {
+        *slot = descriptor(seg).to_le_bytes();
     }
     ram.write(GDT, &table).map_err(|_| Error::NoRoomForTables)?;
     ram.write(IDT, &0u64.to_le_bytes())
