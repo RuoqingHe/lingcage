@@ -197,7 +197,6 @@ pub(in crate::machine) fn enter<V: Vcpu>(
 
 #[cfg(test)]
 mod tests {
-    use crate::machine::aarch64::*;
     use crate::machine::*;
 
     /// Store `o` and `k` at the console data register, then ask PSCI for

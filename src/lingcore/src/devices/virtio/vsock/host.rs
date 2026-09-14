@@ -482,7 +482,6 @@ mod tests {
 
 #[cfg(test)]
 mod named_tests {
-    use std::io::{Read as _, Write as _};
     use std::time::Duration;
 
     use crate::devices::virtio::vsock::host::*;

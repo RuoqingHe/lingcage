@@ -195,7 +195,6 @@ pub(in crate::machine) fn enter<V: Vcpu>(
 
 #[cfg(test)]
 mod tests {
-    use crate::machine::riscv64::*;
     use crate::machine::*;
 
     /// li t0, COM1_AT / two bytes stored at `DATA` / ecall for
