@@ -20,4 +20,6 @@ jobs:
         run: pipx install dco-check
 
       - name: Verify Sign-off On Each Commit
-        run: dco-check --verbose
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: dco-check --verbose --default-branch main
