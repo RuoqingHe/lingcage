@@ -10,6 +10,8 @@
 //! not RAM, and an access into it is refused.
 
 use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -125,7 +127,7 @@ impl GuestRam {
             .iter()
             .try_fold(0u64, |total, &(_, size)| total.checked_add(size))
             .ok_or(Error::Take)?;
-        if template.metadata().map_err(|_| Error::Take)?.len() < size {
+        if extent(template)? < size {
             return Err(Error::ShortTemplate { size });
         }
 
@@ -247,6 +249,17 @@ impl GuestRam {
                 gpa,
                 count: bytes.len(),
             })
+    }
+}
+
+/// Returns how far `template` reaches. A block device holds no length in
+/// its metadata, so the end is sought out instead.
+#[cfg(target_os = "linux")]
+fn extent(template: &File) -> Result<u64> {
+    let mut at = template;
+    match at.metadata().map_err(|_| Error::Take)?.len() {
+        0 => at.seek(SeekFrom::End(0)).map_err(|_| Error::Take),
+        len => Ok(len),
     }
 }
 
