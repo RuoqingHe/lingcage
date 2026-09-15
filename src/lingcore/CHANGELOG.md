@@ -2,9 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- [#4] Add read-only disks: take `:ro` on `--disk`, open the file read-only and offer
+  `VIRTIO_BLK_F_RO`.
+
 ### Changed
 
 - [#2] Pin rust toolchain version to 1.98.1 explicitly.
+- [#4] `Config::disks` takes `Disk` in place of `PathBuf`, breaking the 0.2.0 API.
 
 ### Fixed
 
