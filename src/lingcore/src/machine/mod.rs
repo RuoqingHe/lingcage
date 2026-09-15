@@ -246,6 +246,35 @@ pub enum Link {
     Tap(String),
 }
 
+/// File of the host behind a disk of a guest.
+#[derive(Debug, Clone)]
+pub struct Disk {
+    /// File the disk is served out of.
+    pub at: PathBuf,
+    /// Set if the guest may write to the disk.
+    pub writable: bool,
+}
+
+impl Disk {
+    /// Disk of `at` the guest may write to.
+    pub fn writable(at: impl Into<PathBuf>) -> Disk {
+        Disk {
+            at: at.into(),
+            writable: true,
+        }
+    }
+
+    /// Disk of `at` the guest may only read. The file is opened read-only
+    /// and the disk is offered with `VIRTIO_BLK_F_RO`, so one file backs
+    /// the same disk of several guests at once.
+    pub fn read_only(at: impl Into<PathBuf>) -> Disk {
+        Disk {
+            at: at.into(),
+            writable: false,
+        }
+    }
+}
+
 /// Directory of the host shared with a guest over virtio-fs.
 #[derive(Debug, Clone)]
 pub struct Share {
@@ -299,7 +328,7 @@ pub struct Config {
     pub cmdline: String,
     /// Files backing the disks of the guest, in the order the guest sees
     /// them. At most `DISKS` of them.
-    pub disks: Vec<PathBuf>,
+    pub disks: Vec<Disk>,
     /// Directories of the host shared with the guest, each under a tag
     /// the guest mounts by. At most `SHARES` of them.
     pub shares: Vec<Share>,
@@ -730,13 +759,17 @@ impl<H: Hypervisor> Machine<H> {
         // `virtio_count(config)` slots in the same order.
         let mut devices: Vec<Box<dyn crate::devices::virtio::Device>> =
             vec![Box::new(Entropy::new(seed))];
-        for path in &config.disks {
+        for disk in &config.disks {
+            // A read-only disk is opened read-only as well, so a write the
+            // device does not refuse is one the host still would.
             let file = OpenOptions::new()
                 .read(true)
-                .write(true)
-                .open(path)
+                .write(disk.writable)
+                .open(&disk.at)
                 .map_err(Error::Disk)?;
-            devices.push(Box::new(Block::new(file).map_err(Error::Disk)?));
+            devices.push(Box::new(
+                Block::new(file, disk.writable).map_err(Error::Disk)?,
+            ));
         }
         if !config.ports.is_empty() {
             devices.push(Box::new(Console::new(&config.ports).map_err(Error::Port)?));
@@ -1460,7 +1493,7 @@ mod tests {
                 confine: None,
                 kernel: PathBuf::from("/nonexistent/kernel"),
                 memory: 16 << 20,
-                disks: (0..DISKS).map(|_| PathBuf::from("/dev/null")).collect(),
+                disks: (0..DISKS).map(|_| Disk::writable("/dev/null")).collect(),
                 shares: (0..SHARES)
                     .map(|at| Share {
                         tag: format!("tag{at}"),
@@ -1497,7 +1530,9 @@ mod tests {
                 confine: None,
                 kernel: PathBuf::from("/nonexistent/kernel"),
                 memory: 16 << 20,
-                disks: (0..DISKS + 1).map(|_| PathBuf::from("/dev/null")).collect(),
+                disks: (0..DISKS + 1)
+                    .map(|_| Disk::writable("/dev/null"))
+                    .collect(),
                 ..Default::default()
             };
             assert!(matches!(
@@ -1516,7 +1551,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(virtio_count(&config), 1);
-        config.disks = vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")];
+        config.disks = vec![
+            Disk::writable("a"),
+            Disk::writable("b"),
+            Disk::read_only("c"),
+        ];
         assert_eq!(virtio_count(&config), 4);
     }
 

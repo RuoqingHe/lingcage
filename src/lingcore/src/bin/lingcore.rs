@@ -29,7 +29,9 @@ mod imp {
     use lingcore::hv::vcpu::VmExit;
     use lingcore::logging::{Logger, level_of};
     use lingcore::machine::snapshot::Snapshot;
-    use lingcore::machine::{Channel, Config, Link, Machine, Network, Share, StopHandle, control};
+    use lingcore::machine::{
+        Channel, Config, Disk, Link, Machine, Network, Share, StopHandle, control,
+    };
     use lingcore::seccomp::Refusal;
 
     /// Byte typed on the terminal to end the guest, `Ctrl-]`.
@@ -134,9 +136,10 @@ mod imp {
         },
         Flag {
             name: "disk",
-            value: "FILE",
+            value: "FILE[:ro]",
             required: false,
-            help: "file attached as a virtio-blk disk, /dev/vda in the guest, given once per disk",
+            help: "file attached as a virtio-blk disk, /dev/vda in the guest, given once per \
+                   disk, `:ro` refuses writes",
         },
         Flag {
             name: "network",
@@ -446,6 +449,15 @@ mod imp {
         }
     }
 
+    /// Parse `--disk`, `FILE` or `FILE:ro`. An unreadable file is reported
+    /// by the open.
+    fn parse_disk(text: &str) -> Disk {
+        match text.strip_suffix(":ro") {
+            Some(at) => Disk::read_only(at),
+            None => Disk::writable(text),
+        }
+    }
+
     /// Parse `--share`, `TAG=DIR` or `TAG=DIR:ro`.
     fn parse_share(text: &str) -> std::result::Result<Share, String> {
         let Some((tag, rest)) = text.split_once('=') else {
@@ -545,7 +557,7 @@ mod imp {
                 .unwrap_or("console=ttyS0")
                 .to_string(),
             memory: 512 << 20,
-            disks: parsed.each("disk").into_iter().map(PathBuf::from).collect(),
+            disks: parsed.each("disk").into_iter().map(parse_disk).collect(),
             shares,
             ports,
             confine: Some(Refusal::Trap),

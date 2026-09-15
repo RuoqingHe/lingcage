@@ -21,6 +21,8 @@ const SECTOR: u64 = 512;
 /// Size of request header in bytes.
 const HEADER_SIZE: u32 = 16;
 
+/// `VIRTIO_BLK_F_RO`, feature bit 5, the disk takes no writes.
+const FEATURE_RO: u64 = 1 << 5;
 /// `VIRTIO_BLK_F_FLUSH`, feature bit 9, flush requests are accepted.
 const FEATURE_FLUSH: u64 = 1 << 9;
 
@@ -42,16 +44,22 @@ const UNSUPPORTED: u8 = 2;
 pub struct Block {
     disk: File,
     sectors: u64,
+    writable: bool,
 }
 
 impl Block {
     /// Create a block device over `disk`. Its length is only read once here,
     /// a file which grows later is not read beyond the capacity reported.
-    pub fn new(mut disk: File) -> io::Result<Self> {
+    ///
+    /// A disk which is not `writable` is offered with `VIRTIO_BLK_F_RO`
+    /// and refuses a write, so several guests read one file and none of
+    /// them writes it.
+    pub fn new(mut disk: File, writable: bool) -> io::Result<Self> {
         let bytes = disk.seek(SeekFrom::End(0))?;
         Ok(Block {
             disk,
             sectors: bytes / SECTOR,
+            writable,
         })
     }
 }
@@ -68,7 +76,10 @@ impl Device for Block {
     }
 
     fn features(&self) -> u64 {
-        FEATURE_FLUSH
+        match self.writable {
+            true => FEATURE_FLUSH,
+            false => FEATURE_FLUSH | FEATURE_RO,
+        }
     }
 
     /// Returns bytes of the capacity field, which is the only field in the
@@ -111,6 +122,9 @@ impl Block {
         let data = &chain.descriptors[1..chain.descriptors.len() - 1];
         match header.kind {
             REQUEST_IN => self.transfer(header.sector, data, ram, true),
+            // A driver which took `F_RO` sends no write, and a write
+            // which arrives anyway is refused.
+            REQUEST_OUT if !self.writable => (IOERR, 0),
             REQUEST_OUT => self.transfer(header.sector, data, ram, false),
             // `Write::flush` on a `File` returns `Ok(())` without syscall,
             // `sync_data` is `fdatasync`.
@@ -234,7 +248,7 @@ mod tests {
             .open(&path)
             .expect("open the disk");
         std::fs::remove_file(&path).expect("remove the disk");
-        Block::new(file).expect("measure the disk")
+        Block::new(file, true).expect("measure the disk")
     }
 
     /// Read sector `index` from the file behind `block`.
@@ -375,6 +389,40 @@ mod tests {
         // Write leaves guest RAM untouched, used length is the status byte.
         assert_eq!(reported(&ram, 0), 1);
         assert_eq!(sector_of(&mut block, 5), vec![0xa5u8; SECTOR as usize]);
+    }
+
+    #[test]
+    fn test_read_only_disk_refuses_writes() {
+        let ram = ram();
+        let mut queue = queue();
+        let mut block = disk();
+        block.writable = false;
+
+        assert_eq!(block.features() & FEATURE_RO, FEATURE_RO);
+        ram.write(DATA_AT, &[0xa5u8; SECTOR as usize])
+            .expect("fill the buffer");
+        request(&ram, REQUEST_OUT, 5, &[(SECTOR as u32, false)], 0);
+        block.notify(0, &mut queue, &ram).expect("notify");
+
+        assert_eq!(status(&ram), IOERR);
+        // Sector 5 still holds what the disk was filled with.
+        assert_eq!(sector_of(&mut block, 5), vec![5u8; SECTOR as usize]);
+    }
+
+    #[test]
+    fn test_read_only_disk_still_reads() {
+        let ram = ram();
+        let mut queue = queue();
+        let mut block = disk();
+        block.writable = false;
+
+        request(&ram, REQUEST_IN, 3, &[(SECTOR as u32, true)], 0);
+        block.notify(0, &mut queue, &ram).expect("notify");
+
+        assert_eq!(status(&ram), OK);
+        let mut landed = vec![0u8; SECTOR as usize];
+        ram.read(DATA_AT, &mut landed).expect("read the buffer");
+        assert_eq!(landed, vec![3u8; SECTOR as usize]);
     }
 
     #[test]
