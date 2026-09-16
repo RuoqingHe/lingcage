@@ -1,6 +1,8 @@
-# lingcore
-
-**Building blocks for agentic-workload VMMs.**
+<div align="center">
+    <img src="../../assets/logo.svg" alt="LingCage" width="120">
+    <h1>lingcore</h1>
+    <p><strong>Building blocks for agentic-workload VMMs.</strong></p>
+</div>
 
 [![crates.io](https://img.shields.io/crates/v/lingcore.svg)](https://crates.io/crates/lingcore)
 [![docs.rs](https://img.shields.io/docsrs/lingcore)](https://docs.rs/lingcore)
