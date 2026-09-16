@@ -6,6 +6,11 @@
         minimum overhead. It protects systems from both intentional and
         unintentional harmful actions of AI agents.
     </strong></p>
+    <p>
+        <a href="https://crates.io/crates/lingcore"><img src="https://img.shields.io/crates/v/lingcore?style=for-the-badge&logo=rust&logoColor=white&label=lingcore" alt="lingcore on crates.io"></a>
+        <a href="https://crates.io/crates/lingcage"><img src="https://img.shields.io/crates/v/lingcage?style=for-the-badge&logo=rust&logoColor=white&label=lingcage" alt="lingcage on crates.io"></a>
+        <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge" alt="Apache 2.0 License"></a>
+    </p>
 </div>
 
 > **Note:** LingCage is still under heavy development. APIs may change significantly.

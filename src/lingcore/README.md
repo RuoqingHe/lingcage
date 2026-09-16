@@ -2,11 +2,12 @@
     <img src="../../assets/logo.svg" alt="LingCage" width="120">
     <h1>lingcore</h1>
     <p><strong>Building blocks for agentic-workload VMMs.</strong></p>
+    <p>
+        <a href="https://crates.io/crates/lingcore"><img src="https://img.shields.io/crates/v/lingcore?style=for-the-badge&logo=rust&logoColor=white" alt="crates.io"></a>
+        <a href="https://docs.rs/lingcore"><img src="https://img.shields.io/docsrs/lingcore?style=for-the-badge&logo=docs.rs&logoColor=white" alt="docs.rs"></a>
+        <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge" alt="Apache 2.0 License"></a>
+    </p>
 </div>
-
-[![crates.io](https://img.shields.io/crates/v/lingcore.svg)](https://crates.io/crates/lingcore)
-[![docs.rs](https://img.shields.io/docsrs/lingcore)](https://docs.rs/lingcore)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/RuoqingHe/lingcage/blob/main/LICENSE)
 
 ## Overview
 
