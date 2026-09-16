@@ -110,6 +110,13 @@ pub trait Device: Send {
     /// Default drops it.
     fn write_config(&mut self, _offset: u64, _size: u8, _value: u64) {}
 
+    /// Returns a value which differs once configuration space would read
+    /// differently. Capture keeps it, and a restore which finds another
+    /// tells a guest to read again. Default is `None`.
+    fn configuration(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns host descriptors on which work arrives for the device, each
     /// with the interest to wait for. Default returns none, such a device is
     /// only reached through its ioeventfd.
