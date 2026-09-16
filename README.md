@@ -1,4 +1,5 @@
 <div align="center">
+    <img src="assets/logo.svg" alt="LingCage" width="160">
     <h1>LingCage</h1>
     <p><strong>
         LingCage is a secure agent infrastructure that cages AI agents with

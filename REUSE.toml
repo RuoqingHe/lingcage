@@ -13,6 +13,7 @@ path = [
   "REUSE.toml",
   ".gitignore",
   ".github/**",
+  "assets/**",
   "**/*.md",
   "**/*.json",
   "LICENSE",

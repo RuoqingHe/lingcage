@@ -1,6 +1,8 @@
-# lingcage
-
-**Secure agent infrastructure that cages AI agents with minimum overhead.**
+<div align="center">
+    <img src="../../assets/logo.svg" alt="LingCage" width="120">
+    <h1>lingcage</h1>
+    <p><strong>Secure agent infrastructure that cages AI agents with minimum overhead.</strong></p>
+</div>
 
 [![crates.io](https://img.shields.io/crates/v/lingcage.svg)](https://crates.io/crates/lingcage)
 [![docs.rs](https://img.shields.io/docsrs/lingcage)](https://docs.rs/lingcage)
