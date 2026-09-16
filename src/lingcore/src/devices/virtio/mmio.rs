@@ -59,6 +59,8 @@ const CONFIG_GENERATION: u64 = 0x0fc;
 const CONFIG: u64 = 0x100;
 
 // TODO: `VIRTQ_AVAIL_F_NO_INTERRUPT` of the available ring is not yet read.
+/// `INTERRUPT_STATUS` bit, configuration space changed.
+const INTERRUPT_CONFIG: u32 = 0x2;
 /// `INTERRUPT_STATUS` bit, a used ring was updated.
 const INTERRUPT_VRING: u32 = 0x1;
 
@@ -105,6 +107,8 @@ struct TransportState {
     driver_features_sel: u32,
     queue_sel: u32,
     interrupt_status: u32,
+    config_generation: u32,
+    configuration: Option<u64>,
     queues: Vec<SlotState>,
 }
 
@@ -130,6 +134,13 @@ pub struct Transport {
     driver_features_sel: u32,
     queue_sel: u32,
     interrupt_status: u32,
+    /// Generation of configuration space, bumped once configuration changes.
+    /// Guest reads generation before and after reading configuration; a change
+    /// between the two means configuration changed under the read.
+    config_generation: u32,
+    /// `Device::configuration` kept by the capture, `None` unless restored.
+    /// `restored` compares it with the device.
+    configuration: Option<u64>,
     queues: Vec<Slot>,
     /// Notifications served, from the ioeventfd or a restore.
     notified: u64,
@@ -155,6 +166,8 @@ impl Transport {
             driver_features_sel: 0,
             queue_sel: 0,
             interrupt_status: 0,
+            config_generation: 0,
+            configuration: None,
             queues,
             notified: 0,
             faults: 0,
@@ -197,8 +210,9 @@ impl Transport {
             QUEUE_READY => u32::from(self.selected().is_some_and(|s| s.queue.is_some())),
             INTERRUPT_STATUS => self.interrupt_status,
             STATUS => self.status,
-            // Configuration space never changes, so generation stays zero.
-            CONFIG_GENERATION => 0,
+            // Bumped by a restore changing configuration, so generation read
+            // before and after a read of configuration differs.
+            CONFIG_GENERATION => self.config_generation,
             _ => 0,
         }
     }
@@ -333,6 +347,8 @@ impl Transport {
             driver_features_sel: self.driver_features_sel,
             queue_sel: self.queue_sel,
             interrupt_status: self.interrupt_status,
+            config_generation: self.config_generation,
+            configuration: self.device.configuration(),
             queues: self
                 .queues
                 .iter()
@@ -369,6 +385,8 @@ impl Transport {
         self.driver_features_sel = state.driver_features_sel;
         self.queue_sel = state.queue_sel;
         self.interrupt_status = state.interrupt_status;
+        self.config_generation = state.config_generation;
+        self.configuration = state.configuration;
         for (slot, taken) in self.queues.iter_mut().zip(state.queues) {
             slot.size = taken.size;
             slot.desc = taken.desc;
@@ -441,6 +459,14 @@ impl BusDevice for Transport {
 
     fn restored(&mut self) {
         let mut raised = false;
+        // Configuration no longer reads as the capture kept it. Bump generation
+        // and raise `INT_CONFIG`: guest reads configuration again, and a read
+        // across the restore shows as changed.
+        if self.configuration.is_some() && self.configuration != self.device.configuration() {
+            self.config_generation = self.config_generation.wrapping_add(1);
+            self.interrupt_status |= INTERRUPT_CONFIG;
+            raised = true;
+        }
         for index in 0..self.queues.len() as u16 {
             let Some(queue) = self.queues[usize::from(index)].queue.as_mut() else {
                 continue;
@@ -457,12 +483,14 @@ impl BusDevice for Transport {
                 self.status |= STATUS_NEEDS_RESET;
                 continue;
             }
-            raised |= queue.cursors().1 != answered;
+            if queue.cursors().1 != answered {
+                self.interrupt_status |= INTERRUPT_VRING;
+                raised = true;
+            }
         }
         if !raised {
             return;
         }
-        self.interrupt_status |= INTERRUPT_VRING;
         // Failed raise leaves the work in the used ring, which will be
         // seen at the next raise.
         if let Err(err) = self.line.send() {
@@ -526,6 +554,8 @@ mod tests {
         served: Arc<AtomicUsize>,
         /// Wait reported through `wake_after`.
         wake: Option<Duration>,
+        /// Reported through `configuration`.
+        configuration: Option<u64>,
     }
 
     impl Device for Filler {
@@ -569,6 +599,10 @@ mod tests {
 
         fn wake_after(&self) -> Option<std::time::Duration> {
             self.wake
+        }
+
+        fn configuration(&self) -> Option<u64> {
+            self.configuration
         }
     }
 
@@ -987,6 +1021,79 @@ mod tests {
             0,
             "QUEUE_READY survived the reset"
         );
+    }
+
+    /// Transport over a device whose `configuration` is `now`, restored from a
+    /// capture which kept `kept`; `restored` has already run.
+    fn restored_over(line: &Counter, kept: Option<u64>, now: Option<u64>) -> Transport {
+        let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
+        let mut mmio = Transport::new(
+            Box::new(Filler {
+                configuration: now,
+                ..Filler::default()
+            }),
+            ram,
+            Box::new(line.clone()),
+        );
+        mmio.configuration = kept;
+        BusDevice::restored(&mut mmio);
+        mmio
+    }
+
+    #[test]
+    fn test_moved_configuration_wakes_guest() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut mmio = restored_over(&line, Some(1024), Some(2048));
+
+        assert_eq!(
+            reg(&mut mmio, INTERRUPT_STATUS) & INTERRUPT_CONFIG,
+            INTERRUPT_CONFIG
+        );
+        assert_eq!(
+            reg(&mut mmio, CONFIG_GENERATION),
+            1,
+            "generation not bumped"
+        );
+        assert_eq!(
+            line.raises(),
+            1,
+            "line not raised for a moved configuration"
+        );
+    }
+
+    #[test]
+    fn test_unmoved_configuration_is_left_alone() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut mmio = restored_over(&line, Some(1024), Some(1024));
+
+        assert_eq!(reg(&mut mmio, INTERRUPT_STATUS) & INTERRUPT_CONFIG, 0);
+        assert_eq!(reg(&mut mmio, CONFIG_GENERATION), 0);
+        assert_eq!(line.raises(), 0, "an unmoved configuration woke the guest");
+    }
+
+    #[test]
+    fn test_capture_without_configuration_moves_none() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let mut mmio = restored_over(&line, None, Some(2048));
+
+        assert_eq!(reg(&mut mmio, INTERRUPT_STATUS) & INTERRUPT_CONFIG, 0);
+        assert_eq!(line.raises(), 0, "a capture which kept none woke the guest");
+    }
+
+    #[test]
+    fn test_capture_keeps_device_configuration() {
+        let line = Counter(Arc::new(AtomicUsize::new(0)));
+        let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
+        let mmio = Transport::new(
+            Box::new(Filler {
+                configuration: Some(4096),
+                ..Filler::default()
+            }),
+            ram,
+            Box::new(line.clone()),
+        );
+
+        assert_eq!(mmio.state().configuration, Some(4096));
     }
 
     #[test]

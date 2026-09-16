@@ -6,6 +6,8 @@
 
 - [#4] Add read-only disks: take `:ro` on `--disk`, open the file read-only and offer
   `VIRTIO_BLK_F_RO`.
+- [#5] Add configuration change interrupt: a restore which finds a device's configuration moved
+  raises `VIRTIO_MMIO_INT_CONFIG`.
 
 ### Changed
 

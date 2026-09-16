@@ -82,6 +82,13 @@ impl Device for Block {
         }
     }
 
+    /// Returns the capacity, sole field of configuration space and length of
+    /// the disk file. Clone may be given a file of another length, so restore
+    /// compares it.
+    fn configuration(&self) -> Option<u64> {
+        Some(self.sectors)
+    }
+
     /// Returns bytes of the capacity field, which is the only field in the
     /// configuration space. Read past it returns zero.
     fn read_config(&mut self, offset: u64, size: u8) -> u64 {
