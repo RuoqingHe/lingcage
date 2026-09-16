@@ -2,11 +2,12 @@
     <img src="../../assets/logo.svg" alt="LingCage" width="120">
     <h1>lingcage</h1>
     <p><strong>Secure agent infrastructure that cages AI agents with minimum overhead.</strong></p>
+    <p>
+        <a href="https://crates.io/crates/lingcage"><img src="https://img.shields.io/crates/v/lingcage?style=for-the-badge&logo=rust&logoColor=white" alt="crates.io"></a>
+        <a href="https://docs.rs/lingcage"><img src="https://img.shields.io/docsrs/lingcage?style=for-the-badge&logo=docs.rs&logoColor=white" alt="docs.rs"></a>
+        <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge" alt="Apache 2.0 License"></a>
+    </p>
 </div>
-
-[![crates.io](https://img.shields.io/crates/v/lingcage.svg)](https://crates.io/crates/lingcage)
-[![docs.rs](https://img.shields.io/docsrs/lingcage)](https://docs.rs/lingcage)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/RuoqingHe/lingcage/blob/main/LICENSE)
 
 ## Overview
 
