@@ -58,12 +58,15 @@ seccomp = ["dep:libc", "dep:seccompiler"]
 vcpu = ["hv"]
 # The `lingcore` binary, boots a guest with KVM. aarch64, x86_64 and
 # riscv64 Linux only.
-cli = ["kvm", "machine"]
+cli = ["kvm", "machine", "mmds"]
 # Virtio devices and the split virtqueue.
 virtio = ["devices", "mem"]
 # Network stack behind the virtio-net device, guest frames are translated
 # to host sockets in this process.
 netstack = ["dep:libc", "dep:smoltcp", "virtio"]
+# Metadata service behind the virtio-net device, a document of the caller
+# is answered inside this process.
+mmds = ["dep:smoltcp", "virtio"]
 # KVM backend.
 kvm = [
   "dep:kvm-bindings",
