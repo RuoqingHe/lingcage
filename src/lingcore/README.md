@@ -22,6 +22,7 @@ command line. API documentation is on [docs.rs](https://docs.rs/lingcore).
   riscv64 (`boot`, `acpi`, `fdt`).
 - Minimal device model, serial port and virtio block, filesystem, console, network and vsock devices
   (`devices`, `virtio`, `netstack`).
+- Metadata service answering a document of the caller behind the network device (`mmds`).
 - Per-thread seccomp filters confining the threads which serve the guest (`seccomp`).
 - `Machine`, which assembles them into one guest, started, paused, captured and cloned (`machine`).
 

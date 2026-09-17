@@ -30,7 +30,7 @@ mod imp {
     use lingcore::logging::{Logger, level_of};
     use lingcore::machine::snapshot::Snapshot;
     use lingcore::machine::{
-        Channel, Config, Disk, Link, Machine, Network, Share, StopHandle, control,
+        Channel, Config, Disk, Link, Machine, MetadataConfig, Network, Share, StopHandle, control,
     };
     use lingcore::seccomp::Refusal;
 
@@ -159,6 +159,13 @@ mod imp {
             value: "FILE",
             required: false,
             help: "write frames of the network link to FILE in pcap format, needs --network",
+        },
+        Flag {
+            name: "metadata",
+            value: "ADDR=FILE",
+            required: false,
+            help: "serve the JSON document in FILE as metadata of the guest at ADDR, needs \
+                   --network",
         },
         Flag {
             name: "share",
@@ -449,6 +456,26 @@ mod imp {
         }
     }
 
+    /// Parse `--metadata`, `ADDR=FILE`, and read the document. File not
+    /// opening on a JSON object is refused, since the guest agent parses one.
+    fn parse_metadata(text: &str) -> std::result::Result<MetadataConfig, String> {
+        let Some((ip, file)) = text.split_once('=') else {
+            return Err(format!("invalid metadata {text}, use ADDR=FILE"));
+        };
+        let ip = ip
+            .parse()
+            .map_err(|_| format!("invalid metadata address {ip}"))?;
+        let document = std::fs::read(file)
+            .map_err(|err| format!("invalid metadata document {file}: {err}"))?;
+        let opens = document.iter().find(|byte| !byte.is_ascii_whitespace());
+        if opens != Some(&b'{') {
+            return Err(format!(
+                "invalid metadata document {file}: not a JSON object"
+            ));
+        }
+        Ok(MetadataConfig { ip, document })
+    }
+
     /// Parse `--disk`, `FILE` or `FILE:ro`. An unreadable file is reported
     /// by the open.
     fn parse_disk(text: &str) -> Disk {
@@ -579,13 +606,24 @@ mod imp {
                 .transpose()
                 .map_err(usage_err)?;
             let link = parse_link(link).map_err(usage_err)?;
+            let metadata = parsed
+                .value("metadata")
+                .map(parse_metadata)
+                .transpose()
+                .map_err(usage_err)?;
             config.network = Some(Network {
                 link,
                 mac,
                 pcap: parsed.value("pcap").map(PathBuf::from),
+                metadata,
             });
-        } else if parsed.value("mac").is_some() || parsed.value("pcap").is_some() {
-            return Err(usage_err("--mac and --pcap need --network".to_string()));
+        } else if parsed.value("mac").is_some()
+            || parsed.value("pcap").is_some()
+            || parsed.value("metadata").is_some()
+        {
+            return Err(usage_err(
+                "--mac, --pcap and --metadata need --network".to_string(),
+            ));
         }
         if let Some(mode) = parsed.value("seccomp") {
             config.confine = parse_seccomp(mode).map_err(usage_err)?;
@@ -949,6 +987,7 @@ mod imp {
                 vec!["--kernel", "k", "--network", "tap0"],
                 vec!["--kernel", "k", "--network", "unix:"],
                 vec!["--kernel", "k", "--pcap", "link.pcap"],
+                vec!["--kernel", "k", "--metadata", "169.254.169.254=doc.json"],
                 vec!["--kernel", "k", "--timeout", "soon"],
                 vec!["--kernel", "k", "--verbose=2"],
                 vec!["--kernel", "k", "-vx"],
@@ -997,6 +1036,42 @@ mod imp {
             ));
             assert!(parse_link("/tmp/net.sock").is_err());
             assert!(parse_link("tcp:1").is_err());
+        }
+
+        #[test]
+        fn test_parse_metadata_with_network() {
+            // Document read from FILE, hidden in Debug; array, empty file,
+            // no file and bad address refused.
+            let path =
+                std::env::temp_dir().join(format!("lingcore-metadata-{}", std::process::id()));
+            std::fs::write(&path, b" {\"instanceID\":\"one\"}\n").expect("write the document");
+            let text = format!("169.254.169.254={}", path.display());
+            let args: Vec<String> = ["--kernel", "k", "--network", "user", "--metadata", &text]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let config = config_of(&parse(&args).unwrap()).unwrap();
+            let metadata = config.network.unwrap().metadata.unwrap();
+            assert_eq!(metadata.ip, std::net::Ipv4Addr::new(169, 254, 169, 254));
+            assert_eq!(metadata.document, b" {\"instanceID\":\"one\"}\n");
+            assert!(
+                !format!("{metadata:?}").contains("instanceID"),
+                "document in Debug"
+            );
+
+            std::fs::write(&path, b"[]").expect("write the document");
+            assert!(parse_metadata(&text).is_err(), "a JSON array was taken");
+            std::fs::write(&path, b"").expect("write the document");
+            assert!(parse_metadata(&text).is_err(), "an empty file was taken");
+            std::fs::remove_file(&path).expect("remove the document");
+            assert!(
+                parse_metadata("169.254.169.254").is_err(),
+                "no file was taken"
+            );
+            assert!(
+                parse_metadata("nowhere=/dev/null").is_err(),
+                "a bad address was taken"
+            );
         }
 
         #[test]

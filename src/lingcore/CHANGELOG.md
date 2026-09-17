@@ -8,6 +8,8 @@
   `VIRTIO_BLK_F_RO`.
 - [#5] Add configuration change interrupt: a restore which finds a device's configuration moved
   raises `VIRTIO_MMIO_INT_CONFIG`.
+- [#7] Add metadata service to a guest: `--metadata ADDR=FILE` serves the JSON in FILE at ADDR,
+  tokens as in MMDS V2. The `mmds` feature carries it, and the binary is built with it.
 
 ### Changed
 

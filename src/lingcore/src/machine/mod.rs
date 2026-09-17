@@ -7,8 +7,10 @@
 //! long mode on x86_64, and in supervisor mode with the device tree on
 //! riscv64.
 
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -29,6 +31,8 @@ use crate::devices::virtio::mmio::{self, Transport};
 use crate::devices::virtio::net::carrier::Tap;
 use crate::devices::virtio::net::carrier::{Carrier, Framed};
 use crate::devices::virtio::net::device::Net;
+#[cfg(feature = "mmds")]
+use crate::devices::virtio::net::metadata::Metadata;
 use crate::devices::virtio::net::pcap::Captured;
 use crate::devices::virtio::net::stack::{Stack, StackConfig};
 use crate::devices::virtio::vsock::device::Vsock;
@@ -126,6 +130,14 @@ pub enum Error {
     /// Failed to set up the network link.
     #[error("failed to set up network link")]
     Network(#[source] std::io::Error),
+    /// Failed to set up metadata service.
+    #[error("failed to set up metadata service")]
+    Metadata(#[source] std::io::Error),
+
+    /// A caller named a metadata service and this build does not carry
+    /// one.
+    #[error("no metadata service in this build")]
+    NoMetadata,
     /// Failed to bind the channel socket.
     #[error("failed to bind channel socket")]
     Channel(#[source] std::io::Error),
@@ -286,6 +298,28 @@ pub struct Share {
     pub writable: bool,
 }
 
+/// Metadata service of a guest, `document` served at `ip` inside the machine
+/// as MMDS V2 does. Clone builds the service from config, not from the
+/// capture, so a token from before the capture is refused.
+#[derive(Clone)]
+pub struct MetadataConfig {
+    /// Address the service listens on, `169.254.169.254` for a cloud guest.
+    pub ip: Ipv4Addr,
+    /// Document served, as it is, to a token holder.
+    pub document: Vec<u8>,
+}
+
+// Document may carry a guest credential, so `Debug` prints its length
+// only.
+impl fmt::Debug for MetadataConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetadataConfig")
+            .field("ip", &self.ip)
+            .field("document", &format_args!("{} bytes", self.document.len()))
+            .finish()
+    }
+}
+
 /// Network link of a guest, a virtio-net device over `Link`.
 #[derive(Debug, Clone)]
 pub struct Network {
@@ -297,6 +331,8 @@ pub struct Network {
     /// File the frames of link are written to in pcap format, both
     /// directions. `None` keeps no capture.
     pub pcap: Option<PathBuf>,
+    /// Metadata service wrapped around the link. `None` serves no metadata.
+    pub metadata: Option<MetadataConfig>,
 }
 
 /// Guest configuration which a `Machine` is assembled from.
@@ -806,8 +842,20 @@ impl<H: Hypervisor> Machine<H> {
                 #[cfg(not(target_os = "linux"))]
                 Link::Tap(_) => return Err(Error::Network(io::ErrorKind::Unsupported.into())),
             };
-            // Capture wraps the carrier, so frames of either link are
-            // written on their way through.
+            // Service wraps the link: frames for it are answered, the rest go
+            // to the link.
+            let carrier: Box<dyn Carrier> = match &network.metadata {
+                #[cfg(feature = "mmds")]
+                Some(metadata) => Box::new(
+                    Metadata::over(carrier, metadata.ip, metadata.document.clone())
+                        .map_err(Error::Metadata)?,
+                ),
+                #[cfg(not(feature = "mmds"))]
+                Some(_) => return Err(Error::NoMetadata),
+                None => carrier,
+            };
+            // `Captured` wraps both, so frames of link and service are
+            // written.
             let carrier: Box<dyn Carrier> = match &network.pcap {
                 Some(path) => {
                     let file = File::create(path).map_err(Error::Pcap)?;
