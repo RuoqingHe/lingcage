@@ -11,7 +11,12 @@
 pub mod carrier;
 pub mod device;
 pub mod frame;
+#[cfg(feature = "mmds")]
+pub mod metadata;
 pub mod pcap;
+// The service and the stack both drive smoltcp through the pipe.
+#[cfg(any(feature = "mmds", all(feature = "netstack", target_os = "linux")))]
+mod pipe;
 // Host sockets of the stack are opened through libc on Linux.
 #[cfg(all(feature = "netstack", target_os = "linux"))]
 pub mod stack;

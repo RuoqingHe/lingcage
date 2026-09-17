@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 use log::{debug, warn};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as Tick;
 use smoltcp::wire::{
@@ -32,6 +31,7 @@ use smoltcp::wire::{
 
 use crate::devices::virtio::net::carrier::Carrier;
 use crate::devices::virtio::net::frame::MAX_FRAME;
+use crate::devices::virtio::net::pipe::Pipe;
 use crate::hv::Interest;
 
 /// DHCP server, replies before smoltcp gets the message.
@@ -110,61 +110,6 @@ impl StackConfig {
     fn server_mac(&self) -> EthernetAddress {
         let [a, b, c, d] = self.gateway.octets();
         EthernetAddress([0x52, 0x55, a, b, c, d])
-    }
-}
-
-/// Frames between the guest and smoltcp, both directions queued.
-struct Pipe {
-    from_guest: VecDeque<Vec<u8>>,
-    to_guest: VecDeque<Vec<u8>>,
-    mtu: usize,
-}
-
-/// One frame from the guest, handed to smoltcp.
-struct FromGuest(Vec<u8>);
-
-impl RxToken for FromGuest {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(&self.0)
-    }
-}
-
-/// Room for one frame to the guest, filled by smoltcp.
-struct ToGuest<'a>(&'a mut VecDeque<Vec<u8>>);
-
-impl TxToken for ToGuest<'_> {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut frame = vec![0u8; len];
-        let done = f(&mut frame);
-        self.0.push_back(frame);
-        done
-    }
-}
-
-impl Device for Pipe {
-    type RxToken<'a>
-        = FromGuest
-    where
-        Self: 'a;
-    type TxToken<'a>
-        = ToGuest<'a>
-    where
-        Self: 'a;
-
-    fn receive(&mut self, _now: Tick) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let frame = self.from_guest.pop_front()?;
-        Some((FromGuest(frame), ToGuest(&mut self.to_guest)))
-    }
-
-    fn transmit(&mut self, _now: Tick) -> Option<Self::TxToken<'_>> {
-        Some(ToGuest(&mut self.to_guest))
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = self.mtu;
-        caps
     }
 }
 
