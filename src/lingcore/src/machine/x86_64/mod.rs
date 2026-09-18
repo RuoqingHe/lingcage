@@ -640,6 +640,9 @@ mod tests {
         assert_eq!(machine.state(), State::Running);
         // Second `start` would drop the handles of the first threads.
         assert!(matches!(machine.start(), Err(Error::BadTransition { .. })));
+        // `resume` of a running guest passes and changes nothing.
+        machine.resume().expect("resume a running guest");
+        assert_eq!(machine.state(), State::Running);
 
         assert_eq!(machine.wait().expect("wait"), VmExit::Shutdown);
         assert_eq!(machine.state(), State::Shutdown);
