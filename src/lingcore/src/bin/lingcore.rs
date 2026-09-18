@@ -107,8 +107,9 @@ mod imp {
         Flag {
             name: "kernel",
             value: "K",
-            required: true,
-            help: "kernel image path, bzImage on x86_64 or Image on aarch64 and riscv64",
+            required: false,
+            help: "kernel image path, bzImage on x86_64 or Image on aarch64 and riscv64, not \
+                   needed with --restore",
         },
         Flag {
             name: "initrd",
@@ -521,6 +522,14 @@ mod imp {
 
     /// Build guest `Config` from the parsed flags.
     fn config_of(parsed: &Parsed) -> Result<Config> {
+        // A clone reads its kernel out of the RAM image, so only a boot
+        // needs the file.
+        let kernel = parsed.value("kernel").unwrap_or_default();
+        if kernel.is_empty() && parsed.value("restore").is_none() {
+            return Err(usage_err(
+                "--kernel is needed unless --restore is given".to_string(),
+            ));
+        }
         let mut shares = Vec::new();
         for text in parsed.each("share") {
             shares.push(parse_share(text).map_err(usage_err)?);
@@ -576,7 +585,7 @@ mod imp {
             None => return Err(usage_err("--vsock needs --channel".to_string())),
         };
         let mut config = Config {
-            kernel: PathBuf::from(parsed.value("kernel").expect("required flag")),
+            kernel: PathBuf::from(kernel),
             channel,
             initrd: parsed.value("initrd").map(PathBuf::from),
             cmdline: parsed
@@ -973,6 +982,16 @@ mod imp {
             assert_eq!(config.memory, 1 << 30);
             assert_eq!(config.cmdline, "console=ttyS0");
             assert_eq!(config.confine, Some(Refusal::Trap));
+        }
+
+        #[test]
+        fn test_restore_takes_no_kernel() {
+            let args: Vec<String> = ["--restore", "capture"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let config = config_of(&parse(&args).unwrap()).unwrap();
+            assert!(config.kernel.as_os_str().is_empty());
         }
 
         #[test]

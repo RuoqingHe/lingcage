@@ -15,6 +15,7 @@
 
 - [#2] Pin rust toolchain version to 1.98.1 explicitly.
 - [#4] `Config::disks` takes `Disk` in place of `PathBuf`, breaking the 0.2.0 API.
+- [#9] Drop kernel requirement under `--restore`: a clone takes its kernel from the RAM image.
 
 ### Fixed
 

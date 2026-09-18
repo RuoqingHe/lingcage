@@ -147,7 +147,7 @@ pub enum Error {
     /// Failed to start a guest thread.
     #[error("failed to start thread")]
     Thread(#[source] std::io::Error),
-    /// `Config::kernel` is empty.
+    /// `Config::kernel` is empty on a boot.
     #[error("guest needs a kernel")]
     NoKernel,
     /// `Config::disks` holds more than `DISKS` of them.
@@ -356,7 +356,8 @@ pub struct Config {
     pub memory: u64,
     /// Number of vCPUs, at least one.
     pub vcpus: u16,
-    /// Kernel image path, a bzImage on x86_64 or an Image on riscv64.
+    /// Kernel image path, a bzImage on x86_64 or an Image on riscv64. A
+    /// clone takes its kernel from the RAM image, so it may be empty.
     pub kernel: PathBuf,
     /// Initramfs path, a cpio archive loaded above the kernel.
     pub initrd: Option<PathBuf>,
@@ -734,7 +735,7 @@ impl<H: Hypervisor> Machine<H> {
         if config.vcpus == 0 {
             return Err(Error::NoVcpus);
         }
-        if config.kernel.as_os_str().is_empty() {
+        if entry == Entry::Boot && config.kernel.as_os_str().is_empty() {
             return Err(Error::NoKernel);
         }
         if config.disks.len() > DISKS {
