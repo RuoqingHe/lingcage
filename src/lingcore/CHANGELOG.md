@@ -10,6 +10,8 @@
   raises `VIRTIO_MMIO_INT_CONFIG`.
 - [#7] Add metadata service to a guest: `--metadata ADDR=FILE` serves the JSON in FILE at ADDR,
   tokens as in MMDS V2. The `mmds` feature carries it, and the binary is built with it.
+- [#10] Add stop on a lost template page: a clone whose RAM image lost a page is stopped and
+  `Error::LostPage` reported.
 
 ### Changed
 
