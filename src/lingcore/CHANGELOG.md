@@ -13,6 +13,8 @@
   carries it, and the binary is built with it.
 - \[[#10](https://github.com/RuoqingHe/lingcage/pull/10)\] Add stop on a lost template page: a clone
   whose RAM image lost a page is stopped and `Error::LostPage` reported.
+- \[[#12](https://github.com/RuoqingHe/lingcage/pull/12)\] Add dirty page log to guest RAM:
+  `GuestRam::mark` and `written` name the pages written since assembly.
 
 ### Changed
 

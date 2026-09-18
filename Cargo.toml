@@ -39,7 +39,10 @@ smoltcp = { version = "0.13.1", default-features = false, features = [
 ] }
 thiserror = "2.0.18"
 vm-fdt = "0.3.0"
-vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
+vm-memory = { version = "0.18.0", features = [
+  "backend-bitmap",
+  "backend-mmap",
+] }
 vmm-sys-util = "0.15.0"
 
 # Member crates opt in via `lints.workspace = true`

@@ -15,9 +15,8 @@ use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
 use thiserror::Error;
-use vm_memory::mmap::FromRangesError;
-#[cfg(target_os = "linux")]
-use vm_memory::mmap::MmapRegion;
+use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::mmap::{FromRangesError, MmapRegion};
 use vm_memory::region::GuestRegionCollectionError;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 #[cfg(target_os = "linux")]
@@ -60,6 +59,12 @@ pub enum Error {
 /// Result alias for guest RAM.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Page size. Dirty log keeps one bit per page, the same as KVM.
+const PAGE: u64 = 4096;
+
+/// Regions with one bitmap each. A write from the host marks its page.
+type Ram = GuestMemoryMmap<AtomicBitmap>;
+
 #[cfg(target_os = "linux")]
 mod fault;
 
@@ -81,7 +86,7 @@ pub struct Region {
 #[derive(Clone)]
 pub struct GuestRam {
     /// Shared with each vCPU thread. Unmapped when the last clone drops.
-    inner: Arc<GuestMemoryMmap>,
+    inner: Arc<Ram>,
     /// Watch taken by a file-backed mapping, so that a page truncated out of
     /// the image becomes a marked fault instead of a dead process.
     #[cfg(target_os = "linux")]
@@ -97,7 +102,7 @@ impl GuestRam {
             .iter()
             .map(|&(gpa, size)| (GuestAddress(gpa), size as usize))
             .collect::<Vec<_>>();
-        let inner = GuestMemoryMmap::from_ranges(&ranges).map_err(|err| match err {
+        let inner = Ram::from_ranges(&ranges).map_err(|err| match err {
             FromRangesError::Collection(GuestRegionCollectionError::UnsortedMemoryRegions) => {
                 Error::Unsorted
             }
@@ -136,7 +141,7 @@ impl GuestRam {
         for &(gpa, size) in regions {
             let size = usize::try_from(size).map_err(|_| Error::Take)?;
             let offset = FileOffset::new(template.try_clone().map_err(|_| Error::Take)?, at);
-            let region = MmapRegion::build(
+            let region = MmapRegion::<AtomicBitmap>::build(
                 Some(offset),
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
@@ -146,7 +151,7 @@ impl GuestRam {
             mapped.push(GuestRegionMmap::new(region, GuestAddress(gpa)).ok_or(Error::Take)?);
             at = at.checked_add(size as u64).ok_or(Error::Take)?;
         }
-        let inner = GuestMemoryMmap::from_regions(mapped).map_err(|err| match err {
+        let inner = Ram::from_regions(mapped).map_err(|err| match err {
             GuestRegionCollectionError::UnsortedMemoryRegions => Error::Unsorted,
             GuestRegionCollectionError::MemoryRegionOverlap => Error::Overlap,
             _ => Error::Take,
@@ -186,8 +191,56 @@ impl GuestRam {
     /// Returns the regions as the `GuestMemoryMmap` taken by the kernel
     /// loader.
     #[cfg(all(feature = "boot", target_arch = "x86_64"))]
-    pub(crate) fn backing(&self) -> &GuestMemoryMmap {
+    pub(crate) fn backing(&self) -> &Ram {
         &self.inner
+    }
+
+    /// Mark pages the hypervisor logged in the region at `gpa`. `words`
+    /// holds one bit per page from bit 0 of the first word, as
+    /// `VmMemory::get_dirty_log` returns it.
+    pub fn mark(&self, gpa: u64, words: &[u64]) -> Result<()> {
+        let region = self
+            .inner
+            .find_region(GuestAddress(gpa))
+            .filter(|region| region.start_addr().0 == gpa)
+            .ok_or(Error::Unbacked { gpa, count: 0 })?;
+        let bitmap = MmapRegion::bitmap(region);
+        for (index, word) in words.iter().enumerate() {
+            let mut left = *word;
+            while left != 0 {
+                let bit = left.trailing_zeros() as usize;
+                left &= left - 1;
+                let at = (index * 64 + bit) as u64 * PAGE;
+                if at < region.len() {
+                    bitmap.set_addr_range(at as usize, PAGE as usize);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns whether any page in `count` bytes from `gpa` is marked.
+    /// Bytes outside the regions count as clean.
+    pub fn written(&self, gpa: u64, count: u64) -> bool {
+        let end = gpa.saturating_add(count);
+        let mut at = gpa;
+        while at < end {
+            let Some(region) = self.inner.find_region(GuestAddress(at)) else {
+                return false;
+            };
+            let start = region.start_addr().0;
+            let stop = end.min(start + region.len());
+            let bitmap = MmapRegion::bitmap(region);
+            let mut page = (at - start) & !(PAGE - 1);
+            while start + page < stop {
+                if bitmap.is_addr_set(page as usize) {
+                    return true;
+                }
+                page += PAGE;
+            }
+            at = stop;
+        }
+        false
     }
 
     pub fn write(&self, gpa: u64, bytes: &[u8]) -> Result<()> {
@@ -267,7 +320,6 @@ fn extent(template: &File) -> Result<u64> {
 mod tests {
     use crate::mem::*;
 
-    const PAGE: u64 = 4096;
     /// Start of the hole below 4G left for devices.
     const HOLE: u64 = 0xc000_0000;
 
@@ -346,6 +398,50 @@ mod tests {
             .join()
             .expect("writing thread")
             .expect("fill the socket");
+    }
+
+    #[test]
+    fn test_write_marks_page() {
+        let ram = GuestRam::new(&[(0, 1 << 20)]).expect("host pages");
+        assert!(!ram.written(0, 1 << 20));
+        ram.write(3 * PAGE + 8, &[1]).expect("write");
+        assert!(ram.written(3 * PAGE, PAGE));
+        assert!(ram.written(0, 1 << 20));
+        assert!(!ram.written(0, 3 * PAGE));
+        assert!(!ram.written(4 * PAGE, PAGE));
+        // A read marks nothing.
+        let mut byte = [0u8; 1];
+        ram.read(5 * PAGE, &mut byte).expect("read");
+        assert!(!ram.written(5 * PAGE, PAGE));
+    }
+
+    #[test]
+    fn test_fill_marks_pages() {
+        let ram = GuestRam::new(&[(0, 1 << 20)]).expect("host pages");
+        let mut source = file_of(&[0xa5u8; 2 * PAGE as usize], "marked");
+        ram.fill_from(PAGE, &mut source, 2 * PAGE as usize)
+            .expect("fill");
+        assert!(ram.written(PAGE, PAGE));
+        assert!(ram.written(2 * PAGE, PAGE));
+        assert!(!ram.written(3 * PAGE, PAGE));
+    }
+
+    #[test]
+    fn test_mark_from_log() {
+        let ram = GuestRam::new(&[(0, HOLE), (HOLE + (1 << 30), 1 << 20)]).expect("host pages");
+        // Bit 2 of the first word is page 2, bit 0 of the second is page 64.
+        ram.mark(0, &[0b100, 0b1]).expect("mark");
+        assert!(ram.written(2 * PAGE, PAGE));
+        assert!(ram.written(64 * PAGE, PAGE));
+        assert!(!ram.written(0, 2 * PAGE));
+        // Second region has its own log. A bit past its end is dropped.
+        ram.mark(HOLE + (1 << 30), &[0b1, 0, 0, 0, 0b1])
+            .expect("mark");
+        assert!(ram.written(HOLE + (1 << 30), PAGE));
+        assert!(!ram.written(HOLE + (1 << 30) + PAGE, (1 << 20) - PAGE));
+        // Each log covers a whole region, so an address inside one is
+        // refused.
+        assert!(ram.mark(PAGE, &[1]).is_err());
     }
 
     #[cfg(target_os = "linux")]
