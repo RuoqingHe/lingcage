@@ -23,3 +23,5 @@
 - [#2] Fix four reads rustc 1.98 refuses: drop three unused imports and take a constant chunk by
   `as_chunks_mut`.
 - [#8] Fix resume refused on a running guest: a guest resumed twice is left running.
+- [#10] Fix exit code under `--control`: a guest stopped on `--timeout` or by the escape key exits
+  124 and 0, as it does without a control socket.

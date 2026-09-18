@@ -886,33 +886,17 @@ mod imp {
         let terminal = Terminal::raw()?;
         machine.start()?;
         forward_input(machine.console(), stop.clone(), terminal.is_tty());
-        if let Some(orders) = &orders {
-            // Orders are served between two waits on the guest, so the one
-            // thread which holds the guest is the one which changes it.
-            let exit = drive(&mut machine, orders, timeout)?;
-            drop(terminal);
-            if let Some(code) = signalled() {
-                return Ok(code);
-            }
-            return Ok(exit_code(exit));
-        }
-        let exit = match timeout {
-            Some(within) => match machine.wait_timeout(within)? {
-                Some(exit) => exit,
-                None => {
-                    stop.stop()?;
-                    machine.wait()?;
-                    drop(terminal);
-                    eprintln!("lingcore: guest stopped after {} seconds", within.as_secs());
-                    return Ok(EXIT_TIMEOUT);
-                }
-            },
-            None => machine.wait()?,
-        };
+        let ended = drive(&mut machine, orders.as_ref(), timeout);
         drop(terminal);
+        let ended = ended?;
         if let Some(code) = signalled() {
             return Ok(code);
         }
+        let Some(exit) = ended else {
+            let within = timeout.expect("a deadline ran out");
+            eprintln!("lingcore: guest stopped after {} seconds", within.as_secs());
+            return Ok(EXIT_TIMEOUT);
+        };
         if ESCAPED.load(Ordering::SeqCst) {
             return Ok(0);
         }
@@ -934,24 +918,30 @@ mod imp {
         }
     }
 
-    /// Run the guest until it stops, serving orders in between. A guest
-    /// held still still answers, since the wait is a short one.
+    /// Wait on the guest until it ends, serving orders between waits when
+    /// a control socket is given. `None` once `timeout` ran out and the
+    /// guest was stopped.
     fn drive(
         machine: &mut Machine<KvmHv>,
-        orders: &control::Orders,
+        orders: Option<&control::Orders>,
         timeout: Option<Duration>,
-    ) -> Result<VmExit> {
+    ) -> Result<Option<VmExit>> {
         let deadline = timeout.map(|within| Instant::now() + within);
         loop {
-            while let Some(order) = orders.next() {
-                order.serve(machine);
+            // Orders are served between two waits on the guest, so the one
+            // thread which holds the guest is the one which changes it.
+            if let Some(orders) = orders {
+                while let Some(order) = orders.next() {
+                    order.serve(machine);
+                }
             }
             if let Some(exit) = machine.wait_timeout(SLICE)? {
-                return Ok(exit);
+                return Ok(Some(exit));
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 machine.stop()?;
-                return Ok(machine.wait()?);
+                machine.wait()?;
+                return Ok(None);
             }
         }
     }
