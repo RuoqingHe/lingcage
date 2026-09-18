@@ -15,6 +15,9 @@
   whose RAM image lost a page is stopped and `Error::LostPage` reported.
 - \[[#12](https://github.com/RuoqingHe/lingcage/pull/12)\] Add dirty page log to guest RAM:
   `GuestRam::mark` and `written` name the pages written since assembly.
+- \[[#12](https://github.com/RuoqingHe/lingcage/pull/12)\] Add dirty page capture:
+  `Machine::write_dirty` and the `snapshot` order with `"pages":"dirty"` write the pages written
+  since assembly and skip the rest.
 
 ### Changed
 
