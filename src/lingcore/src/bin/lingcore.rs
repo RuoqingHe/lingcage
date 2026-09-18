@@ -920,7 +920,7 @@ mod imp {
 
     /// Wait on the guest until it ends, serving orders between waits when
     /// a control socket is given. `None` once `timeout` ran out and the
-    /// guest was stopped.
+    /// guest was stopped, `LostPage` once its template lost a page.
     fn drive(
         machine: &mut Machine<KvmHv>,
         orders: Option<&control::Orders>,
@@ -937,6 +937,13 @@ mod imp {
             }
             if let Some(exit) = machine.wait_timeout(SLICE)? {
                 return Ok(Some(exit));
+            }
+            // A clone whose image lost a page runs on over a zero page, so
+            // it is stopped here and the loss reported.
+            if machine.faulted() {
+                machine.stop()?;
+                machine.wait()?;
+                return Err(lingcore::machine::Error::LostPage.into());
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 machine.stop()?;

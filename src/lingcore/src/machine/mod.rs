@@ -150,6 +150,9 @@ pub enum Error {
     /// `Config::kernel` is empty on a boot.
     #[error("guest needs a kernel")]
     NoKernel,
+    /// A page of the RAM image went missing under a clone, see `faulted`.
+    #[error("RAM image lost a page under the guest")]
+    LostPage,
     /// `Config::disks` holds more than `DISKS` of them.
     #[error("guest takes at most {DISKS} disks, {0} were named")]
     TooManyDisks(usize),
