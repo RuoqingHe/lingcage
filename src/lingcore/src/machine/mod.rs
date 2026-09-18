@@ -1314,8 +1314,12 @@ impl<H: Hypervisor> Machine<H> {
         }
     }
 
-    /// Set `Order::Run`, parked threads re-enter `run`.
+    /// Set `Order::Run`, parked threads re-enter `run`. A running guest is
+    /// left as it is.
     pub fn resume(&mut self) -> Result<()> {
+        if self.state == State::Running {
+            return Ok(());
+        }
         self.state.valid_transition(State::Running)?;
         self.orders.tell(Order::Run);
         self.state = State::Running;
