@@ -445,6 +445,71 @@ mod tests {
 
     #[cfg(all(feature = "kvm", target_os = "linux"))]
     #[test]
+    fn test_dirty_capture_writes_marked_pages() {
+        // First capture holds the pages the loader wrote. Marks are kept,
+        // so the second holds the same. One more write adds that page.
+        use std::os::unix::fs::MetadataExt;
+
+        use crate::boot::bzimage::tests::bzimage;
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+        /// `hlt` in a loop, the guest writes no memory.
+        const IDLE: [u8; 3] = [0xf4, 0xeb, 0xfd];
+        const RAM: u64 = 16 << 20;
+
+        let mut payload = vec![0u8; 0x200];
+        payload.extend_from_slice(&IDLE);
+        let image = std::env::temp_dir().join(format!("lingcore-dirty-{}", std::process::id()));
+        std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
+        let config = Config {
+            vcpus: 1,
+            cmdline: String::new(),
+            confine: None,
+            kernel: image.clone(),
+            memory: RAM,
+            ..Default::default()
+        };
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let mut machine = Machine::new(&hv, &config, Vec::new()).expect("assemble the guest");
+        std::fs::remove_file(&image).expect("remove the kernel image");
+        machine.start().expect("start the guest");
+        machine.pause().expect("pause the guest");
+
+        let capture = |tag: &str| {
+            let path =
+                std::env::temp_dir().join(format!("lingcore-delta-{tag}-{}", std::process::id()));
+            let mut out = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("open the delta");
+            machine
+                .write_dirty(&mut out)
+                .expect("write the dirty pages");
+            let held = out.metadata().expect("measure").blocks() * 512;
+            assert_eq!(out.metadata().expect("measure").len(), RAM);
+            std::fs::remove_file(&path).expect("remove the delta");
+            held
+        };
+        let loaded = capture("loaded");
+        assert!(loaded > 0, "loader wrote no page");
+        assert_eq!(capture("again"), loaded, "log was emptied by a capture");
+        machine.ram.write(RAM - 4096, &[1]).expect("write one page");
+        let one = capture("one");
+        assert!(
+            (loaded + 4096..loaded + IMAGE_CHUNK as u64).contains(&one),
+            "one page took {} bytes",
+            one - loaded
+        );
+
+        machine.stop().expect("stop");
+        machine.wait().expect("wait");
+    }
+
+    #[cfg(all(feature = "kvm", target_os = "linux"))]
+    #[test]
     fn test_pause_and_resume() {
         // Output stops while paused, state is readable, and resume works.
         use std::io;

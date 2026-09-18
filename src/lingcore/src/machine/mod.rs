@@ -86,6 +86,8 @@ const ENTROPY_SOURCE: &str = "/dev/urandom";
 /// Bytes of guest RAM which `write_memory` scans and writes as one
 /// piece. A zero piece becomes a hole in the image.
 const IMAGE_CHUNK: usize = 64 << 10;
+/// Page size. Dirty capture reads and writes whole pages.
+const PAGE: usize = 4096;
 
 /// Base of the token a host descriptor is reported with. Its token is
 /// the base plus index of the transport. Token of an ioeventfd is its
@@ -651,7 +653,6 @@ pub struct Machine<H: Hypervisor> {
     vm: H::Vm,
     /// Address space the host pages are mapped into. Dropping it unmaps
     /// them.
-    #[expect(dead_code, reason = "kept for the mappings")]
     memory: <H::Vm as Vm>::Memory,
     ram: GuestRam,
     devices: Devices,
@@ -755,8 +756,14 @@ impl<H: Hypervisor> Machine<H> {
         let since = |assembled: Instant| assembled.elapsed().as_secs_f64() * 1e3;
         let vm = hv.create_vm()?;
         let memory = vm.create_vm_memory()?;
+        // KVM logs the pages the guest writes, so a capture writes those
+        // and skips the rest.
+        let logged = MemMapOption {
+            log_dirty: true,
+            ..MemMapOption::default()
+        };
         for region in ram.regions() {
-            memory.mem_map(region.gpa, region.size, region.hva, MemMapOption::default())?;
+            memory.mem_map(region.gpa, region.size, region.hva, logged)?;
         }
         info!(
             "{} MiB of guest RAM mapped, {:.1} ms",
@@ -1011,6 +1018,70 @@ impl<H: Hypervisor> Machine<H> {
         }
         // Length is the start plus RAM size, no matter there are trailing
         // zeroes or not.
+        out.set_len(start + total).map_err(Error::Ram)?;
+        Ok(())
+    }
+
+    /// Write the pages written since assembly, laid out as `write_memory`
+    /// lays them, with a hole for each clean page. Pages the hypervisor
+    /// logged are marked first. `BadTransition` unless `Paused`.
+    pub fn write_dirty(&self, out: &mut File) -> Result<()> {
+        if self.state != State::Paused {
+            return Err(Error::BadTransition {
+                from: self.state,
+                to: State::Paused,
+            });
+        }
+        for region in self.ram.regions() {
+            let logged = self.memory.get_dirty_log(region.gpa)?;
+            self.ram.mark(region.gpa, &logged)?;
+        }
+        let start = out.stream_position().map_err(Error::Ram)?;
+        let mut total = 0u64;
+        // Buffer takes a whole chunk, since a run of marked pages is read
+        // in one call.
+        let mut page = vec![0u8; IMAGE_CHUNK];
+        for region in self.ram.regions() {
+            let mut at = 0u64;
+            while at < region.size {
+                // A chunk with no mark is skipped whole, one with a mark is
+                // walked in runs.
+                let chunk = IMAGE_CHUNK.min((region.size - at) as usize);
+                if !self.ram.written(region.gpa + at, chunk as u64) {
+                    out.seek(SeekFrom::Current(chunk as i64))
+                        .map_err(Error::Ram)?;
+                    at += chunk as u64;
+                    total += chunk as u64;
+                    continue;
+                }
+                // Pages next to each other move together, so a run of
+                // marked pages takes one read and one write and a run of
+                // unmarked ones a single seek.
+                let mut done = 0usize;
+                while done < chunk {
+                    let gpa = region.gpa + at + done as u64;
+                    let marked = self.ram.written(gpa, PAGE.min(chunk - done) as u64);
+                    let mut run = 0usize;
+                    while done + run < chunk {
+                        let step = PAGE.min(chunk - done - run);
+                        if self.ram.written(gpa + run as u64, step as u64) != marked {
+                            break;
+                        }
+                        run += step;
+                    }
+                    if marked {
+                        self.ram.read(gpa, &mut page[..run])?;
+                        out.write_all(&page[..run]).map_err(Error::Ram)?;
+                    } else {
+                        out.seek(SeekFrom::Current(run as i64))
+                            .map_err(Error::Ram)?;
+                    }
+                    done += run;
+                }
+                at += chunk as u64;
+                total += chunk as u64;
+            }
+        }
         out.set_len(start + total).map_err(Error::Ram)?;
         Ok(())
     }

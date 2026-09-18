@@ -40,8 +40,9 @@ pub enum Action {
     Resume,
     /// Write the guest to `at`, memory beside the document. Guest is held
     /// still first and left held, so `Resume` follows when it is wanted
-    /// back.
-    Snapshot { at: PathBuf },
+    /// back. `dirty` writes the pages written since assembly and skips the
+    /// rest.
+    Snapshot { at: PathBuf, dirty: bool },
     /// Stop the guest.
     Stop,
 }
@@ -91,7 +92,7 @@ pub fn apply<H: Hypervisor>(machine: &mut Machine<H>, action: &Action) -> Result
             .resume()
             .map(|()| Outcome::Done)
             .map_err(|err| Refused::Held(err.to_string())),
-        Action::Snapshot { at } => snapshot(machine, at).map(|()| Outcome::Done),
+        Action::Snapshot { at, dirty } => snapshot(machine, at, *dirty).map(|()| Outcome::Done),
         Action::Stop => machine
             .stop()
             .map(|()| Outcome::Stopping)
@@ -104,7 +105,11 @@ pub fn apply<H: Hypervisor>(machine: &mut Machine<H>, action: &Action) -> Result
 /// Guest is held before a page is read, so image holds one moment of it.
 /// A failure past that point leaves guest held and is reported as such:
 /// pages of a running guest would not match the document.
-fn snapshot<H: Hypervisor>(machine: &mut Machine<H>, at: &Path) -> Result<(), Refused> {
+fn snapshot<H: Hypervisor>(
+    machine: &mut Machine<H>,
+    at: &Path,
+    dirty: bool,
+) -> Result<(), Refused> {
     if machine.state() != State::Paused {
         machine
             .pause()
@@ -117,9 +122,11 @@ fn snapshot<H: Hypervisor>(machine: &mut Machine<H>, at: &Path) -> Result<(), Re
     // Pages of the guest are read out past this point, and one released
     // in the middle would leave an image of two moments.
     let mut memory = File::create(at.join(MEMORY)).map_err(|err| Refused::Held(err.to_string()))?;
-    machine
-        .write_memory(&mut memory)
-        .map_err(|err| Refused::Mutated(err.to_string()))?;
+    match dirty {
+        true => machine.write_dirty(&mut memory),
+        false => machine.write_memory(&mut memory),
+    }
+    .map_err(|err| Refused::Mutated(err.to_string()))?;
     let mut document =
         File::create(at.join(DOCUMENT)).map_err(|err| Refused::Mutated(err.to_string()))?;
     taken
@@ -148,6 +155,7 @@ pub fn parse(line: &str) -> Option<Action> {
         "resume" => Some(Action::Resume),
         "snapshot" => field(line, "at").map(|at| Action::Snapshot {
             at: PathBuf::from(at),
+            dirty: field(line, "pages") == Some("dirty"),
         }),
         "stop" => Some(Action::Stop),
         _ => None,
@@ -276,7 +284,15 @@ mod tests {
         assert_eq!(
             parse("{\"do\":\"snapshot\",\"at\":\"/tmp/one\"}"),
             Some(Action::Snapshot {
-                at: PathBuf::from("/tmp/one")
+                at: PathBuf::from("/tmp/one"),
+                dirty: false,
+            })
+        );
+        assert_eq!(
+            parse("{\"do\":\"snapshot\",\"at\":\"/tmp/one\",\"pages\":\"dirty\"}"),
+            Some(Action::Snapshot {
+                at: PathBuf::from("/tmp/one"),
+                dirty: true,
             })
         );
     }
