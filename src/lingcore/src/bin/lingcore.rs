@@ -30,7 +30,8 @@ mod imp {
     use lingcore::logging::{Logger, level_of};
     use lingcore::machine::snapshot::Snapshot;
     use lingcore::machine::{
-        Channel, Config, Disk, Link, Machine, MetadataConfig, Network, Share, StopHandle, control,
+        Channel, Config, Disk, Link, Machine, MetadataConfig, Network, Rate, Share, StopHandle,
+        control,
     };
     use lingcore::seccomp::Refusal;
 
@@ -137,10 +138,11 @@ mod imp {
         },
         Flag {
             name: "disk",
-            value: "FILE[:ro]",
+            value: "FILE[,ro][,bytes=N][,ops=N]",
             required: false,
             help: "file attached as a virtio-blk disk, /dev/vda in the guest, given once per \
-                   disk, `:ro` refuses writes",
+                   disk, `,ro` refuses writes, `,bytes=N` and `,ops=N` limit bytes and requests \
+                   per second, a comma in FILE is written `,,`",
         },
         Flag {
             name: "network",
@@ -487,13 +489,53 @@ mod imp {
         Ok(MetadataConfig { ip, document })
     }
 
-    /// Parse `--disk`, `FILE` or `FILE:ro`. An unreadable file is reported
-    /// by the open.
-    fn parse_disk(text: &str) -> Disk {
-        match text.strip_suffix(":ro") {
-            Some(at) => Disk::read_only(at),
-            None => Disk::writable(text),
+    /// Split the value of a flag at commas. `,,` is one comma inside a field.
+    fn fields(text: &str) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut field = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != ',' {
+                field.push(c);
+            } else if chars.peek() == Some(&',') {
+                chars.next();
+                field.push(',');
+            } else {
+                fields.push(std::mem::take(&mut field));
+            }
         }
+        fields.push(field);
+        fields
+    }
+
+    /// Parse `--disk`, `FILE[,ro][,bytes=N][,ops=N]`. An unreadable file is
+    /// reported by the open.
+    fn parse_disk(text: &str) -> std::result::Result<Disk, String> {
+        let shape = || format!("invalid disk {text}, use FILE[,ro][,bytes=N][,ops=N]");
+        let parts = fields(text);
+        let at = parts[0].as_str();
+        if at.is_empty() {
+            return Err(shape());
+        }
+        let mut disk = Disk::writable(at);
+        let mut rate = Rate::default();
+        for part in &parts[1..] {
+            match part.split_once('=') {
+                None if part == "ro" => disk.writable = false,
+                Some(("bytes", count)) => rate.bytes = parse_count(count).ok_or_else(shape)?,
+                Some(("ops", count)) => rate.requests = parse_count(count).ok_or_else(shape)?,
+                _ => return Err(shape()),
+            }
+        }
+        if rate != Rate::default() {
+            disk = disk.at_rate(rate);
+        }
+        Ok(disk)
+    }
+
+    /// Parse a count above zero. A K, M or G suffix is taken.
+    fn parse_count(text: &str) -> Option<u64> {
+        parse_scaled(text, &[('k', 1 << 10), ('m', 1 << 20), ('g', 1 << 30)], 1).filter(|n| *n > 0)
     }
 
     /// Parse `--share`, `TAG=DIR` or `TAG=DIR:ro`.
@@ -604,7 +646,11 @@ mod imp {
                 .unwrap_or("console=ttyS0")
                 .to_string(),
             memory: 512 << 20,
-            disks: parsed.each("disk").into_iter().map(parse_disk).collect(),
+            disks: parsed
+                .each("disk")
+                .into_iter()
+                .map(|text| parse_disk(text).map_err(usage_err))
+                .collect::<Result<Vec<_>>>()?,
             shares,
             ports,
             confine: Some(Refusal::Trap),
@@ -990,6 +1036,45 @@ mod imp {
             assert_eq!(config.memory, 1 << 30);
             assert_eq!(config.cmdline, "console=ttyS0");
             assert_eq!(config.confine, Some(Refusal::Trap));
+        }
+
+        #[test]
+        fn test_parse_disk_rate() {
+            let disk = parse_disk("d.img,ro,bytes=10M,ops=100").unwrap();
+            assert!(!disk.writable);
+            assert_eq!(
+                disk.rate,
+                Some(Rate {
+                    bytes: 10 << 20,
+                    requests: 100
+                })
+            );
+            let disk = parse_disk("d.img,bytes=1k").unwrap();
+            assert!(disk.writable);
+            assert_eq!(disk.rate.map(|rate| rate.bytes), Some(1 << 10));
+            assert_eq!(parse_disk("d.img").unwrap().rate, None);
+            assert_eq!(parse_disk("d.img,ro").unwrap().rate, None);
+            for text in [
+                "",
+                ",ro",
+                "d.img,fast",
+                "d.img,bytes=",
+                "d.img,bytes=0",
+                "d.img,ops=x",
+            ] {
+                assert!(parse_disk(text).is_err(), "{text} was taken");
+            }
+        }
+
+        #[test]
+        fn test_parse_disk_path() {
+            // Colon is kept in the path, and `,,` is taken as one comma.
+            let disk = parse_disk("/dev/disk/by-path/pci-0000:00:04.0,ro").unwrap();
+            assert_eq!(disk.at, PathBuf::from("/dev/disk/by-path/pci-0000:00:04.0"));
+            assert!(!disk.writable);
+            let disk = parse_disk("a,,b.img,bytes=1k").unwrap();
+            assert_eq!(disk.at, PathBuf::from("a,b.img"));
+            assert!(disk.rate.is_some());
         }
 
         #[test]
