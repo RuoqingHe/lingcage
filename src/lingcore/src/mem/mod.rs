@@ -48,6 +48,14 @@ pub enum Error {
         /// Guest address of the copy.
         gpa: u64,
     },
+    /// Failed to drop the host pages behind a range.
+    #[error("failed to drop {count:#x} bytes at guest address {gpa:#x}")]
+    Drop {
+        /// Guest address of the range.
+        gpa: u64,
+        /// Length of the range in bytes.
+        count: u64,
+    },
     /// Template mapped by a clone covers less than RAM of the guest.
     #[error("template is shorter than {size:#x} bytes of guest RAM")]
     ShortTemplate {
@@ -91,6 +99,9 @@ pub struct GuestRam {
     /// the image becomes a marked fault instead of a dead process.
     #[cfg(target_os = "linux")]
     watched: Option<Arc<fault::Watched>>,
+    /// Page size of the host. `discard` drops whole host pages only.
+    #[cfg(target_os = "linux")]
+    host_page: u64,
 }
 
 impl GuestRam {
@@ -115,7 +126,16 @@ impl GuestRam {
             inner: Arc::new(inner),
             #[cfg(target_os = "linux")]
             watched: None,
+            #[cfg(target_os = "linux")]
+            host_page: host_page(),
         })
+    }
+
+    /// Set host page size to `size`, for tests of a host with larger pages.
+    #[cfg(all(test, target_os = "linux"))]
+    fn with_host_page(mut self, size: u64) -> Self {
+        self.host_page = size;
+        self
     }
 
     /// Map the RAM image in `template` for each `(gpa, size)` region, with
@@ -165,6 +185,7 @@ impl GuestRam {
         Ok(GuestRam {
             inner,
             watched: Some(Arc::new(watched)),
+            host_page: host_page(),
         })
     }
 
@@ -243,6 +264,51 @@ impl GuestRam {
         false
     }
 
+    /// Drop the host pages behind `count` bytes at `gpa`, so they read as
+    /// zero, or as the template, on their next use. A range not covering
+    /// whole host pages is refused, since `madvise` drops whole ones only.
+    #[cfg(target_os = "linux")]
+    pub fn discard(&self, gpa: u64, count: u64) -> Result<()> {
+        if !(gpa | count).is_multiple_of(self.host_page) {
+            return Err(Error::Drop { gpa, count });
+        }
+        if !self.holds(gpa, count) {
+            return Err(Error::Unbacked {
+                gpa,
+                count: count as usize,
+            });
+        }
+        let end = gpa + count;
+        let mut at = gpa;
+        while at < end {
+            let region = self
+                .inner
+                .find_region(GuestAddress(at))
+                .ok_or(Error::Drop { gpa, count })?;
+            let start = region.start_addr().0;
+            let stop = end.min(start + region.len());
+            let hva = region.as_ptr() as usize + (at - start) as usize;
+            // SAFETY: the range lies inside a region mapped for as long as
+            // `inner` lives, and `MADV_DONTNEED` only drops its pages.
+            let dropped = unsafe {
+                libc::madvise(
+                    hva as *mut libc::c_void,
+                    (stop - at) as usize,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if dropped != 0 {
+                return Err(Error::Drop { gpa, count });
+            }
+            // Dropped page holds no data required by a capture, so its mark is
+            // cleared as well.
+            MmapRegion::bitmap(region)
+                .reset_addr_range((at - start) as usize, (stop - at) as usize);
+            at = stop;
+        }
+        Ok(())
+    }
+
     pub fn write(&self, gpa: u64, bytes: &[u8]) -> Result<()> {
         self.inner
             .write_slice(bytes, GuestAddress(gpa))
@@ -303,6 +369,14 @@ impl GuestRam {
                 count: bytes.len(),
             })
     }
+}
+
+/// Returns the page size of the host.
+#[cfg(target_os = "linux")]
+fn host_page() -> u64 {
+    // SAFETY: `sysconf` takes a name and touches no memory of ours.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(size).unwrap_or(PAGE)
 }
 
 /// Returns how far `template` reaches. A block device holds no length in
@@ -413,6 +487,51 @@ mod tests {
         let mut byte = [0u8; 1];
         ram.read(5 * PAGE, &mut byte).expect("read");
         assert!(!ram.written(5 * PAGE, PAGE));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_discard_zeroes_pages() {
+        let ram = GuestRam::new(&[(0, 1 << 20)]).expect("host pages");
+        ram.write(PAGE, &[0xa5u8; 2 * PAGE as usize])
+            .expect("write");
+        ram.discard(PAGE, 2 * PAGE).expect("discard");
+        let mut back = [0xffu8; 8];
+        ram.read(PAGE, &mut back).expect("read");
+        assert_eq!(back, [0u8; 8]);
+        ram.read(3 * PAGE - 8, &mut back).expect("read");
+        assert_eq!(back, [0u8; 8]);
+        assert!(ram.discard(1 << 20, PAGE).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_discard_refuses_part_of_page() {
+        let ram = GuestRam::new(&[(0, 1 << 20)]).expect("host pages");
+        ram.write(PAGE, &[0xa5u8; PAGE as usize]).expect("write");
+        assert!(ram.discard(PAGE, 1).is_err(), "part of a page dropped");
+        assert!(
+            ram.discard(PAGE + 8, PAGE).is_err(),
+            "unaligned range dropped"
+        );
+        let mut back = [0u8; 1];
+        ram.read(2 * PAGE - 1, &mut back).expect("read");
+        assert_eq!(back, [0xa5], "rest of the page lost");
+        // On a host of 16 KiB pages, a page of 4 KiB is part of a host page.
+        let ram = ram.with_host_page(4 * PAGE);
+        assert!(ram.discard(4 * PAGE, PAGE).is_err(), "part dropped");
+        ram.discard(4 * PAGE, 4 * PAGE).expect("whole host page");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_discard_clears_its_mark() {
+        // Dropped page is left out of the next capture.
+        let ram = GuestRam::new(&[(0, 1 << 20)]).expect("host pages");
+        ram.write(3 * PAGE + 8, &[1]).expect("write");
+        assert!(ram.written(3 * PAGE, PAGE));
+        ram.discard(3 * PAGE, PAGE).expect("drop the page");
+        assert!(!ram.written(3 * PAGE, PAGE), "dropped page still marked");
     }
 
     #[test]

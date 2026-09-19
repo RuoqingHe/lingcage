@@ -18,6 +18,8 @@
 - \[[#12](https://github.com/RuoqingHe/lingcage/pull/12)\] Add dirty page capture:
   `Machine::write_dirty` and the `snapshot` order with `"pages":"dirty"` write the pages written
   since assembly and skip the rest.
+- \[[#13](https://github.com/RuoqingHe/lingcage/pull/13)\] Introduce balloon device: pages the guest
+  reports free are dropped on the host.
 
 ### Changed
 

@@ -9,6 +9,8 @@
 
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+pub mod balloon;
 pub mod block;
 pub mod console;
 pub mod entropy;
