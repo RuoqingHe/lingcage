@@ -46,3 +46,5 @@
   guest resumed twice is left running.
 - \[[#10](https://github.com/RuoqingHe/lingcage/pull/10)\] Fix exit code under `--control`: a guest
   stopped on `--timeout` or by the escape key exits 124 and 0, as it does without a control socket.
+- \[[#15](https://github.com/RuoqingHe/lingcage/pull/15)\] Fix shared directory refused with network
+  stack: the device thread of a guest given `--network user` and `--share` takes the calls of both.
