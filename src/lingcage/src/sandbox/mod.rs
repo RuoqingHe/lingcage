@@ -552,6 +552,7 @@ fn assemble(
         }),
         network: None,
         confine: Some(Refusal::Trap),
+        balloon: false,
     };
     let sink = Sink::default();
     let image = template.ram().try_clone().map_err(Error::Io)?;

@@ -248,6 +248,7 @@ impl TemplateStore {
             }),
             network: None,
             confine: Some(Refusal::Trap),
+            balloon: false,
         };
         let mut machine = Machine::new(hv.core(), &config, sink).map_err(Error::Lingcore)?;
         machine.start().map_err(Error::Lingcore)?;
