@@ -55,14 +55,14 @@ pub enum Thread {
     Vcpu,
     /// Waits on an ioeventfd, serves the rings and raises the line of the
     /// device.
-    Device,
-    /// Same as `Device`, plus the host sockets opened by the network stack
-    /// running in this process.
-    #[cfg(feature = "netstack")]
-    Stack,
-    /// Same as `Device`, plus calls a shared directory is served with. A
-    /// guest without one keeps the narrower list.
-    Sharing,
+    Device {
+        /// Set if the network link is the stack in this process,
+        /// `Link::User`, the thread then opens host sockets.
+        user_net: bool,
+        /// Set if a directory of the host is served, the thread then
+        /// reaches the filesystem.
+        fs: bool,
+    },
 }
 
 /// Action on a syscall outside of the allowlist.
@@ -138,10 +138,7 @@ impl Thread {
     fn tag(self) -> &'static str {
         match self {
             Thread::Vcpu => "vcpu",
-            Thread::Device => "device",
-            #[cfg(feature = "netstack")]
-            Thread::Stack => "stack",
-            Thread::Sharing => "sharing",
+            Thread::Device { .. } => "device",
         }
     }
 
@@ -192,89 +189,87 @@ impl Thread {
             // socket per connection. `ioctl` is for `FIONBIO`, and on riscv64
             // for `KVM_IRQ_LINE` which raises the line of a device. `socket`
             // is for `AF_UNIX` only, other family is refused.
-            Thread::Device => Ok(BTreeMap::from([
-                (libc::SYS_accept4, Vec::new()),
-                (libc::SYS_close, Vec::new()),
-                (libc::SYS_connect, Vec::new()),
-                (libc::SYS_fcntl, Vec::new()),
-                (libc::SYS_fdatasync, Vec::new()),
-                (libc::SYS_lseek, Vec::new()),
-                (SYS_POLL, Vec::new()),
-                (libc::SYS_read, Vec::new()),
-                (libc::SYS_recvfrom, Vec::new()),
-                (libc::SYS_sendto, Vec::new()),
-                (libc::SYS_shutdown, Vec::new()),
-                (
-                    libc::SYS_ioctl,
-                    vec![
-                        request(FIONBIO)?,
-                        #[cfg(target_arch = "riscv64")]
-                        request(KVM_IRQ_LINE)?,
-                    ],
-                ),
-                (libc::SYS_socket, vec![family(libc::AF_UNIX)?]),
-            ])),
-            // A shared directory is walked, opened, read and written, and
-            // a guest asking for room reaches `statfs`. Paths served are
-            // held inside the directory the device was given.
-            Thread::Sharing => {
-                let mut list = Thread::Device.extras()?;
-                for call in [
-                    libc::SYS_openat,
-                    libc::SYS_statx,
-                    libc::SYS_newfstatat,
-                    libc::SYS_getdents64,
-                    libc::SYS_write,
-                    libc::SYS_fsync,
-                    libc::SYS_ftruncate,
-                    libc::SYS_statfs,
-                    libc::SYS_fstatfs,
-                    libc::SYS_mkdirat,
-                    libc::SYS_unlinkat,
-                    libc::SYS_renameat2,
-                    libc::SYS_symlinkat,
-                    libc::SYS_readlinkat,
-                    libc::SYS_fchmodat,
-                    libc::SYS_utimensat,
-                    // glibc of x86_64 still reaches the calls which name a
-                    // path of their own, the other architectures have only
-                    // the `*at` forms above.
-                    #[cfg(target_arch = "x86_64")]
-                    libc::SYS_fstat,
-                    #[cfg(target_arch = "x86_64")]
-                    libc::SYS_mkdir,
-                    #[cfg(target_arch = "x86_64")]
-                    libc::SYS_rmdir,
-                    #[cfg(target_arch = "x86_64")]
-                    libc::SYS_unlink,
-                    #[cfg(target_arch = "x86_64")]
-                    libc::SYS_rename,
-                    #[cfg(target_arch = "x86_64")]
-                    libc::SYS_renameat,
-                    #[cfg(target_arch = "x86_64")]
-                    libc::SYS_symlink,
-                    #[cfg(target_arch = "x86_64")]
-                    libc::SYS_readlink,
-                ] {
-                    list.insert(call, Vec::new());
+            Thread::Device { user_net, fs } => {
+                let mut list = BTreeMap::from([
+                    (libc::SYS_accept4, Vec::new()),
+                    (libc::SYS_close, Vec::new()),
+                    (libc::SYS_connect, Vec::new()),
+                    (libc::SYS_fcntl, Vec::new()),
+                    (libc::SYS_fdatasync, Vec::new()),
+                    (libc::SYS_lseek, Vec::new()),
+                    (SYS_POLL, Vec::new()),
+                    (libc::SYS_read, Vec::new()),
+                    (libc::SYS_recvfrom, Vec::new()),
+                    (libc::SYS_sendto, Vec::new()),
+                    (libc::SYS_shutdown, Vec::new()),
+                    (
+                        libc::SYS_ioctl,
+                        vec![
+                            request(FIONBIO)?,
+                            #[cfg(target_arch = "riscv64")]
+                            request(KVM_IRQ_LINE)?,
+                        ],
+                    ),
+                    (libc::SYS_socket, vec![family(libc::AF_UNIX)?]),
+                ]);
+                // A shared directory is walked, opened, read and written, and
+                // a guest asking for room reaches `statfs`. Paths served are
+                // held inside the directory the device was given.
+                if fs {
+                    for call in [
+                        libc::SYS_openat,
+                        libc::SYS_statx,
+                        libc::SYS_newfstatat,
+                        libc::SYS_getdents64,
+                        libc::SYS_write,
+                        libc::SYS_fsync,
+                        libc::SYS_ftruncate,
+                        libc::SYS_statfs,
+                        libc::SYS_fstatfs,
+                        libc::SYS_mkdirat,
+                        libc::SYS_unlinkat,
+                        libc::SYS_renameat2,
+                        libc::SYS_symlinkat,
+                        libc::SYS_readlinkat,
+                        libc::SYS_fchmodat,
+                        libc::SYS_utimensat,
+                        // glibc of x86_64 still reaches the calls which name a
+                        // path of their own, the other architectures have only
+                        // the `*at` forms above.
+                        #[cfg(target_arch = "x86_64")]
+                        libc::SYS_fstat,
+                        #[cfg(target_arch = "x86_64")]
+                        libc::SYS_mkdir,
+                        #[cfg(target_arch = "x86_64")]
+                        libc::SYS_rmdir,
+                        #[cfg(target_arch = "x86_64")]
+                        libc::SYS_unlink,
+                        #[cfg(target_arch = "x86_64")]
+                        libc::SYS_rename,
+                        #[cfg(target_arch = "x86_64")]
+                        libc::SYS_renameat,
+                        #[cfg(target_arch = "x86_64")]
+                        libc::SYS_symlink,
+                        #[cfg(target_arch = "x86_64")]
+                        libc::SYS_readlink,
+                    ] {
+                        list.insert(call, Vec::new());
+                    }
                 }
-                Ok(list)
-            }
-            // The stack opens `AF_INET` sockets as well, binds the UDP ones,
-            // asks a connect how it went through `getpeername` and
-            // `getsockopt`, and its hash maps draw their keys from
-            // `getrandom`.
-            #[cfg(feature = "netstack")]
-            Thread::Stack => {
-                let mut list = Thread::Device.extras()?;
-                list.insert(libc::SYS_bind, Vec::new());
-                list.insert(libc::SYS_getrandom, Vec::new());
-                list.insert(libc::SYS_getpeername, Vec::new());
-                list.insert(libc::SYS_getsockopt, Vec::new());
-                list.insert(
-                    libc::SYS_socket,
-                    vec![family(libc::AF_UNIX)?, family(libc::AF_INET)?],
-                );
+                // The stack opens `AF_INET` sockets as well, binds the UDP
+                // ones, asks a connect how it went through `getpeername` and
+                // `getsockopt`, and its hash maps draw their keys from
+                // `getrandom`.
+                if user_net {
+                    list.insert(libc::SYS_bind, Vec::new());
+                    list.insert(libc::SYS_getrandom, Vec::new());
+                    list.insert(libc::SYS_getpeername, Vec::new());
+                    list.insert(libc::SYS_getsockopt, Vec::new());
+                    list.insert(
+                        libc::SYS_socket,
+                        vec![family(libc::AF_UNIX)?, family(libc::AF_INET)?],
+                    );
+                }
                 Ok(list)
             }
         }
@@ -350,6 +345,12 @@ mod tests {
         .expect("join confined thread")
     }
 
+    /// Device thread with neither stack nor shared directory.
+    const BARE: Thread = Thread::Device {
+        user_net: false,
+        fs: false,
+    };
+
     /// Returns the last errno without further syscall.
     fn errno() -> i32 {
         std::io::Error::last_os_error()
@@ -361,9 +362,11 @@ mod tests {
     fn test_extras_disjoint_from_common() {
         for thread in [
             Thread::Vcpu,
-            Thread::Device,
-            #[cfg(feature = "netstack")]
-            Thread::Stack,
+            BARE,
+            Thread::Device {
+                user_net: true,
+                fs: false,
+            },
         ] {
             for number in thread.extras().expect("assemble extras").keys() {
                 assert!(
@@ -450,7 +453,7 @@ mod tests {
     fn test_device_thread_refuses_kvm_run() {
         // `KVM_RUN` is refused on a device thread, `lseek` reaches the
         // kernel.
-        let (entering, seeking): (Answer, Answer) = under(Thread::Device, || {
+        let (entering, seeking): (Answer, Answer) = under(BARE, || {
             // SAFETY: -1 is not an open descriptor.
             let entering = unsafe { libc::ioctl(-1, KVM_RUN as _, 0) };
             let entering = (entering as libc::c_long, errno());
@@ -465,6 +468,32 @@ mod tests {
         );
         assert_eq!(seeking, (-1, libc::EBADF), "lseek did not reach the kernel");
     }
+
+    #[test]
+    fn test_device_thread_takes_user_net_and_fs_calls() {
+        // `fs` adds `fsync` and `user_net` adds `bind`. Both name a closed
+        // descriptor, so `EBADF` shows the kernel ran the call.
+        let both = Thread::Device {
+            user_net: true,
+            fs: true,
+        };
+        let (flushing, binding): (Answer, Answer) = under(both, || {
+            // SAFETY: `fsync` takes no pointer.
+            let flushing = unsafe { libc::fsync(-1) };
+            let flushing = (flushing as libc::c_long, errno());
+            // SAFETY: -1 is not an open descriptor, the kernel fails the call
+            // before reading the address.
+            let binding = unsafe { libc::bind(-1, std::ptr::null(), 0) };
+            (flushing, (binding as libc::c_long, errno()))
+        });
+        assert_eq!(
+            flushing,
+            (-1, libc::EBADF),
+            "fsync did not reach the kernel"
+        );
+        assert_eq!(binding, (-1, libc::EBADF), "bind did not reach the kernel");
+    }
+
     #[test]
     fn test_sigsys_report() {
         // Report names the thread and the syscall number. It is read from
