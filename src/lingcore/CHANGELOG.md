@@ -20,6 +20,8 @@
   since assembly and skip the rest.
 - \[[#13](https://github.com/RuoqingHe/lingcage/pull/13)\] Introduce balloon device: pages the guest
   reports free are dropped on the host.
+- \[[#13](https://github.com/RuoqingHe/lingcage/pull/13)\] Add balloon to a guest: `Config::balloon`
+  and `--balloon` place the device.
 
 ### Changed
 

@@ -21,6 +21,8 @@ use thiserror::Error;
 
 use crate::devices::bus::Bus;
 use crate::devices::serial::Serial;
+#[cfg(target_os = "linux")]
+use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::Block;
 use crate::devices::virtio::console::{Console, Reach};
 use crate::devices::virtio::entropy::Entropy;
@@ -384,6 +386,8 @@ pub struct Config {
     /// Action on a syscall outside allowlist of a thread. `None` installs
     /// no allowlist.
     pub confine: Option<Refusal>,
+    /// Balloon device, host reuses pages reported free by the guest.
+    pub balloon: bool,
 }
 
 impl Default for Config {
@@ -400,6 +404,7 @@ impl Default for Config {
             channel: None,
             network: None,
             confine: None,
+            balloon: false,
         }
     }
 }
@@ -413,6 +418,7 @@ fn virtio_count(config: &Config) -> u8 {
         + u8::from(!config.ports.is_empty())
         + u8::from(config.channel.is_some())
         + u8::from(config.network.is_some())
+        + u8::from(config.balloon)
 }
 
 /// Returns MMIO address of virtio register block `slot`.
@@ -875,6 +881,10 @@ impl<H: Hypervisor> Machine<H> {
                 None => carrier,
             };
             devices.push(Box::new(Net::new(network.mac, carrier)));
+        }
+        #[cfg(target_os = "linux")]
+        if config.balloon {
+            devices.push(Box::new(Balloon::new()));
         }
         let mut wired = Vec::with_capacity(devices.len());
         for (slot, device) in devices.into_iter().enumerate() {

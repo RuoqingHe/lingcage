@@ -228,6 +228,12 @@ mod imp {
             help: "write log lines to FILE instead of stderr",
         },
         Flag {
+            name: "balloon",
+            value: "",
+            required: false,
+            help: "give the guest a balloon device, host reuses pages reported free by the guest",
+        },
+        Flag {
             name: "verbose",
             value: "",
             required: false,
@@ -331,7 +337,11 @@ mod imp {
                 if inline.is_some() {
                     return Err(usage_err(format!("flag --{name} takes no value")));
                 }
-                parsed.verbose = parsed.verbose.saturating_add(1);
+                if flag.name == "verbose" {
+                    parsed.verbose = parsed.verbose.saturating_add(1);
+                } else {
+                    parsed.values.push((flag.name, String::new()));
+                }
                 continue;
             }
             let value = match inline {
@@ -586,6 +596,7 @@ mod imp {
         };
         let mut config = Config {
             kernel: PathBuf::from(kernel),
+            balloon: parsed.value("balloon").is_some(),
             channel,
             initrd: parsed.value("initrd").map(PathBuf::from),
             cmdline: parsed
@@ -982,6 +993,17 @@ mod imp {
         }
 
         #[test]
+        fn test_balloon_flag() {
+            let args: Vec<String> = ["--kernel", "k", "--balloon"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            assert!(config_of(&parse(&args).unwrap()).unwrap().balloon);
+            let args: Vec<String> = ["--kernel", "k"].iter().map(|s| s.to_string()).collect();
+            assert!(!config_of(&parse(&args).unwrap()).unwrap().balloon);
+        }
+
+        #[test]
         fn test_restore_takes_no_kernel() {
             let args: Vec<String> = ["--restore", "capture"]
                 .iter()
@@ -1006,6 +1028,7 @@ mod imp {
                 vec!["--kernel", "k", "--metadata", "169.254.169.254=doc.json"],
                 vec!["--kernel", "k", "--timeout", "soon"],
                 vec!["--kernel", "k", "--verbose=2"],
+                vec!["--kernel", "k", "--balloon=1"],
                 vec!["--kernel", "k", "-vx"],
                 vec!["--kernel", "k", "extra"],
                 vec!["--kernel", "k", "--flag"],
