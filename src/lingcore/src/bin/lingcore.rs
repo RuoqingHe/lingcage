@@ -30,7 +30,8 @@ mod imp {
     use lingcore::logging::{Logger, level_of};
     use lingcore::machine::snapshot::Snapshot;
     use lingcore::machine::{
-        Channel, Config, Disk, Link, Machine, MetadataConfig, Network, Share, StopHandle, control,
+        Channel, Config, Disk, Link, Machine, MetadataConfig, Network, Rate, Share, StopHandle,
+        control,
     };
     use lingcore::seccomp::Refusal;
 
@@ -137,10 +138,11 @@ mod imp {
         },
         Flag {
             name: "disk",
-            value: "FILE[:ro]",
+            value: "FILE[:ro][:bytes=N][:ops=N]",
             required: false,
             help: "file attached as a virtio-blk disk, /dev/vda in the guest, given once per \
-                   disk, `:ro` refuses writes",
+                   disk, `:ro` refuses writes, `:bytes=N` and `:ops=N` limit bytes and requests \
+                   per second",
         },
         Flag {
             name: "network",
@@ -487,13 +489,34 @@ mod imp {
         Ok(MetadataConfig { ip, document })
     }
 
-    /// Parse `--disk`, `FILE` or `FILE:ro`. An unreadable file is reported
+    /// Parse `--disk`, `FILE[:ro][:bytes=N][:ops=N]`.
     /// by the open.
-    fn parse_disk(text: &str) -> Disk {
-        match text.strip_suffix(":ro") {
-            Some(at) => Disk::read_only(at),
-            None => Disk::writable(text),
+    fn parse_disk(text: &str) -> std::result::Result<Disk, String> {
+        let shape = || format!("invalid disk {text}, use FILE[:ro][:bytes=N][:ops=N]");
+        let mut parts = text.split(':');
+        let at = parts.next().unwrap_or_default();
+        if at.is_empty() {
+            return Err(shape());
         }
+        let mut disk = Disk::writable(at);
+        let mut rate = Rate::default();
+        for part in parts {
+            match part.split_once('=') {
+                None if part == "ro" => disk.writable = false,
+                Some(("bytes", count)) => rate.bytes = parse_count(count).ok_or_else(shape)?,
+                Some(("ops", count)) => rate.requests = parse_count(count).ok_or_else(shape)?,
+                _ => return Err(shape()),
+            }
+        }
+        if rate != Rate::default() {
+            disk = disk.at_rate(rate);
+        }
+        Ok(disk)
+    }
+
+    /// Parse a count above zero. A K, M or G suffix is taken.
+    fn parse_count(text: &str) -> Option<u64> {
+        parse_scaled(text, &[('k', 1 << 10), ('m', 1 << 20), ('g', 1 << 30)], 1).filter(|n| *n > 0)
     }
 
     /// Parse `--share`, `TAG=DIR` or `TAG=DIR:ro`.
@@ -604,7 +627,11 @@ mod imp {
                 .unwrap_or("console=ttyS0")
                 .to_string(),
             memory: 512 << 20,
-            disks: parsed.each("disk").into_iter().map(parse_disk).collect(),
+            disks: parsed
+                .each("disk")
+                .into_iter()
+                .map(|text| parse_disk(text).map_err(usage_err))
+                .collect::<Result<Vec<_>>>()?,
             shares,
             ports,
             confine: Some(Refusal::Trap),
@@ -990,6 +1017,34 @@ mod imp {
             assert_eq!(config.memory, 1 << 30);
             assert_eq!(config.cmdline, "console=ttyS0");
             assert_eq!(config.confine, Some(Refusal::Trap));
+        }
+
+        #[test]
+        fn test_parse_disk_rate() {
+            let disk = parse_disk("d.img:ro:bytes=10M:ops=100").unwrap();
+            assert!(!disk.writable);
+            assert_eq!(
+                disk.rate,
+                Some(Rate {
+                    bytes: 10 << 20,
+                    requests: 100
+                })
+            );
+            let disk = parse_disk("d.img:bytes=1k").unwrap();
+            assert!(disk.writable);
+            assert_eq!(disk.rate.map(|rate| rate.bytes), Some(1 << 10));
+            assert_eq!(parse_disk("d.img").unwrap().rate, None);
+            assert_eq!(parse_disk("d.img:ro").unwrap().rate, None);
+            for text in [
+                "",
+                ":ro",
+                "d.img:fast",
+                "d.img:bytes=",
+                "d.img:bytes=0",
+                "d.img:ops=x",
+            ] {
+                assert!(parse_disk(text).is_err(), "{text} was taken");
+            }
         }
 
         #[test]
