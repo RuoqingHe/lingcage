@@ -335,7 +335,11 @@ impl Transport {
     }
 
     /// Returns the longest time the device can wait, see `Device::wake_after`.
+    /// `None` while no queue is built, since `notify` could not serve it.
     pub fn wake_after(&self) -> Option<Duration> {
+        if self.queues.iter().all(|slot| slot.queue.is_none()) {
+            return None;
+        }
         self.device.wake_after()
     }
 
@@ -1162,10 +1166,10 @@ mod tests {
     }
 
     #[test]
-    fn test_wake_after_passthrough() {
+    fn test_wake_after_needs_built_queue() {
         let line = Counter(Arc::new(AtomicUsize::new(0)));
         let ram = GuestRam::new(&[(0, RAM_SIZE)]).expect("host pages");
-        let mmio = Transport::new(
+        let mut mmio = Transport::new(
             Box::new(Filler {
                 wake: Some(Duration::from_millis(40)),
                 ..Default::default()
@@ -1174,6 +1178,15 @@ mod tests {
             Box::new(line.clone()),
         );
 
+        // No deadline is reported before a queue is built or after a reset.
+        assert_eq!(mmio.wake_after(), None);
+        set(&mut mmio, QUEUE_NUM, 8);
+        set(&mut mmio, QUEUE_DESC_LOW, DESC_TABLE as u32);
+        set(&mut mmio, QUEUE_AVAIL_LOW, AVAIL_RING as u32);
+        set(&mut mmio, QUEUE_USED_LOW, USED_RING as u32);
+        set(&mut mmio, QUEUE_READY, 1);
         assert_eq!(mmio.wake_after(), Some(Duration::from_millis(40)));
+        set(&mut mmio, STATUS, 0);
+        assert_eq!(mmio.wake_after(), None);
     }
 }

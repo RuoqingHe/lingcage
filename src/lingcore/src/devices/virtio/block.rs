@@ -9,6 +9,7 @@
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom};
+use std::time::{Duration, Instant};
 
 use crate::devices::virtio::queue::{Chain, Descriptor, Queue};
 use crate::devices::virtio::{Device, Error, Result};
@@ -40,11 +41,102 @@ const IOERR: u8 = 1;
 /// `VIRTIO_BLK_S_UNSUPP`, request type or shape is not supported.
 const UNSUPPORTED: u8 = 2;
 
+/// Rate limit of a disk, in bytes and in requests per second, with a burst
+/// of one second's worth. A field of zero is not limited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rate {
+    /// Bytes moved a second.
+    pub bytes: u64,
+    /// Requests served a second.
+    pub requests: u64,
+}
+
+/// Token bucket used to limit bytes or requests of a disk. It is refilled
+/// at `rate` tokens per second and holds at most one second's worth.
+struct Bucket {
+    /// Tokens refilled per second.
+    rate: u64,
+    /// Tokens held. Below zero while the bucket is in debt.
+    held: f64,
+    /// Time `held` was last refilled.
+    filled: Instant,
+}
+
+impl Bucket {
+    /// Create a full bucket for `rate` tokens per second.
+    fn new(rate: u64) -> Self {
+        Bucket {
+            rate,
+            held: rate as f64,
+            filled: Instant::now(),
+        }
+    }
+
+    /// Take `cost` tokens, or return time to wait for them. Cost over one
+    /// second's worth is taken from a full bucket and leaves it in debt.
+    fn take(&mut self, cost: u64) -> Option<Duration> {
+        let now = Instant::now();
+        let rate = self.rate as f64;
+        let earned = now.duration_since(self.filled).as_secs_f64() * rate;
+        self.held = (self.held + earned).min(rate);
+        self.filled = now;
+        let want = (cost as f64).min(rate);
+        if want > self.held {
+            return Some(Duration::from_secs_f64((want - self.held) / rate));
+        }
+        self.held -= cost as f64;
+        None
+    }
+
+    /// Put `cost` tokens back, since the other bucket is short.
+    fn refund(&mut self, cost: u64) {
+        self.held = (self.held + cost as f64).min(self.rate as f64);
+    }
+}
+
+/// Rate limiter of a disk, with one bucket for bytes and one for requests.
+/// A bucket is `None` if its field of `Rate` is zero.
+struct Throttle {
+    bytes: Option<Bucket>,
+    requests: Option<Bucket>,
+}
+
+impl Throttle {
+    /// Create the buckets of a disk served at `rate`.
+    fn new(rate: Rate) -> Self {
+        Throttle {
+            bytes: (rate.bytes > 0).then(|| Bucket::new(rate.bytes)),
+            requests: (rate.requests > 0).then(|| Bucket::new(rate.requests)),
+        }
+    }
+
+    /// Take the cost of one request moving `bytes`. If either bucket is
+    /// short, no token is taken and time to wait is returned.
+    fn take(&mut self, bytes: u64) -> Option<Duration> {
+        if let Some(wait) = self.requests.as_mut().and_then(|bucket| bucket.take(1)) {
+            return Some(wait);
+        }
+        if let Some(wait) = self.bytes.as_mut().and_then(|bucket| bucket.take(bytes)) {
+            if let Some(requests) = &mut self.requests {
+                requests.refund(1);
+            }
+            return Some(wait);
+        }
+        None
+    }
+}
+
 /// Block device backed by a file.
 pub struct Block {
     disk: File,
     sectors: u64,
     writable: bool,
+    /// Rate limit of the disk. `None` serves it as fast as the host reads.
+    throttle: Option<Throttle>,
+    /// Next time a held request is served.
+    due: Option<Instant>,
+    /// Requests held back by the rate.
+    deferred: u64,
 }
 
 impl Block {
@@ -60,7 +152,16 @@ impl Block {
             disk,
             sectors: bytes / SECTOR,
             writable,
+            throttle: None,
+            due: None,
+            deferred: 0,
         })
+    }
+
+    /// Serve the disk at `rate`.
+    pub fn at_rate(mut self, rate: Rate) -> Self {
+        self.throttle = Some(Throttle::new(rate));
+        self
     }
 }
 
@@ -105,17 +206,45 @@ impl Device for Block {
         u64::from_le_bytes(answer)
     }
 
+    /// Returns time until a held request is served.
+    fn wake_after(&self) -> Option<Duration> {
+        self.due
+            .map(|due| due.saturating_duration_since(Instant::now()))
+    }
+
+    /// Returns requests held back by the rate.
+    fn counts(&self) -> Vec<(&'static str, u64)> {
+        vec![("deferred", self.deferred)]
+    }
+
     /// Serve each request in `queue`. Chain without status byte is reported
     /// as `Error::Request`, any other fault is reported in the status byte.
     fn notify(&mut self, _index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
+        // Deadline is set again below if a request is held.
+        self.due = None;
         while let Some(chain) = queue.pop(ram)? {
             let answer = answer_in(&chain).ok_or(Error::Request)?;
+            // Request past the rate returns to the ring. Device wakes once
+            // the bucket holds its cost.
+            if let Some(throttle) = &mut self.throttle
+                && let Some(wait) = throttle.take(payload(&chain))
+            {
+                queue.undo_pop();
+                self.due = Some(Instant::now() + wait);
+                self.deferred += 1;
+                return Ok(());
+            }
             let (status, written) = self.serve(&chain, ram);
             ram.write(answer, &[status])
                 .map_err(|_| Error::Ring { gpa: answer })?;
             queue.add_used(ram, chain.head, written + 1)?;
         }
         Ok(())
+    }
+
+    /// Serve requests held at capture time, as a notify does.
+    fn restored(&mut self, index: u16, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
+        self.notify(index, queue, ram)
     }
 }
 
@@ -187,6 +316,14 @@ impl Block {
         }
         (OK, moved)
     }
+}
+
+/// Returns bytes a request moves, the buffers between header and status.
+fn payload(chain: &Chain) -> u64 {
+    chain.descriptors[1..chain.descriptors.len() - 1]
+        .iter()
+        .map(|d| u64::from(d.len))
+        .sum()
 }
 
 /// Returns address of the status byte, which is the writable and
@@ -319,6 +456,126 @@ mod tests {
 
     fn queue() -> Queue {
         Queue::new(8, DESC_TABLE, AVAIL_RING, USED_RING).expect("ring")
+    }
+
+    /// Let `by` pass for each bucket of `block`.
+    fn pass(block: &mut Block, by: Duration) {
+        let throttle = block.throttle.as_mut().expect("a rate");
+        for bucket in [&mut throttle.bytes, &mut throttle.requests]
+            .into_iter()
+            .flatten()
+        {
+            bucket.filled -= by;
+        }
+    }
+
+    #[test]
+    fn test_rate_holds_request_past_bytes() {
+        let ram = ram();
+        let mut queue = queue();
+        let mut block = disk().at_rate(Rate {
+            bytes: SECTOR,
+            requests: 0,
+        });
+        request(&ram, REQUEST_IN, 1, &[(SECTOR as u32, true)], 0);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert_eq!(status(&ram), OK);
+        // Another sector within the same second waits for the bucket.
+        request(&ram, REQUEST_IN, 2, &[(SECTOR as u32, true)], 1);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert_eq!(queue.cursors(), (1, 1), "held request was used");
+        let wait = block.wake_after().expect("a deadline");
+        assert!(wait <= Duration::from_secs(1), "wait of {wait:?}");
+        assert_eq!(block.counts(), vec![("deferred", 1)]);
+        pass(&mut block, Duration::from_secs(2));
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert_eq!(queue.cursors(), (2, 2));
+        assert_eq!(status(&ram), OK);
+        assert!(block.wake_after().is_none());
+    }
+
+    #[test]
+    fn test_rate_holds_request_past_count() {
+        let ram = ram();
+        let mut queue = queue();
+        let mut block = disk().at_rate(Rate {
+            bytes: 0,
+            requests: 1,
+        });
+        request(&ram, REQUEST_FLUSH, 0, &[], 0);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert_eq!(status(&ram), OK);
+        request(&ram, REQUEST_FLUSH, 0, &[], 1);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert_eq!(queue.cursors(), (1, 1), "held request was used");
+        pass(&mut block, Duration::from_secs(1));
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert_eq!(queue.cursors(), (2, 2));
+    }
+
+    #[test]
+    fn test_rate_takes_oversize_request_from_full_bucket() {
+        let ram = ram();
+        let mut queue = queue();
+        let mut block = disk().at_rate(Rate {
+            bytes: SECTOR,
+            requests: 0,
+        });
+        // Two sectors at a rate of one are served at once from a full bucket.
+        request(&ram, REQUEST_IN, 1, &[(2 * SECTOR as u32, true)], 0);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert_eq!(status(&ram), OK);
+        assert_eq!(queue.cursors(), (1, 1));
+        // The bucket owes one sector after it, so one sector waits two seconds.
+        request(&ram, REQUEST_IN, 3, &[(SECTOR as u32, true)], 1);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert_eq!(queue.cursors(), (1, 1));
+        let wait = block.wake_after().expect("a deadline");
+        assert!(wait > Duration::from_millis(1900), "wait of {wait:?}");
+    }
+
+    #[test]
+    fn test_restored_serves_held_request() {
+        // Capture keeps no deadline, so `restored` serves the held request.
+        let ram = ram();
+        let mut queue = queue();
+        let rate = Rate {
+            bytes: SECTOR,
+            requests: 0,
+        };
+        let mut block = disk().at_rate(rate);
+        request(&ram, REQUEST_IN, 1, &[(SECTOR as u32, true)], 0);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        request(&ram, REQUEST_IN, 2, &[(SECTOR as u32, true)], 1);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert_eq!(queue.cursors(), (1, 1), "held request was used");
+        let mut restored = disk().at_rate(rate);
+        restored.restored(0, &mut queue, &ram).expect("restored");
+        assert_eq!(queue.cursors(), (2, 2), "held request was left");
+        assert_eq!(status(&ram), OK);
+    }
+
+    #[test]
+    fn test_notify_drops_stale_deadline() {
+        // Next notify drops the deadline of a request held before a reset.
+        let ram = ram();
+        let mut queue = queue();
+        let mut block = disk().at_rate(Rate {
+            bytes: SECTOR,
+            requests: 0,
+        });
+        request(&ram, REQUEST_IN, 1, &[(SECTOR as u32, true)], 0);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        request(&ram, REQUEST_IN, 2, &[(SECTOR as u32, true)], 1);
+        block.notify(0, &mut queue, &ram).expect("notify");
+        assert!(block.wake_after().is_some());
+        ram.write(AVAIL_RING + 2, &0u16.to_le_bytes())
+            .expect("index");
+        block.notify(0, &mut self::queue(), &ram).expect("notify");
+        assert!(
+            block.wake_after().is_none(),
+            "deadline outlived its request"
+        );
     }
 
     #[test]
