@@ -1189,12 +1189,9 @@ impl<H: Hypervisor> Machine<H> {
         let driving = confine(Thread::Vcpu)?;
         // Device thread with the stack opens host sockets and one with a
         // shared directory reaches the filesystem, each list is wider.
-        let working = confine(if self.host_stack {
-            Thread::Stack
-        } else if self.sharing {
-            Thread::Sharing
-        } else {
-            Thread::Device
+        let working = confine(Thread::Device {
+            user_net: self.host_stack,
+            fs: !self.host_stack && self.sharing,
         })?;
         let mut threads = Vec::with_capacity(self.vcpus.len());
         for (index, vcpu) in self.vcpus.iter().enumerate() {

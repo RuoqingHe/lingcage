@@ -34,6 +34,8 @@
 - \[[#9](https://github.com/lingcage/lingcage/pull/9)\] Drop kernel requirement under `--restore`: a
   clone takes its kernel from the RAM image.
 - \[[#14](https://github.com/lingcage/lingcage/pull/14)\] `--disk` takes `,ro` in place of `:ro`.
+- \[[#18](https://github.com/lingcage/lingcage/pull/18)\] `Thread::Device` takes `user_net` and `fs`
+  in place of `Thread::Stack` and `Thread::Sharing`, breaking the 0.2.0 API.
 
 ### Fixed
 
