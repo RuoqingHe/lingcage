@@ -11,7 +11,7 @@ categories = ["os::linux-apis", "virtualization"]
 edition = "2024"
 homepage = "https://lingcage.com"
 license = "Apache-2.0"
-repository = "https://github.com/RuoqingHe/lingcage"
+repository = "https://github.com/lingcage/lingcage"
 rust-version = "1.91"
 
 [workspace.dependencies]

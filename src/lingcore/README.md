@@ -35,7 +35,7 @@ the only backend for now.
   host needs GICv3, since interrupt controller of a guest is in-kernel distributor and
   redistributors. riscv64 host needs AIA, since controller there is in-kernel APLIC and IMSICs.
 - Rust toolchain pinned by
-  [rust-toolchain.toml](https://github.com/RuoqingHe/lingcage/blob/main/rust-toolchain.toml) of the
+  [rust-toolchain.toml](https://github.com/lingcage/lingcage/blob/main/rust-toolchain.toml) of the
   repository.
 
 ## Usage
@@ -136,5 +136,4 @@ $ lingcore --kernel bzImage --initrd initramfs.cpio.gz --vcpus 2 --memory 1G
 
 ## License
 
-Apache-2.0, see [LICENSE](https://github.com/RuoqingHe/lingcage/blob/main/LICENSE) in the
-repository.
+Apache-2.0, see [LICENSE](https://github.com/lingcage/lingcage/blob/main/LICENSE) in the repository.

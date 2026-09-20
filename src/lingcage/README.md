@@ -32,7 +32,7 @@ spawn sources, `sandbox` for the guests cloned from them.
   host needs GICv3, since interrupt controller of a guest is in-kernel distributor and
   redistributors. riscv64 host needs AIA, since controller there is in-kernel APLIC and IMSICs.
 - Rust toolchain pinned by
-  [rust-toolchain.toml](https://github.com/RuoqingHe/lingcage/blob/main/rust-toolchain.toml) of the
+  [rust-toolchain.toml](https://github.com/lingcage/lingcage/blob/main/rust-toolchain.toml) of the
   repository.
 
 ## Usage
@@ -109,5 +109,4 @@ Store defaults to `/var/lib/lingcage`, use `--store DIR` or `LINGCAGE_STORE` for
 
 ## License
 
-Apache-2.0, see [LICENSE](https://github.com/RuoqingHe/lingcage/blob/main/LICENSE) in the
-repository.
+Apache-2.0, see [LICENSE](https://github.com/lingcage/lingcage/blob/main/LICENSE) in the repository.
