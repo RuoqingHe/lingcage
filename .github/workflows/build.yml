@@ -3,6 +3,9 @@ name: LingCage Build
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Compile Workspace

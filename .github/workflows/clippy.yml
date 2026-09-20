@@ -3,6 +3,9 @@ name: LingCage Clippy
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   clippy:
     name: Lint With Clippy

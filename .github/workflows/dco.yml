@@ -6,6 +6,9 @@ name: LingCage DCO
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   dco:
     name: Verify DCO Sign-off

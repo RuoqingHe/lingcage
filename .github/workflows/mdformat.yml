@@ -3,6 +3,9 @@ name: LingCage Mdformat
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   mdformat:
     name: Check Markdown Formatting

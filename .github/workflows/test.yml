@@ -3,6 +3,9 @@ name: LingCage Test
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Run Test Suite

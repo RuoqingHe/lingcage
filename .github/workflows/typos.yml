@@ -3,6 +3,9 @@ name: LingCage Typos
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   typos:
     name: Check Spelling With Typos

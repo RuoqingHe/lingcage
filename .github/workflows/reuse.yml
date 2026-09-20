@@ -3,6 +3,9 @@ name: LingCage REUSE
 on:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   reuse:
     name: Verify REUSE Compliance
