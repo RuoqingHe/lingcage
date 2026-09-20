@@ -1188,10 +1188,11 @@ impl<H: Hypervisor> Machine<H> {
         let confine = |thread| self.confine.map(|how| Filter::new(thread, how)).transpose();
         let driving = confine(Thread::Vcpu)?;
         // Device thread with the stack opens host sockets and one with a
-        // shared directory reaches the filesystem, each list is wider.
+        // shared directory reaches the filesystem, each adds calls to its
+        // list.
         let working = confine(Thread::Device {
             user_net: self.host_stack,
-            fs: !self.host_stack && self.sharing,
+            fs: self.sharing,
         })?;
         let mut threads = Vec::with_capacity(self.vcpus.len());
         for (index, vcpu) in self.vcpus.iter().enumerate() {

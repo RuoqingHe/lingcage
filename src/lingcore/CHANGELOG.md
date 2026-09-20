@@ -48,3 +48,5 @@
   stopped on `--timeout` or by the escape key exits 124 and 0, as it does without a control socket.
 - \[[#15](https://github.com/lingcage/lingcage/pull/15)\] Fix packet lost on small receive chain:
   vsock device splits a packet larger than a receive chain over several chains.
+- \[[#18](https://github.com/lingcage/lingcage/pull/18)\] Fix shared directory refused with network
+  stack: the device thread of a guest given `--network user` and `--share` takes the calls of both.
