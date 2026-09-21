@@ -13,7 +13,7 @@
 //! way look the same from outside, so [`Refused`] tells them apart.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -127,10 +127,17 @@ fn snapshot<H: Hypervisor>(
         false => machine.write_memory(&mut memory),
     }
     .map_err(|err| Refused::Mutated(err.to_string()))?;
-    let mut document =
+    let document =
         File::create(at.join(DOCUMENT)).map_err(|err| Refused::Mutated(err.to_string()))?;
+    // The document is written field by field, so a plain `File` costs one
+    // `write` per field. `BufWriter` ignores a failed flush on drop, so the
+    // flush is called here to report it.
+    let mut document = BufWriter::new(document);
     taken
         .write_to(&mut document)
+        .map_err(|err| Refused::Mutated(err.to_string()))?;
+    document
+        .flush()
         .map_err(|err| Refused::Mutated(err.to_string()))?;
     Ok(())
 }

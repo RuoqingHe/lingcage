@@ -50,3 +50,5 @@
   vsock device splits a packet larger than a receive chain over several chains.
 - \[[#18](https://github.com/lingcage/lingcage/pull/18)\] Fix shared directory refused with network
   stack: the device thread of a guest given `--network user` and `--share` takes the calls of both.
+- \[[#19](https://github.com/lingcage/lingcage/pull/19)\] Fix snapshot document read byte by byte:
+  restore reads the document through a buffer and capture writes it through one.

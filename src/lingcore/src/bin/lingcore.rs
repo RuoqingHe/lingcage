@@ -16,7 +16,7 @@
 ))]
 mod imp {
     use std::fs::File;
-    use std::io::{self, Read, Write};
+    use std::io::{self, BufReader, Read, Write};
     use std::os::fd::AsRawFd;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -925,9 +925,11 @@ mod imp {
                 let image = File::open(from.join(control::MEMORY))
                     .map_err(|_| lingcore::machine::Error::Snapshot)?;
                 let mut machine = Machine::cloned(&hv, &config, Sink, &image)?;
-                let mut document = File::open(from.join(control::DOCUMENT))
+                let document = File::open(from.join(control::DOCUMENT))
                     .map_err(|_| lingcore::machine::Error::Snapshot)?;
-                let taken = Snapshot::read_from(&mut document)?;
+                // The parser reads the document field by field, so a plain
+                // `File` costs one `read` per byte.
+                let taken = Snapshot::read_from(&mut BufReader::new(document))?;
                 machine.restore(&taken)?;
                 machine
             }
