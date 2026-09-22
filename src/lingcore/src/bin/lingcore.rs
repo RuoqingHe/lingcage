@@ -17,7 +17,7 @@
 mod imp {
     use std::fs::File;
     use std::io::{self, BufReader, Read, Write};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::time::{Duration, Instant};
@@ -55,6 +55,9 @@ mod imp {
 
     /// Token of `Orders::descriptor` in that wait.
     const ORDERS: u64 = 1;
+
+    /// Token of the signal pipe in that wait.
+    const SIGNALS: u64 = 2;
 
     /// Time to wait before retrying if console input queue is full.
     const INPUT_RETRY: Duration = Duration::from_millis(5);
@@ -838,16 +841,17 @@ mod imp {
     static SIGNALLED: AtomicI32 = AtomicI32::new(0);
 
     /// Set up handlers for SIGTERM, SIGINT and SIGHUP. Handler writes the
-    /// signal number to a pipe, and a thread reading the pipe stops the
-    /// guest through `stop`.
-    fn arm_signals(stop: StopHandle) -> Result<()> {
+    /// signal number to a pipe, and the holding thread waits on its read end.
+    fn arm_signals() -> Result<OwnedFd> {
         let mut fds = [0; 2];
+        // Neither end blocks, so a handler returns at once on a full pipe.
         // SAFETY: `fds` is a valid array of two file descriptors.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
             return Err(io::Error::last_os_error().into());
         }
-        let (reader, writer) = (fds[0], fds[1]);
-        SIGNAL_PIPE.store(writer, Ordering::SeqCst);
+        // SAFETY: `fds[0]` was just opened and has no other owner.
+        let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        SIGNAL_PIPE.store(fds[1], Ordering::SeqCst);
         for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
             // SAFETY: a zeroed sigaction is a valid empty sigaction.
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -857,29 +861,20 @@ mod imp {
                 return Err(io::Error::last_os_error().into());
             }
         }
-        std::thread::spawn(move || {
-            let mut byte = [0u8; 1];
-            loop {
-                // SAFETY: `byte` is a valid one-byte buffer.
-                let read = unsafe { libc::read(reader, byte.as_mut_ptr().cast(), 1) };
-                if read == 1 {
-                    break;
-                }
-                // Read is interrupted if a handler runs on this thread. Other
-                // results mean the pipe is gone, exit the thread accordingly.
-                if read == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                    return;
-                }
-            }
-            SIGNALLED.store(i32::from(byte[0]), Ordering::SeqCst);
-            if let Err(err) = stop.stop() {
-                eprintln!(
-                    "lingcore: failed to stop the guest on signal {}: {err}",
-                    byte[0]
-                );
-            }
-        });
-        Ok(())
+        Ok(reader)
+    }
+
+    /// Read the number the handler wrote to `reader` and record it in
+    /// `SIGNALLED`. Returns the number, or `None` if the pipe is empty.
+    fn take_signal(reader: &OwnedFd) -> Option<i32> {
+        let mut byte = [0u8; 1];
+        // SAFETY: `byte` is a valid one-byte buffer.
+        if unsafe { libc::read(reader.as_raw_fd(), byte.as_mut_ptr().cast(), 1) } != 1 {
+            return None;
+        }
+        let signal = i32::from(byte[0]);
+        SIGNALLED.store(signal, Ordering::SeqCst);
+        Some(signal)
     }
 
     /// Returns exit code for the signal which stopped the guest, if any. The
@@ -946,11 +941,11 @@ mod imp {
         };
 
         let stop = machine.stop_handle();
-        arm_signals(stop.clone())?;
+        let signals = arm_signals()?;
         let terminal = Terminal::raw()?;
         machine.start()?;
-        forward_input(machine.console(), stop.clone(), terminal.is_tty());
-        let ended = drive(&mut machine, orders.as_ref(), timeout);
+        forward_input(machine.console(), stop, terminal.is_tty());
+        let ended = drive(&mut machine, orders.as_ref(), &signals, timeout);
         drop(terminal);
         let ended = ended?;
         if let Some(code) = signalled() {
@@ -982,12 +977,13 @@ mod imp {
         }
     }
 
-    /// Wait on the guest until it ends, serving orders as they arrive if
-    /// a control socket is given. `None` once `timeout` ran out and the
-    /// guest was stopped, `LostPage` once its template lost a page.
+    /// Wait on the guest until it ends, serving orders and signals as they
+    /// arrive. `None` once `timeout` ran out and the guest was stopped,
+    /// `LostPage` once its template lost a page.
     fn drive(
         machine: &mut Machine<KvmHv>,
         orders: Option<&control::Orders>,
+        signals: &OwnedFd,
         timeout: Option<Duration>,
     ) -> Result<Option<VmExit>> {
         let deadline = timeout.map(|within| Instant::now() + within);
@@ -1010,14 +1006,21 @@ mod imp {
                 machine.wait()?;
                 return Ok(None);
             }
-            // Stop and lost page write `wake_fd`, and orders come on the
-            // socket, so the wait below ends on any of them at once.
+            // Each event the thread serves has a descriptor in this set, so
+            // the wait ends on any of them at once.
             waiting.clear();
             waiting.add(machine.wake_fd(), WAKE, Interest::Read);
+            waiting.add(signals.as_raw_fd(), SIGNALS, Interest::Read);
             if let Some(orders) = &orders {
                 waiting.add(orders.descriptor(), ORDERS, Interest::Read);
             }
             wait_on(&waiting, left.unwrap_or(Duration::MAX), &mut ready)?;
+            if ready.contains(&SIGNALS)
+                && let Some(signal) = take_signal(signals)
+                && let Err(err) = machine.stop()
+            {
+                eprintln!("lingcore: failed to stop the guest on signal {signal}: {err}");
+            }
             // Thread holding the guest serves the orders, so no other thread
             // changes the guest.
             if let Some(orders) = orders
@@ -1047,6 +1050,24 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use crate::imp::*;
+
+        #[test]
+        fn test_signal_read_from_pipe() {
+            // A raised signal makes the read end ready, and `take_signal`
+            // returns its number.
+            let signals = arm_signals().expect("arm signals");
+            let mut waiting = Waiting::new();
+            waiting.add(signals.as_raw_fd(), SIGNALS, Interest::Read);
+            let mut ready = Vec::new();
+            // SAFETY: `raise` takes a signal number and touches no memory.
+            assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+            waiting.ready(Duration::ZERO, &mut ready).expect("poll");
+            assert_eq!(ready, vec![SIGNALS], "pipe not ready after a signal");
+            assert_eq!(take_signal(&signals), Some(libc::SIGHUP));
+            assert_eq!(signalled(), Some(128 + libc::SIGHUP));
+            waiting.ready(Duration::ZERO, &mut ready).expect("poll");
+            assert!(ready.is_empty(), "number left on the pipe");
+        }
 
         #[test]
         fn test_help_lists_flags_and_exit_codes() {

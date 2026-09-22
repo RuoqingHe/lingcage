@@ -40,6 +40,8 @@
   in place of `Thread::Stack` and `Thread::Sharing`, breaking the 0.2.0 API.
 - \[[#20](https://github.com/lingcage/lingcage/pull/20)\] `control::Orders` takes `descriptor` and
   `take` in place of `next`, breaking the 0.2.0 API.
+- \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Move signal handling onto holding thread:
+  the thread holding the guest reads the signal pipe itself.
 
 ### Fixed
 
