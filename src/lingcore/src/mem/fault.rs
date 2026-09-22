@@ -13,9 +13,11 @@
 //! to know its memory is gone.
 //!
 //! The handler is installed before any thread installs its allowlist,
-//! and it only calls `mmap`, which is on each allowlist.
+//! and it only calls `mmap` and `write`, which are on each allowlist.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// Mappings watched at the same time. A machine takes one entry per
 /// region, and the entries are freed together with the memory.
@@ -31,6 +33,8 @@ struct Watch {
     start: AtomicUsize,
     len: AtomicUsize,
     hit: AtomicBool,
+    /// eventfd the handler writes on a fault, -1 if none is set.
+    alert: AtomicI32,
 }
 
 impl Watch {
@@ -42,6 +46,7 @@ impl Watch {
             start: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
             hit: AtomicBool::new(false),
+            alert: AtomicI32::new(-1),
         }
     }
 }
@@ -51,6 +56,9 @@ static WATCHES: [Watch; WATCHED] = [const { Watch::free() }; WATCHED];
 /// Entries held by one `GuestRam`, freed when the memory unmaps.
 pub(crate) struct Watched {
     slots: Vec<usize>,
+    /// eventfd the entries name as `alert`. Holding it here keeps it open
+    /// while an entry names it.
+    alerted: OnceLock<Arc<OwnedFd>>,
 }
 
 impl Watched {
@@ -78,7 +86,23 @@ impl Watched {
                 break;
             }
         }
-        Watched { slots }
+        Watched {
+            slots,
+            alerted: OnceLock::new(),
+        }
+    }
+
+    /// Make the handler write the eventfd `alert` on each fault in these
+    /// ranges, so a thread polling `alert` learns of the fault at once. A
+    /// second call keeps the first eventfd.
+    pub(crate) fn alert(&self, alert: Arc<OwnedFd>) {
+        let fd = alert.as_raw_fd();
+        if self.alerted.set(alert).is_err() {
+            return;
+        }
+        for &at in &self.slots {
+            WATCHES[at].alert.store(fd, Ordering::Release);
+        }
     }
 
     /// Returns whether a fault landed in one of the ranges.
@@ -92,6 +116,7 @@ impl Watched {
 impl Drop for Watched {
     fn drop(&mut self) {
         for &at in &self.slots {
+            WATCHES[at].alert.store(-1, Ordering::Release);
             WATCHES[at].start.store(0, Ordering::Release);
             WATCHES[at].len.store(0, Ordering::Release);
             WATCHES[at].taken.store(false, Ordering::Release);
@@ -147,6 +172,13 @@ extern "C" fn on_bus(
         };
         if placed != libc::MAP_FAILED {
             watch.hit.store(true, Ordering::Release);
+            let alert = watch.alert.load(Ordering::Acquire);
+            if alert >= 0 {
+                let one = 1u64.to_ne_bytes();
+                // SAFETY: `one` is 8 bytes, the width an eventfd write takes,
+                // and `write` is async-signal-safe.
+                unsafe { libc::write(alert, one.as_ptr().cast(), 8) };
+            }
             return;
         }
         break;
@@ -161,26 +193,19 @@ mod tests {
 
     #[test]
     fn test_watch_slot_taken_and_freed() {
-        let taken = WATCHES
-            .iter()
-            .filter(|w| w.taken.load(Ordering::Acquire))
-            .count();
+        // Other tests watch ranges at the same time, so only the slot of
+        // this range is checked.
         let watched = Watched::of([(0x1000, 0x2000)].into_iter());
-        assert_eq!(
-            WATCHES
-                .iter()
-                .filter(|w| w.taken.load(Ordering::Acquire))
-                .count(),
-            taken + 1
-        );
+        assert_eq!(watched.slots.len(), 1, "range not watched");
+        let at = watched.slots[0];
+        assert!(WATCHES[at].taken.load(Ordering::Acquire));
+        assert_eq!(WATCHES[at].start.load(Ordering::Acquire), 0x1000);
         assert!(!watched.hit());
         drop(watched);
-        assert_eq!(
-            WATCHES
-                .iter()
-                .filter(|w| w.taken.load(Ordering::Acquire))
-                .count(),
-            taken
+        assert_ne!(
+            WATCHES[at].start.load(Ordering::Acquire),
+            0x1000,
+            "slot not freed"
         );
     }
 
@@ -191,7 +216,7 @@ mod tests {
         use std::io::Write as _;
         use std::os::fd::AsRawFd as _;
 
-        let mut file = tempfile();
+        let mut file = tempfile("zero");
         file.write_all(&[0x5a; PAGE * 2]).expect("fill file");
         // SAFETY: the length and the descriptor belong to this file.
         let at = unsafe {
@@ -216,9 +241,58 @@ mod tests {
         unsafe { libc::munmap(at, PAGE * 2) };
     }
 
-    /// Temporary file for the test.
-    fn tempfile() -> std::fs::File {
-        let path = std::env::temp_dir().join(format!("lingcore-fault-{}", std::process::id()));
+    #[test]
+    fn test_fault_writes_alert() {
+        // A fault in a watched mapping makes its alert readable, so a
+        // thread polling the alert learns of the fault at once.
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let mut file = tempfile("alert");
+        file.write_all(&[0x5a; PAGE * 2]).expect("fill file");
+        // SAFETY: the length and the descriptor belong to this file.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE * 2,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED, "mapping failed");
+        // SAFETY: `eventfd(2)` takes a count and flags and returns a
+        // descriptor or -1.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(fd >= 0, "eventfd");
+        // SAFETY: `fd` was just opened and has no other owner.
+        let alert = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+        let watched = Watched::of([(at as usize, PAGE * 2)].into_iter());
+        watched.alert(Arc::clone(&alert));
+        let mut count = [0u8; 8];
+        // SAFETY: `count` is 8 bytes, the width an eventfd read fills.
+        let quiet = unsafe { libc::read(alert.as_raw_fd(), count.as_mut_ptr().cast(), 8) };
+        assert_eq!(quiet, -1, "alert readable before a fault");
+
+        file.set_len(PAGE as u64).expect("truncate file");
+        // SAFETY: the address is the second page of a live mapping, which
+        // the file no longer covers.
+        let _ = unsafe { std::ptr::read_volatile((at as usize + PAGE) as *const u8) };
+        // SAFETY: `count` is 8 bytes, the width an eventfd read fills.
+        let read = unsafe { libc::read(alert.as_raw_fd(), count.as_mut_ptr().cast(), 8) };
+        assert_eq!(read, 8, "fault did not write the alert");
+        assert_eq!(u64::from_ne_bytes(count), 1);
+        drop(watched);
+        // SAFETY: the mapping belongs to this test and is unused past here.
+        unsafe { libc::munmap(at, PAGE * 2) };
+    }
+
+    /// Temporary file with `tag` in its name, so tests running together do
+    /// not share one.
+    fn tempfile(tag: &str) -> std::fs::File {
+        let path =
+            std::env::temp_dir().join(format!("lingcore-fault-{tag}-{}", std::process::id()));
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

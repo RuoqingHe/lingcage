@@ -12,6 +12,8 @@
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io::{Seek, SeekFrom};
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -195,6 +197,16 @@ impl GuestRam {
     #[cfg(target_os = "linux")]
     pub fn faulted(&self) -> bool {
         self.watched.as_ref().is_some_and(|watched| watched.hit())
+    }
+
+    /// Write the eventfd `alert` each time a page of the RAM image goes
+    /// missing, so a thread polling `alert` learns of the loss at once. RAM
+    /// not mapped from an image has no page to lose and ignores the call.
+    #[cfg(target_os = "linux")]
+    pub fn alert_on_fault(&self, alert: Arc<OwnedFd>) {
+        if let Some(watched) = &self.watched {
+            watched.alert(alert);
+        }
     }
 
     /// Returns the regions in ascending address order.

@@ -25,7 +25,9 @@ mod imp {
     use lingcore::devices::Receive;
     use lingcore::devices::virtio::console::Reach;
     use lingcore::devices::virtio::net::stack::StackConfig;
+    use lingcore::hv::Interest;
     use lingcore::hv::backend::kvm::hypervisor::KvmHv;
+    use lingcore::hv::os::linux::waiting::Waiting;
     use lingcore::hv::vcpu::VmExit;
     use lingcore::logging::{Logger, level_of};
     use lingcore::machine::snapshot::Snapshot;
@@ -50,6 +52,9 @@ mod imp {
 
     /// Time the guest is waited on between two rounds of orders.
     const SLICE: Duration = Duration::from_millis(50);
+
+    /// Token of `Machine::wake_fd` in the wait of the holding thread.
+    const WAKE: u64 = 0;
 
     /// Time to wait before retrying if console input queue is full.
     const INPUT_RETRY: Duration = Duration::from_millis(5);
@@ -986,6 +991,11 @@ mod imp {
         timeout: Option<Duration>,
     ) -> Result<Option<VmExit>> {
         let deadline = timeout.map(|within| Instant::now() + within);
+        // A stop and a lost page both write this descriptor, so the wait
+        // below ends on either at once.
+        let mut waiting = Waiting::new();
+        waiting.add(machine.wake_fd(), WAKE, Interest::Read);
+        let mut ready = Vec::new();
         loop {
             // Orders are served between two waits on the guest, so the one
             // thread which holds the guest is the one which changes it.
@@ -994,9 +1004,6 @@ mod imp {
                     order.serve(machine);
                 }
             }
-            if let Some(exit) = machine.wait_timeout(SLICE)? {
-                return Ok(Some(exit));
-            }
             // A clone whose image lost a page runs on over a zero page, so
             // it is stopped here and the loss reported.
             if machine.faulted() {
@@ -1004,11 +1011,36 @@ mod imp {
                 machine.wait()?;
                 return Err(lingcore::machine::Error::LostPage.into());
             }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if let Some(exit) = machine.wait_timeout(Duration::ZERO)? {
+                return Ok(Some(exit));
+            }
+            let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if left == Some(Duration::ZERO) {
                 machine.stop()?;
                 machine.wait()?;
                 return Ok(None);
             }
+            // `poll` cannot wait for orders on a channel, so the wait ends
+            // after `SLICE` and the orders are taken then.
+            wait_on(
+                &waiting,
+                left.map_or(SLICE, |left| left.min(SLICE)),
+                &mut ready,
+            )?;
+        }
+    }
+
+    /// Wait on `waiting` for at most `within`, rounded up to a whole
+    /// millisecond so the wait does not end before a deadline. A signal
+    /// handled on this thread ends the wait with no descriptor ready.
+    fn wait_on(waiting: &Waiting, within: Duration, ready: &mut Vec<u64>) -> Result<()> {
+        let millis = u64::try_from(within.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
+        match waiting.ready(Duration::from_millis(millis), ready) {
+            Err(lingcore::hv::Error::Os { errno, .. }) if errno == libc::EINTR => {
+                ready.clear();
+                Ok(())
+            }
+            waited => waited.map_err(|err| lingcore::machine::Error::from(err).into()),
         }
     }
 

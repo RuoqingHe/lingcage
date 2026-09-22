@@ -11,6 +11,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::Ipv4Addr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -542,17 +543,45 @@ struct Standing {
 /// Order shared by vCPU and device threads, `pause`, `stop`, `wait`,
 /// and each `StopHandle`. Each thread reads the order before its next
 /// run or wait. `parked` counts the threads parked on a `Hold`.
-#[derive(Default)]
 struct Orders {
     standing: Mutex<Standing>,
     changed: Condvar,
+    /// eventfd written on a `Stop` order and on a lost page of the RAM
+    /// image. A thread polling descriptors learns of either through it.
+    wake: Arc<OwnedFd>,
 }
 
 impl Orders {
-    /// Set the order and wake up the threads.
+    /// Orders with `Run` standing.
+    fn new() -> Result<Orders> {
+        // SAFETY: `eventfd(2)` takes a count and flags and returns a
+        // descriptor or -1.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(Error::Hv(crate::hv::Error::Os {
+                op: "eventfd",
+                errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            }));
+        }
+        Ok(Orders {
+            standing: Mutex::default(),
+            changed: Condvar::new(),
+            // SAFETY: `fd` was just opened and has no other owner.
+            wake: Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }),
+        })
+    }
+
+    /// Set the order and wake up the threads. A `Stop` also writes `wake`.
     fn tell(&self, order: Order) {
         self.standing.lock().unwrap().order = order;
         self.changed.notify_all();
+        if order == Order::Stop {
+            let one = 1u64.to_ne_bytes();
+            // SAFETY: `one` is 8 bytes, the width an eventfd write takes. A
+            // write fails only on a full count, and a full count wakes the
+            // reader too, so the result is ignored.
+            unsafe { libc::write(self.wake.as_raw_fd(), one.as_ptr().cast(), 8) };
+        }
     }
 
     fn standing(&self) -> Order {
@@ -923,6 +952,8 @@ impl<H: Hypervisor> Machine<H> {
             .map(|vcpu| Arc::new(Mutex::new(vcpu)))
             .collect();
 
+        let orders = Arc::new(Orders::new()?);
+        ram.alert_on_fault(Arc::clone(&orders.wake));
         Ok(Machine {
             vm,
             memory,
@@ -937,7 +968,7 @@ impl<H: Hypervisor> Machine<H> {
             vcpus,
             stoppers,
             threads: Vec::new(),
-            orders: Arc::new(Orders::default()),
+            orders,
             genid,
             confine: config.confine,
             sharing: !config.shares.is_empty(),
@@ -959,6 +990,13 @@ impl<H: Hypervisor> Machine<H> {
     #[cfg(target_os = "linux")]
     pub fn faulted(&self) -> bool {
         self.ram.faulted()
+    }
+
+    /// Returns an eventfd, readable once the guest is told to stop or
+    /// loses a page of its RAM image. A thread polling other descriptors
+    /// adds this one to learn of either at once.
+    pub fn wake_fd(&self) -> RawFd {
+        self.orders.wake.as_raw_fd()
     }
 
     /// Returns current state of the guest.
@@ -1573,7 +1611,7 @@ mod tests {
         // Pause does not return until each told thread has parked.
         use std::sync::mpsc;
 
-        let orders = Arc::new(Orders::default());
+        let orders = Arc::new(Orders::new().expect("orders"));
         orders.tell(Order::Hold);
 
         // One thread parks on the hold.
@@ -1607,7 +1645,7 @@ mod tests {
 
     #[test]
     fn test_timed_stop_wait_returns() {
-        let orders = Arc::new(Orders::default());
+        let orders = Arc::new(Orders::new().expect("orders"));
         orders.tell(Order::Run);
         assert!(
             !orders.wait_for_a_stop_within(Duration::from_millis(20)),
@@ -1625,6 +1663,23 @@ mod tests {
             "stop told was missed"
         );
         assert!(orders.wait_for_a_stop_within(Duration::ZERO));
+    }
+
+    #[test]
+    fn test_stop_order_writes_wake() {
+        // `Hold` and `Run` leave `wake` quiet. `Stop` makes it readable, so
+        // a thread polling it ends its wait.
+        let orders = Orders::new().expect("orders");
+        let mut waiting = Waiting::new();
+        waiting.add(orders.wake.as_raw_fd(), 1, Interest::Read);
+        let mut ready = Vec::new();
+        orders.tell(Order::Hold);
+        orders.tell(Order::Run);
+        waiting.ready(Duration::ZERO, &mut ready).expect("wait");
+        assert!(ready.is_empty(), "woken before a stop");
+        orders.tell(Order::Stop);
+        waiting.ready(Duration::ZERO, &mut ready).expect("wait");
+        assert_eq!(ready, vec![1], "stop left wake quiet");
     }
 
     #[test]

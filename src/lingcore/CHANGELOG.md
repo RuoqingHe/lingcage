@@ -24,6 +24,8 @@
   and `--balloon` place the device.
 - \[[#14](https://github.com/lingcage/lingcage/pull/14)\] Add rate limit to a disk: `Disk::rate`,
   and `,bytes=N` and `,ops=N` on `--disk`, cap bytes and requests a second.
+- \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Add `Machine::wake_fd`: an eventfd
+  readable once the guest is told to stop or loses a page of its RAM image.
 
 ### Changed
 
