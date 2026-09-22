@@ -14,8 +14,10 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use log::{debug, warn};
@@ -210,13 +212,30 @@ impl Order {
 /// Orders arriving on the socket, read by the holder of the guest.
 pub struct Orders {
     taking: Receiver<Order>,
+    /// eventfd the control thread writes after it sends an order.
+    sent: Arc<OwnedFd>,
     at: PathBuf,
 }
 
 impl Orders {
-    /// Returns next order, or `None` while none waits.
-    pub fn next(&self) -> Option<Order> {
-        self.taking.try_recv().ok()
+    /// Returns an eventfd, readable once an order waits. Holder polls it
+    /// beside its other descriptors.
+    pub fn descriptor(&self) -> RawFd {
+        self.sent.as_raw_fd()
+    }
+
+    /// Returns the orders waiting. The eventfd is read ahead of the channel,
+    /// so an order sent after that read makes it readable again.
+    pub fn take(&self) -> Vec<Order> {
+        let mut count = [0u8; 8];
+        // SAFETY: `count` is 8 bytes, the width an eventfd read fills. With
+        // no order sent the read fails with `EAGAIN`, so the result is ignored.
+        unsafe { libc::read(self.sent.as_raw_fd(), count.as_mut_ptr().cast(), 8) };
+        let mut taken = Vec::new();
+        while let Ok(order) = self.taking.try_recv() {
+            taken.push(order);
+        }
+        taken
     }
 }
 
@@ -227,25 +246,36 @@ impl Drop for Orders {
 }
 
 /// Take orders on the socket at `at`. Socket is served by a thread, so a
-/// guest held still keeps answering.
+/// guest held still keeps answering. It writes the eventfd of
+/// `Orders::descriptor` after each order.
 pub fn listen(at: &Path) -> std::io::Result<Orders> {
     let _ = std::fs::remove_file(at);
     let listening = UnixListener::bind(at)?;
+    // SAFETY: `eventfd(2)` takes a count and flags and returns a
+    // descriptor or -1.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened and has no other owner.
+    let sent = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+    let telling = Arc::clone(&sent);
     let (orders, taking) = channel();
     std::thread::Builder::new()
         .name("control".to_string())
-        .spawn(move || serve(listening, orders))?;
+        .spawn(move || serve(listening, orders, &telling))?;
     Ok(Orders {
         taking,
+        sent,
         at: at.to_path_buf(),
     })
 }
 
-fn serve(listening: UnixListener, orders: Sender<Order>) {
+fn serve(listening: UnixListener, orders: Sender<Order>, sent: &OwnedFd) {
     for stream in listening.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(err) = talk(stream, &orders) {
+                if let Err(err) = talk(stream, &orders, sent) {
                     warn!("control connection came apart: {err}");
                 }
             }
@@ -254,7 +284,7 @@ fn serve(listening: UnixListener, orders: Sender<Order>) {
     }
 }
 
-fn talk(stream: UnixStream, orders: &Sender<Order>) -> std::io::Result<()> {
+fn talk(stream: UnixStream, orders: &Sender<Order>, sent: &OwnedFd) -> std::io::Result<()> {
     let mut out = stream.try_clone()?;
     for line in BufReader::new(stream).lines() {
         let line = line?;
@@ -271,6 +301,11 @@ fn talk(stream: UnixStream, orders: &Sender<Order>) -> std::io::Result<()> {
             // Holder of the guest is gone, so is the guest.
             return Ok(());
         }
+        let one = 1u64.to_ne_bytes();
+        // SAFETY: `one` is 8 bytes, the width an eventfd write takes. A
+        // write fails only on a full count, and a full count wakes the
+        // holder too, so the result is ignored.
+        unsafe { libc::write(sent.as_raw_fd(), one.as_ptr().cast(), 8) };
         let Ok(answer) = answer.recv() else {
             return Ok(());
         };
@@ -311,6 +346,84 @@ mod tests {
         assert_eq!(parse("{\"do\":\"snapshot\"}"), None);
         assert_eq!(parse("{\"do\":\"fly\"}"), None);
         assert_eq!(parse("not an order"), None);
+    }
+
+    #[test]
+    fn test_order_wakes_holder() {
+        // Order makes the eventfd readable, `take` returns it and reads the
+        // eventfd, and the answer reaches the client.
+        use std::time::Duration;
+
+        use crate::hv::Interest;
+        use crate::hv::os::linux::waiting::Waiting;
+
+        let at = std::env::temp_dir().join(format!("lingcore-orders-{}", std::process::id()));
+        let orders = listen(&at).expect("listen");
+        let mut waiting = Waiting::new();
+        waiting.add(orders.descriptor(), 1, Interest::Read);
+        let mut ready = Vec::new();
+        waiting.ready(Duration::ZERO, &mut ready).expect("wait");
+        assert!(ready.is_empty(), "readable with no order");
+
+        let mut client = UnixStream::connect(&at).expect("connect");
+        client.write_all(b"{\"do\":\"state\"}\n").expect("write");
+        waiting
+            .ready(Duration::from_secs(5), &mut ready)
+            .expect("wait");
+        assert_eq!(ready, [1], "order did not wake the holder");
+        let taken = orders.take();
+        assert_eq!(taken.len(), 1);
+        waiting.ready(Duration::ZERO, &mut ready).expect("wait");
+        assert!(ready.is_empty(), "readable after `take`");
+
+        taken[0]
+            .back
+            .send("{\"ok\":true}".to_string())
+            .expect("answer");
+        let mut answer = String::new();
+        BufReader::new(&client)
+            .read_line(&mut answer)
+            .expect("read the answer");
+        assert_eq!(answer, "{\"ok\":true}\n");
+    }
+
+    #[test]
+    fn test_answers_wait_for_slow_client() {
+        // Client sends 1000 orders and reads only after 200 ms. Control
+        // thread waits on its writes, so each answer reaches the client.
+        use std::time::Duration;
+
+        use crate::hv::Interest;
+        use crate::hv::os::linux::waiting::Waiting;
+
+        let at = std::env::temp_dir().join(format!("lingcore-orders-slow-{}", std::process::id()));
+        let orders = listen(&at).expect("listen");
+        let client = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(&at).expect("connect");
+            stream
+                .write_all(&b"{\"do\":\"state\"}\n".repeat(1000))
+                .expect("write");
+            std::thread::sleep(Duration::from_millis(200));
+            BufReader::new(stream).lines().take(1000).count()
+        });
+        let mut waiting = Waiting::new();
+        waiting.add(orders.descriptor(), 1, Interest::Read);
+        let mut ready = Vec::new();
+        let mut answered = 0;
+        while answered < 1000 {
+            waiting
+                .ready(Duration::from_secs(5), &mut ready)
+                .expect("wait");
+            assert_eq!(ready, [1], "order did not wake the holder");
+            for order in orders.take() {
+                order
+                    .back
+                    .send("{\"ok\":true}".to_string())
+                    .expect("answer");
+                answered += 1;
+            }
+        }
+        assert_eq!(client.join().expect("client"), 1000);
     }
 
     #[test]

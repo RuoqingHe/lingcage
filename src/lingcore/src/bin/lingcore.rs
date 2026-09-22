@@ -50,11 +50,11 @@ mod imp {
     /// `timeout(1)`.
     const EXIT_TIMEOUT: i32 = 124;
 
-    /// Time the guest is waited on between two rounds of orders.
-    const SLICE: Duration = Duration::from_millis(50);
-
     /// Token of `Machine::wake_fd` in the wait of the holding thread.
     const WAKE: u64 = 0;
+
+    /// Token of `Orders::descriptor` in that wait.
+    const ORDERS: u64 = 1;
 
     /// Time to wait before retrying if console input queue is full.
     const INPUT_RETRY: Duration = Duration::from_millis(5);
@@ -982,7 +982,7 @@ mod imp {
         }
     }
 
-    /// Wait on the guest until it ends, serving orders between waits when
+    /// Wait on the guest until it ends, serving orders as they arrive if
     /// a control socket is given. `None` once `timeout` ran out and the
     /// guest was stopped, `LostPage` once its template lost a page.
     fn drive(
@@ -991,19 +991,9 @@ mod imp {
         timeout: Option<Duration>,
     ) -> Result<Option<VmExit>> {
         let deadline = timeout.map(|within| Instant::now() + within);
-        // A stop and a lost page both write this descriptor, so the wait
-        // below ends on either at once.
         let mut waiting = Waiting::new();
-        waiting.add(machine.wake_fd(), WAKE, Interest::Read);
         let mut ready = Vec::new();
         loop {
-            // Orders are served between two waits on the guest, so the one
-            // thread which holds the guest is the one which changes it.
-            if let Some(orders) = orders {
-                while let Some(order) = orders.next() {
-                    order.serve(machine);
-                }
-            }
             // A clone whose image lost a page runs on over a zero page, so
             // it is stopped here and the loss reported.
             if machine.faulted() {
@@ -1020,13 +1010,23 @@ mod imp {
                 machine.wait()?;
                 return Ok(None);
             }
-            // `poll` cannot wait for orders on a channel, so the wait ends
-            // after `SLICE` and the orders are taken then.
-            wait_on(
-                &waiting,
-                left.map_or(SLICE, |left| left.min(SLICE)),
-                &mut ready,
-            )?;
+            // Stop and lost page write `wake_fd`, and orders come on the
+            // socket, so the wait below ends on any of them at once.
+            waiting.clear();
+            waiting.add(machine.wake_fd(), WAKE, Interest::Read);
+            if let Some(orders) = &orders {
+                waiting.add(orders.descriptor(), ORDERS, Interest::Read);
+            }
+            wait_on(&waiting, left.unwrap_or(Duration::MAX), &mut ready)?;
+            // Thread holding the guest serves the orders, so no other thread
+            // changes the guest.
+            if let Some(orders) = orders
+                && ready.contains(&ORDERS)
+            {
+                for order in orders.take() {
+                    order.serve(machine);
+                }
+            }
         }
     }
 

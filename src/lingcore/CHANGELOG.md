@@ -38,6 +38,8 @@
 - \[[#14](https://github.com/lingcage/lingcage/pull/14)\] `--disk` takes `,ro` in place of `:ro`.
 - \[[#18](https://github.com/lingcage/lingcage/pull/18)\] `Thread::Device` takes `user_net` and `fs`
   in place of `Thread::Stack` and `Thread::Sharing`, breaking the 0.2.0 API.
+- \[[#20](https://github.com/lingcage/lingcage/pull/20)\] `control::Orders` takes `descriptor` and
+  `take` in place of `next`, breaking the 0.2.0 API.
 
 ### Fixed
 
@@ -54,3 +56,6 @@
   stack: the device thread of a guest given `--network user` and `--share` takes the calls of both.
 - \[[#19](https://github.com/lingcage/lingcage/pull/19)\] Fix snapshot document read byte by byte:
   restore reads the document through a buffer and capture writes it through one.
+- \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Fix orders waiting out the poll slice: the
+  control thread wakes the thread holding the guest through an eventfd, so an order no longer waits
+  up to 50 ms.
