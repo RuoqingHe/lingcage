@@ -26,6 +26,8 @@
   and `,bytes=N` and `,ops=N` on `--disk`, cap bytes and requests a second.
 - \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Add `Machine::wake_fd`: an eventfd
   readable once the guest is told to stop or loses a page of its RAM image.
+- \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Add `Receive::try_receive`: bytes queued
+  for the guest without waiting for a device held by another thread.
 
 ### Changed
 
@@ -42,6 +44,8 @@
   `take` in place of `next`, breaking the 0.2.0 API.
 - \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Move signal handling onto holding thread:
   the thread holding the guest reads the signal pipe itself.
+- \[[#20](https://github.com/lingcage/lingcage/pull/20)\] Move console input onto holding thread:
+  the thread holding the guest reads stdin itself.
 
 ### Fixed
 

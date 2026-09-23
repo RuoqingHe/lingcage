@@ -16,8 +16,8 @@
 ))]
 mod imp {
     use std::fs::File;
-    use std::io::{self, BufReader, Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::io::{self, BufReader, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::time::{Duration, Instant};
@@ -32,8 +32,7 @@ mod imp {
     use lingcore::logging::{Logger, level_of};
     use lingcore::machine::snapshot::Snapshot;
     use lingcore::machine::{
-        Channel, Config, Disk, Link, Machine, MetadataConfig, Network, Rate, Share, StopHandle,
-        control,
+        Channel, Config, Disk, Link, Machine, MetadataConfig, Network, Rate, Share, control,
     };
     use lingcore::seccomp::Refusal;
 
@@ -59,7 +58,11 @@ mod imp {
     /// Token of the signal pipe in that wait.
     const SIGNALS: u64 = 2;
 
-    /// Time to wait before retrying if console input queue is full.
+    /// Token of stdin in that wait.
+    const INPUT: u64 = 3;
+
+    /// Time the holding thread waits before it offers console input again,
+    /// once the console queue is full or a vCPU holds the console.
     const INPUT_RETRY: Duration = Duration::from_millis(5);
 
     /// Errors thrown by the command line.
@@ -792,43 +795,84 @@ mod imp {
     /// Set to true once `Ctrl-]` ended the guest from the terminal.
     static ESCAPED: AtomicBool = AtomicBool::new(false);
 
-    /// Forward stdin to the guest console on a separate thread. On a
-    /// terminal `Ctrl-]` stops the guest, otherwise bytes are forwarded until
-    /// EOF and the guest keeps running.
-    fn forward_input(console: std::sync::Arc<dyn Receive>, stop: StopHandle, tty: bool) {
-        std::thread::spawn(move || {
-            let mut stdin = io::stdin().lock();
-            let mut buf = [0u8; 256];
-            loop {
-                let count = match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(count) => count,
-                };
-                let bytes = &buf[..count];
-                let bytes = match (tty, bytes.iter().position(|byte| *byte == ESCAPE)) {
-                    (true, Some(at)) => {
-                        queue(&*console, &bytes[..at]);
-                        ESCAPED.store(true, Ordering::SeqCst);
-                        if let Err(err) = stop.stop() {
-                            eprintln!("lingcore: failed to stop the guest: {err}");
-                        }
-                        return;
-                    }
-                    _ => bytes,
-                };
-                queue(&*console, bytes);
-            }
-        });
+    /// Console input the holding thread reads from stdin. On a terminal
+    /// `Ctrl-]` stops the guest. Otherwise bytes are forwarded until EOF,
+    /// and the guest keeps running.
+    struct Input {
+        console: std::sync::Arc<dyn Receive>,
+        fd: RawFd,
+        tty: bool,
+        /// Stdin still gives bytes. EOF or a failed read clears this flag.
+        open: bool,
+        /// Bytes read but not yet taken by the console queue. Stdin is not
+        /// read while `pending` holds any.
+        pending: Vec<u8>,
     }
 
-    /// Queue `bytes` on the console, waiting for room if the guest has not
-    /// read the earlier ones yet.
-    fn queue(console: &dyn Receive, mut bytes: &[u8]) {
-        while !bytes.is_empty() {
-            match console.receive(bytes) {
-                Ok(0) => std::thread::sleep(INPUT_RETRY),
-                Ok(taken) => bytes = &bytes[taken..],
-                Err(_) => return,
+    impl Input {
+        /// Input read from `fd`. It ends at once if `fd` is not open.
+        fn new(console: std::sync::Arc<dyn Receive>, fd: RawFd, tty: bool) -> Input {
+            // SAFETY: `fcntl` with `F_GETFD` reads flags of `fd` and touches
+            // no memory.
+            let open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+            Input {
+                console,
+                fd,
+                tty,
+                open,
+                pending: Vec::new(),
+            }
+        }
+
+        /// Returns the descriptor to poll. It is `None` after EOF and while
+        /// `pending` holds bytes.
+        fn descriptor(&self) -> Option<RawFd> {
+            (self.open && self.pending.is_empty()).then_some(self.fd)
+        }
+
+        /// Read stdin and queue its bytes on the console. Returns true if
+        /// `Ctrl-]` was typed on a terminal, and bytes typed before it are
+        /// still queued.
+        fn read(&mut self) -> bool {
+            let mut buf = [0u8; 256];
+            // SAFETY: `buf` is valid for writes of its length.
+            let count = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if count < 0 {
+                let kind = io::Error::last_os_error().kind();
+                if kind != io::ErrorKind::Interrupted && kind != io::ErrorKind::WouldBlock {
+                    self.open = false;
+                }
+                return false;
+            }
+            if count == 0 {
+                self.open = false;
+                return false;
+            }
+            let bytes = &buf[..count as usize];
+            let escaped = match (self.tty, bytes.iter().position(|byte| *byte == ESCAPE)) {
+                (true, Some(at)) => {
+                    self.pending.extend_from_slice(&bytes[..at]);
+                    true
+                }
+                _ => {
+                    self.pending.extend_from_slice(bytes);
+                    false
+                }
+            };
+            self.flush();
+            escaped
+        }
+
+        /// Queue `pending` on the console, as many bytes as the queue takes.
+        /// A console held by a vCPU takes none, the thread does not wait for
+        /// it. An error of the console drops the rest.
+        fn flush(&mut self) {
+            match self.console.try_receive(&self.pending) {
+                Ok(Some(taken)) => {
+                    self.pending.drain(..taken);
+                }
+                Ok(None) => {}
+                Err(_) => self.pending.clear(),
             }
         }
     }
@@ -940,12 +984,15 @@ mod imp {
             None => None,
         };
 
-        let stop = machine.stop_handle();
         let signals = arm_signals()?;
         let terminal = Terminal::raw()?;
         machine.start()?;
-        forward_input(machine.console(), stop, terminal.is_tty());
-        let ended = drive(&mut machine, orders.as_ref(), &signals, timeout);
+        let mut input = Input::new(
+            machine.console(),
+            io::stdin().as_raw_fd(),
+            terminal.is_tty(),
+        );
+        let ended = drive(&mut machine, orders.as_ref(), &mut input, &signals, timeout);
         drop(terminal);
         let ended = ended?;
         if let Some(code) = signalled() {
@@ -977,12 +1024,13 @@ mod imp {
         }
     }
 
-    /// Wait on the guest until it ends, serving orders and signals as they
-    /// arrive. `None` once `timeout` ran out and the guest was stopped,
-    /// `LostPage` once its template lost a page.
+    /// Wait on the guest until it ends, serving orders, console input and
+    /// signals as they arrive. `None` once `timeout` ran out and the guest
+    /// was stopped, `LostPage` once its template lost a page.
     fn drive(
         machine: &mut Machine<KvmHv>,
         orders: Option<&control::Orders>,
+        input: &mut Input,
         signals: &OwnedFd,
         timeout: Option<Duration>,
     ) -> Result<Option<VmExit>> {
@@ -1006,20 +1054,37 @@ mod imp {
                 machine.wait()?;
                 return Ok(None);
             }
+            if !input.pending.is_empty() {
+                input.flush();
+            }
             // Each event the thread serves has a descriptor in this set, so
-            // the wait ends on any of them at once.
+            // the wait ends on any of them at once. Input the console did not
+            // take yet is offered again after `INPUT_RETRY`.
             waiting.clear();
             waiting.add(machine.wake_fd(), WAKE, Interest::Read);
             waiting.add(signals.as_raw_fd(), SIGNALS, Interest::Read);
             if let Some(orders) = &orders {
                 waiting.add(orders.descriptor(), ORDERS, Interest::Read);
             }
-            wait_on(&waiting, left.unwrap_or(Duration::MAX), &mut ready)?;
+            if let Some(fd) = input.descriptor() {
+                waiting.add(fd, INPUT, Interest::Read);
+            }
+            let mut within = left.unwrap_or(Duration::MAX);
+            if !input.pending.is_empty() {
+                within = within.min(INPUT_RETRY);
+            }
+            wait_on(&waiting, within, &mut ready)?;
             if ready.contains(&SIGNALS)
                 && let Some(signal) = take_signal(signals)
                 && let Err(err) = machine.stop()
             {
                 eprintln!("lingcore: failed to stop the guest on signal {signal}: {err}");
+            }
+            if ready.contains(&INPUT) && input.read() {
+                ESCAPED.store(true, Ordering::SeqCst);
+                if let Err(err) = machine.stop() {
+                    eprintln!("lingcore: failed to stop the guest: {err}");
+                }
             }
             // Thread holding the guest serves the orders, so no other thread
             // changes the guest.
@@ -1050,6 +1115,122 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use crate::imp::*;
+
+        /// Console taking at most `room` bytes until `drain` empties it.
+        /// With `held` set it takes none, as if a vCPU held it.
+        struct Room {
+            taken: std::sync::Mutex<Vec<u8>>,
+            room: usize,
+            held: AtomicBool,
+        }
+
+        impl Room {
+            fn new(room: usize) -> std::sync::Arc<Room> {
+                std::sync::Arc::new(Room {
+                    taken: std::sync::Mutex::new(Vec::new()),
+                    room,
+                    held: AtomicBool::new(false),
+                })
+            }
+
+            fn drain(&self) -> Vec<u8> {
+                std::mem::take(&mut *self.taken.lock().unwrap())
+            }
+        }
+
+        impl Receive for Room {
+            fn receive(&self, bytes: &[u8]) -> io::Result<usize> {
+                let mut taken = self.taken.lock().unwrap();
+                let count = bytes.len().min(self.room - taken.len());
+                taken.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+
+            fn try_receive(&self, bytes: &[u8]) -> io::Result<Option<usize>> {
+                if self.held.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                self.receive(bytes).map(Some)
+            }
+        }
+
+        /// Pipe used as stdin. Returns the read end and the write end.
+        fn stdin_pipe() -> (OwnedFd, OwnedFd) {
+            let mut fds = [0; 2];
+            // SAFETY: `fds` is a valid array of two file descriptors.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            // SAFETY: both were just opened and have no other owner.
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        }
+
+        fn type_in(end: &OwnedFd, bytes: &[u8]) {
+            // SAFETY: `bytes` is valid for reads of its length.
+            let wrote = unsafe { libc::write(end.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(wrote, bytes.len() as isize);
+        }
+
+        #[test]
+        fn test_escape_queues_bytes_ahead_of_it() {
+            let console = Room::new(64);
+            let (reader, writer) = stdin_pipe();
+            let mut input = Input::new(console.clone(), reader.as_raw_fd(), true);
+            type_in(&writer, b"ab\x1dcd");
+            assert!(input.read(), "escape not seen");
+            assert_eq!(console.drain(), b"ab");
+
+            // Without a terminal, `Ctrl-]` is forwarded like any other byte.
+            let mut piped = Input::new(console.clone(), reader.as_raw_fd(), false);
+            type_in(&writer, b"a\x1db");
+            assert!(!piped.read());
+            assert_eq!(console.drain(), b"a\x1db");
+        }
+
+        #[test]
+        fn test_input_waits_for_room() {
+            // The console takes three bytes. The other two wait, and stdin is
+            // not read until the console takes them.
+            let console = Room::new(3);
+            let (reader, writer) = stdin_pipe();
+            let mut input = Input::new(console.clone(), reader.as_raw_fd(), true);
+            assert_eq!(input.descriptor(), Some(reader.as_raw_fd()));
+            type_in(&writer, b"abcde");
+            assert!(!input.read());
+            assert_eq!(console.drain(), b"abc");
+            assert_eq!(input.descriptor(), None, "stdin read while bytes wait");
+            input.flush();
+            assert_eq!(console.drain(), b"de");
+            assert_eq!(input.descriptor(), Some(reader.as_raw_fd()));
+        }
+
+        #[test]
+        fn test_input_waits_for_held_console() {
+            // A vCPU holds the console, so the bytes wait and stdin is not
+            // read. Once it lets go, a flush hands them over.
+            let console = Room::new(8);
+            console.held.store(true, Ordering::SeqCst);
+            let (reader, writer) = stdin_pipe();
+            let mut input = Input::new(console.clone(), reader.as_raw_fd(), true);
+            type_in(&writer, b"ab");
+            assert!(!input.read());
+            assert_eq!(console.drain(), b"");
+            assert_eq!(input.descriptor(), None, "stdin read while bytes wait");
+            console.held.store(false, Ordering::SeqCst);
+            input.flush();
+            assert_eq!(console.drain(), b"ab");
+        }
+
+        #[test]
+        fn test_eof_ends_input() {
+            let console = Room::new(8);
+            let (reader, writer) = stdin_pipe();
+            let mut input = Input::new(console.clone(), reader.as_raw_fd(), true);
+            drop(writer);
+            assert!(!input.read());
+            assert_eq!(input.descriptor(), None, "stdin waited on after EOF");
+            // Input ends at once on a descriptor not open. The test uses -1,
+            // since a parallel test can reuse the number of a closed one.
+            assert_eq!(Input::new(console, -1, false).descriptor(), None);
+        }
 
         #[test]
         fn test_signal_read_from_pipe() {

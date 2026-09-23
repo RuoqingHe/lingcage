@@ -6,7 +6,7 @@
 //! places a device in x86 port space or in an MMIO window.
 
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 
 use thiserror::Error;
 
@@ -114,6 +114,12 @@ pub trait Receive: Send + Sync {
     /// Queue `bytes` for the guest to read, returns the count queued. Count
     /// less than the length means the queue has no room for the rest.
     fn receive(&self, bytes: &[u8]) -> io::Result<usize>;
+
+    /// Queue `bytes` like `receive` does, without waiting for a device held
+    /// by another thread. `None` while it is held. Default calls `receive`.
+    fn try_receive(&self, bytes: &[u8]) -> io::Result<Option<usize>> {
+        self.receive(bytes).map(Some)
+    }
 }
 
 /// Device behind a mutex, which is reached from outside the bus as well
@@ -130,6 +136,16 @@ impl<D> Shared<D> {
     /// Run `f` with the device locked.
     pub fn with<R>(&self, f: impl FnOnce(&mut D) -> R) -> R {
         f(&mut self.0.lock().unwrap())
+    }
+
+    /// Run `f` with the device locked, `None` if another thread holds the
+    /// lock.
+    pub fn try_with<R>(&self, f: impl FnOnce(&mut D) -> R) -> Option<R> {
+        match self.0.try_lock() {
+            Ok(mut device) => Some(f(&mut device)),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(err)) => panic!("{err}"),
+        }
     }
 }
 

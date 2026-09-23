@@ -286,6 +286,15 @@ impl<W: Write + Send> crate::devices::Receive for crate::devices::Shared<Serial<
     fn receive(&self, bytes: &[u8]) -> io::Result<usize> {
         self.with(|uart| uart.receive(bytes))
     }
+
+    /// A vCPU writing to the sink holds the UART, and a full sink keeps it
+    /// waiting. `None` then.
+    fn try_receive(&self, bytes: &[u8]) -> io::Result<Option<usize>> {
+        match self.try_with(|uart| uart.receive(bytes)) {
+            Some(taken) => taken.map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 impl<W: Write + Send> Device for Serial<W> {
@@ -728,6 +737,18 @@ mod tests {
         uart.read(DATA);
         uart.receive(&[0x5a; 2]).expect("receive after a drain");
         assert!(uart.drop_logged, "refill was not marked");
+    }
+
+    #[test]
+    fn test_try_receive_on_held_uart() {
+        // A thread holding the UART makes `try_receive` return at once.
+        use crate::devices::{Receive, Shared};
+
+        let uart = Shared::new(Serial::new(Vec::new()));
+        let held = uart.0.lock().unwrap();
+        assert_eq!(uart.try_receive(b"a").expect("try"), None);
+        drop(held);
+        assert_eq!(uart.try_receive(b"a").expect("try"), Some(1));
     }
 
     /// Guest reads `LSR` and writes it to `DATA`, then reads the queued byte
