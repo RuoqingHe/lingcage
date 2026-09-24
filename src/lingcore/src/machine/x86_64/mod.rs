@@ -445,6 +445,66 @@ mod tests {
 
     #[cfg(all(feature = "kvm", target_os = "linux"))]
     #[test]
+    fn test_unread_console_leaves_vcpu_running() {
+        // A guest writing the console to a pipe left unread still pauses.
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::time::Duration;
+
+        use crate::boot::bzimage::tests::bzimage;
+        use crate::devices::backlog::Output;
+        use crate::hv::backend::kvm::hypervisor::KvmHv;
+
+        // Write a byte to the UART in a loop.
+        let program = [
+            0xba, 0xf8, 0x03, 0x00, 0x00, // mov edx, 0x3f8
+            0xb0, 0x78, // mov al, 'x'
+            0xee, // out dx, al
+            0xeb, 0xfb, // jmp back to the mov
+        ];
+        let mut payload = vec![0u8; 0x200];
+        payload.extend_from_slice(&program);
+
+        let image = std::env::temp_dir().join(format!("lingcore-unread-{}", std::process::id()));
+        std::fs::write(&image, bzimage(&payload)).expect("write the kernel image");
+
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a valid array of two descriptors.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both descriptors were just opened and have no other owner.
+        let (_reader, writer) = unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        // A small pipe fills sooner.
+        // SAFETY: `fcntl` takes a descriptor, a command and a size.
+        unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+        let output = Output::new(writer.as_raw_fd()).expect("output");
+        let config = Config {
+            vcpus: 1,
+            cmdline: "console=ttyS0".to_string(),
+            // With `Trap` a syscall missed by the allowlists ends the test with
+            // `SIGSYS`.
+            confine: Some(Refusal::Trap),
+            kernel: image.clone(),
+            memory: 16 << 20,
+            ..Default::default()
+        };
+        let hv = KvmHv::new().expect("open /dev/kvm");
+        let mut machine = Machine::new(&hv, &config, output.backlog()).expect("assemble the guest");
+        std::fs::remove_file(&image).expect("remove the kernel image");
+
+        machine.start().expect("start the guest");
+        // Guest fills the pipe in about 0.1 s.
+        std::thread::sleep(Duration::from_secs(1));
+        machine.pause().expect("pause the guest");
+        machine.stop().expect("stop the guest");
+        assert_eq!(machine.wait().expect("wait"), VmExit::Interrupted);
+    }
+
+    #[cfg(all(feature = "kvm", target_os = "linux"))]
+    #[test]
     fn test_channel_sockets_go_with_machine() {
         // Sockets of the channel go with the machine, or with its refusal.
         use std::os::unix::net::UnixListener;

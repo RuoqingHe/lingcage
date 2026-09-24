@@ -12,6 +12,8 @@ use thiserror::Error;
 
 use crate::hv::vcpu::VmExit;
 
+#[cfg(target_os = "linux")]
+pub mod backlog;
 pub mod bus;
 pub mod i8042;
 pub mod pm1;

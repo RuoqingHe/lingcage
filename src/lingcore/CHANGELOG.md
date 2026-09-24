@@ -34,6 +34,9 @@
 - \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Add `Sockets::take_file` and
   `Named::take_files`: the socket files come out of the endpoint as `SocketFile`, removed when
   dropped, so a thread whose allowlist refuses stat and unlink can drop the endpoint.
+- \[[#23](https://github.com/lingcage/lingcage/pull/23)\] Add backlog of console output:
+  `devices::backlog::Backlog` keeps up to 64 KiB of console output a reader does not take, dropping
+  the oldest bytes past that, and `Output` writes it out without waiting on the reader.
 
 ### Changed
 
@@ -81,3 +84,6 @@
   the same path.
 - \[[#21](https://github.com/lingcage/lingcage/pull/21)\] Fix context id taken outside the vsock
   range: a guest given an id under 3 or from `u32::MAX` up is refused with `Error::ContextId`.
+- \[[#23](https://github.com/lingcage/lingcage/pull/23)\] Fix vCPU blocked on stdout: console output
+  goes through `Output`, so a vCPU no longer waits on an unread stdout, and output to a closed
+  stdout is dropped while the guest runs on.

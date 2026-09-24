@@ -16,13 +16,14 @@
 ))]
 mod imp {
     use std::fs::File;
-    use std::io::{self, BufReader, Write};
+    use std::io::{self, BufReader};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::time::{Duration, Instant};
 
     use lingcore::devices::Receive;
+    use lingcore::devices::backlog::Output;
     use lingcore::devices::virtio::console::Reach;
     use lingcore::devices::virtio::net::stack::StackConfig;
     use lingcore::hv::Interest;
@@ -60,6 +61,9 @@ mod imp {
 
     /// Token of stdin in that wait.
     const INPUT: u64 = 3;
+
+    /// Token of `Output::wake_fd` and `Output::descriptor` in that wait.
+    const OUTPUT: u64 = 4;
 
     /// Time the holding thread waits before it offers console input again,
     /// once the console queue is full or a vCPU holds the console.
@@ -762,23 +766,6 @@ mod imp {
         Ok(())
     }
 
-    /// Console sink writing guest output to stdout right away. Stdout is line
-    /// buffered by default, which would hold back a prompt without newline.
-    struct Sink;
-
-    impl Write for Sink {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let mut out = io::stdout().lock();
-            out.write_all(buf)?;
-            out.flush()?;
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            io::stdout().flush()
-        }
-    }
-
     /// Terminal settings of stdin saved before raw mode, restored on drop.
     /// Holds `None` if stdin is not a terminal.
     struct Terminal(Option<libc::termios>);
@@ -993,13 +980,14 @@ mod imp {
         let control = parsed.value("control").map(PathBuf::from);
         let restore = parsed.value("restore").map(PathBuf::from);
         let hv = KvmHv::new().map_err(lingcore::machine::Error::from)?;
+        let mut output = Output::new(io::stdout().as_raw_fd())?;
         let mut machine = match &restore {
             // A guest laid over a captured one shares pages of the image
             // until it writes to them.
             Some(from) => {
                 let image = File::open(from.join(control::MEMORY))
                     .map_err(|_| lingcore::machine::Error::Snapshot)?;
-                let mut machine = Machine::cloned(&hv, &config, Sink, &image)?;
+                let mut machine = Machine::cloned(&hv, &config, output.backlog(), &image)?;
                 let document = File::open(from.join(control::DOCUMENT))
                     .map_err(|_| lingcore::machine::Error::Snapshot)?;
                 // The parser reads the document field by field, so a plain
@@ -1008,7 +996,7 @@ mod imp {
                 machine.restore(&taken)?;
                 machine
             }
-            None => Machine::new(&hv, &config, Sink)?,
+            None => Machine::new(&hv, &config, output.backlog())?,
         };
         let orders = match &control {
             Some(at) => Some(control::listen(at).map_err(lingcore::machine::Error::Network)?),
@@ -1023,8 +1011,17 @@ mod imp {
             io::stdin().as_raw_fd(),
             terminal.is_tty(),
         );
-        let ended = drive(&mut machine, orders.as_ref(), &mut input, &signals, timeout);
+        let ended = drive(
+            &mut machine,
+            orders.as_ref(),
+            &mut input,
+            &mut output,
+            &signals,
+            timeout,
+        );
         drop(terminal);
+        // Flags of stdout are restored before the lines below.
+        drop(output);
         let ended = ended?;
         if let Some(code) = signalled() {
             return Ok(code);
@@ -1056,12 +1053,13 @@ mod imp {
     }
 
     /// Wait on the guest until it ends, serving orders, console input and
-    /// signals as they arrive. `None` once `timeout` ran out and the guest
-    /// was stopped, `LostPage` once its template lost a page.
+    /// output, and signals as they arrive. `None` once `timeout` ran out and
+    /// the guest was stopped, `LostPage` once its template lost a page.
     fn drive(
         machine: &mut Machine<KvmHv>,
         orders: Option<&control::Orders>,
         input: &mut Input,
+        output: &mut Output,
         signals: &OwnedFd,
         timeout: Option<Duration>,
     ) -> Result<Option<VmExit>> {
@@ -1100,11 +1098,18 @@ mod imp {
             if let Some(fd) = input.descriptor() {
                 waiting.add(fd, INPUT, Interest::Read);
             }
+            waiting.add(output.wake_fd(), OUTPUT, Interest::Read);
+            if let Some(fd) = output.descriptor() {
+                waiting.add(fd, OUTPUT, Interest::Write);
+            }
             let mut within = left.unwrap_or(Duration::MAX);
             if !input.pending.is_empty() {
                 within = within.min(INPUT_RETRY);
             }
             wait_on(&waiting, within, &mut ready)?;
+            if ready.contains(&OUTPUT) {
+                output.write_out();
+            }
             if ready.contains(&SIGNALS)
                 && let Some(signal) = take_signal(signals)
                 && let Err(err) = machine.stop()
