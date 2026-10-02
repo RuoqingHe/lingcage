@@ -22,6 +22,8 @@
   reports free are dropped on the host.
 - \[[#13](https://github.com/RuoqingHe/lingcage/pull/13)\] Add balloon to a guest: `Config::balloon`
   and `--balloon` place the device.
+- \[[#14](https://github.com/RuoqingHe/lingcage/pull/14)\] Add rate limit to a disk: `Disk::rate`,
+  and `:bytes=N` and `:ops=N` on `--disk`, cap bytes and requests a second.
 
 ### Changed
 

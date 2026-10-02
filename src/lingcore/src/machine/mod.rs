@@ -24,6 +24,7 @@ use crate::devices::serial::Serial;
 #[cfg(target_os = "linux")]
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::Block;
+pub use crate::devices::virtio::block::Rate;
 use crate::devices::virtio::console::{Console, Reach};
 use crate::devices::virtio::entropy::Entropy;
 #[cfg(target_os = "linux")]
@@ -272,6 +273,8 @@ pub struct Disk {
     pub at: PathBuf,
     /// Set if the guest may write to the disk.
     pub writable: bool,
+    /// Rate limit of the disk. `None` serves it as fast as the host reads.
+    pub rate: Option<Rate>,
 }
 
 impl Disk {
@@ -280,7 +283,14 @@ impl Disk {
         Disk {
             at: at.into(),
             writable: true,
+            rate: None,
         }
+    }
+
+    /// The disk served at `rate`.
+    pub fn at_rate(mut self, rate: Rate) -> Disk {
+        self.rate = Some(rate);
+        self
     }
 
     /// Disk of `at` the guest may only read. The file is opened read-only
@@ -290,6 +300,7 @@ impl Disk {
         Disk {
             at: at.into(),
             writable: false,
+            rate: None,
         }
     }
 }
@@ -820,9 +831,11 @@ impl<H: Hypervisor> Machine<H> {
                 .write(disk.writable)
                 .open(&disk.at)
                 .map_err(Error::Disk)?;
-            devices.push(Box::new(
-                Block::new(file, disk.writable).map_err(Error::Disk)?,
-            ));
+            let mut block = Block::new(file, disk.writable).map_err(Error::Disk)?;
+            if let Some(rate) = disk.rate {
+                block = block.at_rate(rate);
+            }
+            devices.push(Box::new(block));
         }
         if !config.ports.is_empty() {
             devices.push(Box::new(Console::new(&config.ports).map_err(Error::Port)?));
@@ -1311,6 +1324,7 @@ impl<H: Hypervisor> Machine<H> {
                 // Signal during `notify` or a hold stays counted for the
                 // next wait. Ioeventfd of the entropy source keeps the set
                 // non-empty, so the wait really waits.
+                let waited = Instant::now();
                 if waiting.ready(after, &mut signalled).is_err() {
                     error!("device thread exits, ioeventfd wait failed");
                     return Err(Error::DeviceThread);
@@ -1341,7 +1355,9 @@ impl<H: Hypervisor> Machine<H> {
                         serving.extend(outsides[(*token - OUTSIDE) as usize].1.clone());
                     }
                 }
-                if signalled.is_empty() {
+                // Deadline already passed is served as well, so a descriptor
+                // staying ready does not hold it back.
+                if signalled.is_empty() || waited.elapsed() >= after {
                     for index in &armed {
                         serving.extend(outsides[*index].1.clone());
                     }
