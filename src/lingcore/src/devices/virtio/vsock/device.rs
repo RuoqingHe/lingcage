@@ -85,6 +85,8 @@ pub struct Vsock {
     waiting: Vec<(Header, Vec<u8>)>,
     /// Packets dropped at the `WAITING` bound, logged on the first one.
     dropped: u64,
+    /// Receive chains too short for a packet, reported used and ignored.
+    short: u64,
     /// Host port assigned to the last incoming connection.
     last_port: u32,
     /// Transport reset pending for the guest. Each restore sets it, posting
@@ -107,6 +109,7 @@ impl Vsock {
             open: HashMap::new(),
             waiting: Vec::new(),
             dropped: 0,
+            short: 0,
             last_port: 0,
             reset_owed: false,
             #[cfg(target_os = "linux")]
@@ -397,16 +400,36 @@ impl Vsock {
     }
 
     /// Write held packets into receive ring, one per chain, until packets
-    /// or chains run out.
+    /// or chains run out. A chain takes the part of a packet it has room
+    /// for, the rest stays at the head of `waiting` for the next chain.
     fn give(&mut self, queue: &mut Queue, ram: &GuestRam) -> Result<()> {
         while !self.waiting.is_empty() {
             let Some(chain) = queue.pop(ram)? else {
                 // No buffer offered, the rest stays in `waiting`.
                 return Ok(());
             };
-            let (header, payload) = self.waiting.remove(0);
-            let written = write_packet(&chain, ram, &header, &payload)?;
+            let (header, payload) = &mut self.waiting[0];
+            let room = writable_room(&chain);
+            // Header takes `ROOM` bytes, and payload needs at least one more.
+            // Chain shorter than this is reported used and ignored.
+            let least = if payload.is_empty() { ROOM } else { ROOM + 1 };
+            if room < least {
+                debug!("receive chain of {room} bytes ignored, too short for a packet");
+                self.short += 1;
+                queue.add_used(ram, chain.head, 0)?;
+                continue;
+            }
+            // TODO: `VIRTIO_VSOCK_SEQ_EOM` and `VIRTIO_VSOCK_SEQ_EOR` are not
+            // yet cleared on a part before the last, `STREAM` sets neither.
+            let fits = payload.len().min(room - ROOM);
+            header.len = fits as u32;
+            let written = write_packet(&chain, ram, header, &payload[..fits])?;
             queue.add_used(ram, chain.head, written)?;
+            if fits < payload.len() {
+                payload.drain(..fits);
+            } else {
+                self.waiting.remove(0);
+            }
         }
         Ok(())
     }
@@ -584,6 +607,16 @@ fn read_packet(chain: &Chain, ram: &GuestRam) -> Result<Option<(Header, Vec<u8>)
     };
     let payload = whole.get(ROOM..).unwrap_or(&[]).to_vec();
     Ok(Some((header, payload)))
+}
+
+/// Room the writable descriptors of `chain` leave for a packet.
+fn writable_room(chain: &Chain) -> usize {
+    chain
+        .descriptors
+        .iter()
+        .filter(|descriptor| descriptor.writable())
+        .map(|descriptor| descriptor.len as usize)
+        .sum()
 }
 
 /// Write the packet into writable descriptors of `chain`. Returns bytes
@@ -866,6 +899,14 @@ mod tests {
         let mut bytes = [0u8; ROOM];
         ram.read(at, &mut bytes).expect("read the buffer");
         Header::read(&bytes).expect("header")
+    }
+
+    /// Returns length of entry `slot` of the used ring of receive queue.
+    fn guest_used(ram: &GuestRam, slot: u16) -> u32 {
+        let mut bytes = [0u8; 4];
+        ram.read(RX_RING + 0x2000 + 4 + u64::from(slot) * 8 + 4, &mut bytes)
+            .expect("read the used entry");
+        u32::from_le_bytes(bytes)
     }
 
     /// Post one writable buffer as available entry `slot` of event ring.
@@ -1457,6 +1498,101 @@ mod tests {
         assert_eq!(given.len, 5);
         let mut payload = [0u8; 5];
         ram.read(BUFFER + 0x8000 + 0x400 + ROOM as u64, &mut payload)
+            .expect("read the payload");
+        assert_eq!(&payload, b"world");
+    }
+
+    #[test]
+    fn test_split_packet_over_receive_chains() {
+        // Packet larger than a buffer takes several of them. The rest waits
+        // while no buffer is offered.
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        guest_offers(&ram, 0);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+
+        // One read of the host stream, more bytes than two buffers take.
+        let sent: Vec<u8> = (0..2500u32).map(|n| (n % 251) as u8).collect();
+        landed.ready.lock().unwrap().extend_from_slice(&sent);
+        vsock.pump();
+        guest_offers(&ram, 1);
+        guest_offers(&ram, 2);
+        vsock
+            .notify(RX, &mut rx, &ram)
+            .expect("notify rx with two buffers");
+        assert_eq!(vsock.waiting.len(), 1, "rest of the packet not held");
+
+        guest_offers(&ram, 3);
+        vsock
+            .notify(RX, &mut rx, &ram)
+            .expect("notify rx with a buffer");
+        assert!(vsock.waiting.is_empty(), "rest of the packet still held");
+
+        // Buffer of `0x400` bytes has room for 980 behind the header.
+        let mut got = Vec::new();
+        for (slot, len) in [(1u16, 980u32), (2, 980), (3, 540)] {
+            let given = guest_given(&ram, slot);
+            assert_eq!(given.op, Op::Data);
+            assert_eq!(given.len, len, "buffer {slot} carries wrong length");
+            assert_eq!(
+                guest_used(&ram, slot),
+                ROOM as u32 + len,
+                "buffer {slot} reported with wrong length"
+            );
+            let mut payload = vec![0u8; len as usize];
+            let at = BUFFER + 0x8000 + u64::from(slot) * 0x400 + ROOM as u64;
+            ram.read(at, &mut payload).expect("read the payload");
+            got.extend_from_slice(&payload);
+        }
+        assert_eq!(got, sent, "bytes lost or out of order");
+    }
+
+    #[test]
+    fn test_ignore_short_receive_chain() {
+        // Buffer of `ROOM` bytes takes a packet of header only. With data
+        // waiting it is reported used and ignored.
+        let landed = Landed::default();
+        let mut vsock = device(&landed);
+        let ram = ram();
+        let mut tx = queue(TX_RING);
+        let mut rx = queue(RX_RING);
+
+        guest_sends(&ram, 0, Op::Request, OPEN_PORT, &[]);
+        vsock.notify(TX, &mut tx, &ram).expect("notify tx");
+        describe(&ram, RX_RING, 0, BUFFER + 0x8000, ROOM as u32, WRITE);
+        publish(&ram, RX_RING, 0, 0, 1);
+        vsock.notify(RX, &mut rx, &ram).expect("notify rx");
+        assert_eq!(guest_given(&ram, 0).op, Op::Response);
+        assert_eq!(vsock.short, 0, "buffer of a header counted as short");
+
+        // Same buffer has no room for a byte of data.
+        landed.ready.lock().unwrap().extend_from_slice(b"world");
+        vsock.pump();
+        describe(&ram, RX_RING, 1, BUFFER + 0x8000, ROOM as u32, WRITE);
+        publish(&ram, RX_RING, 1, 1, 2);
+        vsock
+            .notify(RX, &mut rx, &ram)
+            .expect("notify rx with a short buffer");
+        assert_eq!(rx.cursors().1, 2, "short buffer not reported used");
+        assert_eq!(guest_used(&ram, 1), 0, "short buffer reported as written");
+        assert_eq!(vsock.short, 1, "short buffer not counted");
+
+        // Data waits for the next buffer.
+        guest_offers(&ram, 2);
+        vsock
+            .notify(RX, &mut rx, &ram)
+            .expect("notify rx with a buffer");
+        let given = guest_given(&ram, 2);
+        assert_eq!(given.op, Op::Data);
+        assert_eq!(given.len, 5);
+        let mut payload = [0u8; 5];
+        ram.read(BUFFER + 0x8000 + 2 * 0x400 + ROOM as u64, &mut payload)
             .expect("read the payload");
         assert_eq!(&payload, b"world");
     }
