@@ -44,3 +44,5 @@
   guest resumed twice is left running.
 - \[[#10](https://github.com/RuoqingHe/lingcage/pull/10)\] Fix exit code under `--control`: a guest
   stopped on `--timeout` or by the escape key exits 124 and 0, as it does without a control socket.
+- \[[#15](https://github.com/RuoqingHe/lingcage/pull/15)\] Fix packet lost on small receive chain:
+  vsock device splits a packet larger than a receive chain over several chains.
